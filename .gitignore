@@ -1,0 +1,13 @@
+# build artifacts
+build/*.o
+build/*.exe
+build/*.dll
+
+# extracted reference archives (keep the zips, drop the unpacked trees)
+refs/x/
+
+# editor / os
+*.ini
+*.swp
+.DS_Store
+Thumbs.db
