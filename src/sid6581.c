@@ -38,16 +38,17 @@ static uint8_t     s_mode[SID_MAX_SLOTS];
 static sid_write_hook_t s_hook = NULL;
 static void            *s_hook_user = NULL;
 
-/* Hardware is now 74LS374 + 74HCT02 + 74HCT32 + 74HC74 (see
- * docs/接线表_374_02_min.md). The 74HC32 encodes the write condition into
- * TRIG_n = !A0 | /WR | CSn and the 74HC74 reshapes it into Wn, which drives
- * the SID's /CS and R/W from the same pin. That removed the /CS vs R/W
- * skew, so one write per register is enough.
+/* Hardware is 74LS374 + 74HCT02 + 74HCT32 (see docs/接线表_374_02_min.md).
+ * The 74HC32 encodes the write condition into TRIG_n = !A0 | /WR | CSn, which
+ * drives the SID's /CS directly; the SID's R/W is the SPFM /WR line itself.
+ * One write per register is enough.
  *
- * Historical note: before the 74HC74 was added, single writes were
- * probabilistic and only repeat >= 4 gave a sustained tone, at the cost of a
- * fixed wrong pitch (see docs/写入时序调试记录.md §9). Those defaults are kept
- * reachable through the CLI so the old behaviour can still be reproduced. */
+ * Two earlier designs are superseded and kept only as history (see
+ * docs/写入时序调试记录.md §9): a PHI2-counted 13 us window (the RTL-derived
+ * "write must span a PHI2 edge" rule turned out to be wrong) and a 74HC74
+ * reshaping stage (what actually caused the garbled single writes was one
+ * gate driving two CMOS loads, not the missing buffer). The old timing knobs
+ * stay reachable from the CLI to reproduce those setups. */
 static sid_write_mode_t s_mode_w = SID_WRITE_TWO_PHASE;
 static uint32_t         s_phase_gap = 0;
 static uint32_t         s_write_delay_us = 0;
