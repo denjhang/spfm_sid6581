@@ -38,21 +38,20 @@ static uint8_t     s_mode[SID_MAX_SLOTS];
 static sid_write_hook_t s_hook = NULL;
 static void            *s_hook_user = NULL;
 
-/* Measured on real hardware (RE-SPFM slot 3, 6581, 1 MHz PHI2):
+/* Hardware is now 74LS374 + 74HCT02 + 74HCT32 + 74HC74 (see
+ * docs/接线表_374_02_min.md). The 74HC32 encodes the write condition into
+ * TRIG_n = !A0 | /WR | CSn and the 74HC74 reshapes it into Wn, which drives
+ * the SID's /CS and R/W from the same pin. That removed the /CS vs R/W
+ * skew, so one write per register is enough.
  *
- *   two-phase + host sleep, 8 x 90 us -> works, but every retry is its own
- *                                        USB transfer, so init crawls and the
- *                                        first note can be ~0.5 s late
- *   two-phase-nop, gap 3 x 12         -> immediate and stable on every run
- *   repeat 1                          -> pitch only sometimes follows the
- *                                        command, so single writes are lost
- *
- * The NOP variant wins because the inter-phase gap is executed by the STM32
- * (0x80 tick) and the retries go out in a single buffer flush. */
-static sid_write_mode_t s_mode_w = SID_WRITE_TWO_PHASE_NOP;
-static uint32_t         s_phase_gap = 3;
+ * Historical note: before the 74HC74 was added, single writes were
+ * probabilistic and only repeat >= 4 gave a sustained tone, at the cost of a
+ * fixed wrong pitch (see docs/写入时序调试记录.md §9). Those defaults are kept
+ * reachable through the CLI so the old behaviour can still be reproduced. */
+static sid_write_mode_t s_mode_w = SID_WRITE_TWO_PHASE;
+static uint32_t         s_phase_gap = 0;
 static uint32_t         s_write_delay_us = 0;
-static uint32_t         s_write_repeat = 12;
+static uint32_t         s_write_repeat = 1;
 
 /* Split-mode counters. Defaults keep the phases symmetric so a bare
  * `--write-mode split` behaves like the NOP mode above. */
