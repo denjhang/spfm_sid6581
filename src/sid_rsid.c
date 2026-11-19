@@ -1011,6 +1011,139 @@ void sid_song_free(sid_event_t *events)
 }
 
 /* ============================================================
+ * public: live streaming
+ *
+ * A .sid header has no length: the play routine is designed to be called
+ * forever and loops inside itself, so playing "until the song ends" has no
+ * meaning. Rendering a fixed buffer up front therefore forces an arbitrary
+ * duration on the user, which is exactly what we do not want.
+ *
+ * Instead the machine is left running and advanced one frame per call. The
+ * caller keeps the pacing, so the emulation cost is at most one frame's worth
+ * of 6502 (typically tens of microseconds) hidden inside the 20 ms the
+ * previous frame takes to play out. There is no stall and no precomputed end.
+ * ============================================================ */
+
+static int       s_streaming = 0;
+static uint16_t  s_stream_play_addr = 0;
+static double    s_stream_cpu_hz = 985248.0;
+static int32_t   s_stream_frame = 0;
+static sid_event_t *s_frame_ev = NULL;
+static size_t      s_frame_cap = 0;
+
+int sid_stream_open(const char *path, int subsong, sid_song_info_t *info,
+                    char *err, size_t errlen)
+{
+    sid_stream_close();
+    if (err && errlen) err[0] = 0;
+
+    PSID si;
+    if (parse_psid(path, &si) < 0) {
+        if (err && errlen) snprintf(err, errlen, "not a PSID/RSID file");
+        return -1;
+    }
+
+    sid_song_info_t local;
+    if (!info) info = &local;
+    if (sid_song_probe(path, info) < 0) {
+        free(si.code);
+        if (err && errlen) snprintf(err, errlen, "header unreadable");
+        return -1;
+    }
+
+    if (subsong < 0) subsong = si.start_song ? si.start_song - 1 : 0;
+
+    reset_machine();
+
+    uint32_t clk = si.flags & 0x0C;
+    double vsync_hz, cpu_hz;
+    if (clk == 0x08) { vsync_hz = 60.0; cpu_hz = 1022730.0; VIC_lines = 263; VIC_cpr = 65; }
+    else            { vsync_hz = 50.125; cpu_hz = 985248.0; VIC_lines = 312; VIC_cpr = 63; }
+
+    s_stream_cpu_hz = cpu_hz;
+    g_cycles_per_frame = (int32_t)(cpu_hz / vsync_hz);
+
+    for (uint32_t i = 0; i < si.code_size; i++)
+        RAM[(si.load_addr + i) & 0xFFFF] = si.code[i];
+
+    /* The init routine's writes all land at t=0; they must be applied before
+     * the first play frame. */
+    sid_write_hook = on_sid_write;
+    g_current_frame = -1;
+    g_current_cycle = 0;
+    g_frame_base_cycle = clockticks6502;
+    call_init(si.init_addr, (uint8_t)subsong, 2000000);
+
+    /* The init writes are handed out as the first frame, so the caller gets
+     * them before it starts counting time. */
+    s_stream_play_addr = get_play_addr(si.play_addr);
+    s_stream_frame = 0;
+    s_streaming = 1;
+
+    free(si.code);
+    return 0;
+}
+
+int sid_stream_next_frame(const sid_event_t **events, size_t *count)
+{
+    if (!s_streaming) return -1;
+
+    if (g_current_frame < 0) {
+        /* First call: hand over the init writes captured by sid_stream_open. */
+        g_current_frame = 0;
+    } else {
+        if (s_stream_play_addr != 0) {
+            g_current_cycle = (int64_t)s_stream_frame * (int64_t)g_cycles_per_frame;
+            g_frame_base_cycle = clockticks6502;
+            call_play(s_stream_play_addr, 1000000);
+        }
+        s_stream_frame++;
+    }
+
+    /* Convert the accumulated cycles to milliseconds into a stable buffer.
+     * The machine's cycle counter keeps growing across frames, so t_ms stays
+     * monotonic for as long as the stream runs - there is no wrap and no
+     * restart at an arbitrary length. */
+    size_t n = cap_n;
+    if (n > s_frame_cap) {
+        size_t want = n;
+        sid_event_t *np = (sid_event_t *)realloc(s_frame_ev, want * sizeof(*np));
+        if (!np) { cap_n = 0; return -1; }
+        s_frame_ev = np;
+        s_frame_cap = want;
+    }
+    for (size_t i = 0; i < n; i++) {
+        int64_t c = cap_buf[i].cycle;
+        s_frame_ev[i].t_ms = (c < 0) ? 0.0
+                            : (double)c / s_stream_cpu_hz * 1000.0;
+        s_frame_ev[i].reg = cap_buf[i].reg;
+        s_frame_ev[i].val = cap_buf[i].val;
+    }
+    cap_n = 0;
+
+    if (events) *events = s_frame_ev;
+    if (count)  *count = n;
+    return 0;
+}
+
+double sid_stream_frame_ms(void)
+{
+    if (g_cycles_per_frame <= 0) return 19.96;
+    return (double)g_cycles_per_frame / s_stream_cpu_hz * 1000.0;
+}
+
+void sid_stream_close(void)
+{
+    if (!s_streaming) return;
+    sid_write_hook = NULL;
+    reset_machine();
+    s_streaming = 0;
+    s_stream_play_addr = 0;
+    s_stream_frame = 0;
+}
+
+
+/* ============================================================
  * .sidreg text cache
  * ============================================================ */
 int sid_sidreg_write(const char *path, const sid_event_t *events, size_t count)

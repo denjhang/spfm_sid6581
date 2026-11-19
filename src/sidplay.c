@@ -34,12 +34,15 @@
 #ifdef _WIN32
 #include <conio.h>
 #include <direct.h>
+#include <io.h>
+#include <process.h>
 #include <windows.h>
 #else
 #include <termios.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <pthread.h>
 #endif
 
 #ifndef _WIN32
@@ -51,8 +54,6 @@
 /* ------------------------------------------------------------------ */
 
 static sidplay_opts_t s_opt;
-static int            s_stop_requested = 0;   /* q */
-static int            s_next_action = 0;      /* 'n', 'b', ',', '.' */
 
 /* Registers defs worth suppressing while the melody is playing: leaving the
  * filter wide open is usually closer to what the composer heard on a 6581 than
@@ -105,43 +106,114 @@ static void hw_mute(void)
 /* keyboard (playlist control)                                         */
 /* ------------------------------------------------------------------ */
 
-static int kb_hit(void)
+/* A dedicated blocking read thread, not a poll.
+ *
+ * The first version called _kbhit() between events, which means a key only
+ * registered while the player happened to be waiting for the next note, and
+ * never at all while a track was being flushed or the pause between tracks
+ * ran. Keys are supposed to interrupt immediately, so the reader blocks in
+ * _getch() and just records the latest request; the replay loop checks that
+ * record at every event and drops whatever it is doing. */
+
+static volatile int s_action = 0;      /* 'q','n','b',',','.' or 0 */
+
+static int kb_read_blocking(void)
 {
 #ifdef _WIN32
-    return _kbhit() ? 1 : 0;
+    /* _getch() talks to the console directly (CONIN$), so it ignores redirected
+     * stdin and returns EOF the moment there is no console. Read fd 0 instead
+     * when stdin is not a terminal, which is what makes piped input - and the
+     * SIDPLAY_KEYS test path - actually reach the reader. */
+    if (!_isatty(_fileno(stdin))) {
+        unsigned char c;
+        if (_read(0, &c, 1) != 1) return -1;
+        return c;
+    }
+    int c = _getch();
+    /* Arrow and function keys arrive as two bytes: 0x00 or 0xE0 then a code.
+     * Swallow the pair so it cannot be mistaken for ',' or '.'. */
+    if (c == 0 || c == 0xE0) { _getch(); return 0; }
+    return c;
 #else
-    /* Raw mode is only worth the trouble on a terminal; when stdin is a pipe
-     * (scripted run) there is nothing to read. */
-    return 0;
+    unsigned char c;
+    if (read(STDIN_FILENO, &c, 1) != 1) return -1;
+    return c;
 #endif
 }
 
-static int kb_get(void)
+static void kb_thread_body(void)
 {
-#ifdef _WIN32
-    return _getch();
-#else
-    return getchar();
-#endif
-}
-
-/* Polled between events rather than in a thread: the player already wakes up
- * on every event boundary, so a 10 ms reaction time costs nothing and there is
- * no second thread racing the FTDI handle. */
-static void kb_poll(void)
-{
-    while (kb_hit()) {
-        int c = kb_get();
+    for (;;) {
+        int c = kb_read_blocking();
+        if (c < 0) break;              /* stdin closed, nothing more to read */
         switch (c) {
-        case 'q': case 'Q': case 27:      s_stop_requested = 1; return;
-        case 'n': case 'N':               s_next_action = 'n';   return;
-        case 'b': case 'B':               s_next_action = 'b';   return;
-        case ',':                         s_next_action = ',';   return;
-        case '.':                         s_next_action = '.';   return;
+        case 'q': case 'Q': case 27: s_action = 'q'; break;
+        case 'n': case 'N':          s_action = 'n'; break;
+        case 'b': case 'B':          s_action = 'b'; break;
+        case ',':                    s_action = ','; break;
+        case '.':                    s_action = '.'; break;
         default: break;
         }
     }
 }
+
+#ifdef _WIN32
+static unsigned __stdcall kb_thread(void *arg)
+{
+    (void)arg;
+    kb_thread_body();
+    return 0;
+}
+#else
+static void *kb_thread(void *arg)
+{
+    (void)arg;
+    kb_thread_body();
+    return NULL;
+}
+#endif
+
+static void kb_start(void)
+{
+#ifdef _WIN32
+    /* No console at all (output redirected into a file, run from a scheduler):
+     * _getch() would fail immediately and the reader would spin. SIDPLAY_KEYS=1
+     * forces the reader on anyway, which is how the interrupt path is tested
+     * with piped input. */
+    if (!_isatty(_fileno(stdin)) && !getenv("SIDPLAY_KEYS")) return;
+    uintptr_t h = _beginthreadex(NULL, 0, kb_thread, NULL, 0, NULL);
+    if (h) CloseHandle((HANDLE)h);
+#else
+    static int raw_done = 0;
+    if (!raw_done && isatty(STDIN_FILENO)) {
+        struct termios t;
+        if (tcgetattr(STDIN_FILENO, &t) == 0) {
+            t.c_lflag &= ~(ICANON | ECHO);
+            t.c_cc[VMIN] = 1;
+            t.c_cc[VTIME] = 0;
+            tcsetattr(STDIN_FILENO, TCSANOW, &t);
+        }
+        raw_done = 1;
+    }
+    pthread_t th;
+    pthread_create(&th, NULL, kb_thread, NULL);
+    pthread_detach(th);
+#endif
+}
+
+/* Take the pending request, if any. Consuming it is what lets the caller tell
+ * "the user pressed something this track" from "nothing happened". */
+static int kb_take(void)
+{
+    int a = s_action;
+    if (a) s_action = 0;
+    return a;
+}
+
+/* The key that interrupted the last replay. replay() consumes the request to
+ * decide it should stop, but the playlist still needs to know *which* key it
+ * was to pick the next track, so the choice is kept here. */
+static int s_interrupt = 0;
 
 /* ------------------------------------------------------------------ */
 /* event stream loading                                                */
@@ -284,8 +356,108 @@ static void emit(const sid_event_t *e)
     sid_write(s_opt.slot, e->reg, e->val);
 }
 
-/* Replay `ev` at wall-clock pace. Returns 0 when the stream finished, -1 when
- * interrupted by the user. */
+/* Play a .sid forever, running the 6502 live.
+ *
+ * A .sid has no end: the play routine is meant to be called indefinitely and
+ * loops inside itself. Rendering a fixed buffer therefore imposes an arbitrary
+ * duration, which is what the earlier version did (and why tracks stopped at
+ * 60 seconds). Here the emulator is advanced one frame at a time, and each
+ * frame's writes are emitted at the times they carry.
+ *
+ * Cost: one play() call is tens of microseconds against the ~20 ms the
+ * previous frame is playing, so the emulation hides inside the playback and
+ * there is no audible stall. The frame is emitted as soon as it is ready, and
+ * the wait for the next frame is the only place the process blocks.
+ *
+ * Returns 0 if the user asked for the next track, -1 if they asked to quit. */
+static int stream_play_sid(const char *path, int subsong, double speed,
+                           sid_song_info_t *out_info)
+{
+    char err[128];
+    sid_song_info_t info;
+    if (sid_stream_open(path, subsong, &info, err, sizeof err) != 0) {
+        fprintf(stderr, "  %s\n", err);
+        return -1;
+    }
+    if (out_info) *out_info = info;
+
+    const double frame_ms = sid_stream_frame_ms();
+    const double us_per_ms = 1000.0 / speed;
+    const int64_t start = spfm_now_us();
+
+    /* The init writes are the first frame; they have t_ms == 0 and must all
+     * land before the first play frame, so they are emitted without waiting. */
+    const sid_event_t *ev = NULL;
+    size_t n = 0;
+    if (sid_stream_next_frame(&ev, &n) != 0) {
+        sid_stream_close();
+        return -1;
+    }
+    sid_set_deferred_flush(true);
+    for (size_t i = 0; i < n; i++) emit(&ev[i]);
+
+    int64_t worst_lag_us = 0;
+    double played_ms = 0.0;
+    int64_t next_report = 1000;      /* ms of music between progress updates */
+
+    for (;;) {
+        if (sid_stream_next_frame(&ev, &n) != 0) break;
+
+        /* Emit this frame's writes, waiting for each one's due time. The
+         * frame's timestamps are absolute from the song start, so they stay
+         * correct no matter how many frames have gone by. */
+        for (size_t i = 0; i < n; i++) {
+            int64_t due = start + (int64_t)(ev[i].t_ms * us_per_ms);
+            if (due > spfm_now_us()) {
+                sid_flush();
+                while (due > spfm_now_us()) {
+                    int k = kb_take();
+                    if (k) {
+                        s_interrupt = k;
+                        sid_set_deferred_flush(false);
+                        sid_flush();
+                        sid_stream_close();
+                        return k == 'q' ? -1 : 0;
+                    }
+                    int64_t left = due - spfm_now_us();
+                    spfm_wait_until_us(spfm_now_us() + (left > 5000 ? 5000 : left));
+                }
+            } else {
+                int64_t lag = spfm_now_us() - due;
+                if (lag > worst_lag_us) worst_lag_us = lag;
+            }
+            emit(&ev[i]);
+        }
+
+        /* Interrupt check between frames as well: a sparse song may have no
+         * event to wait on for hundreds of milliseconds. */
+        int k = kb_take();
+        if (k) {
+            s_interrupt = k;
+            sid_set_deferred_flush(false);
+            sid_flush();
+            sid_stream_close();
+            return k == 'q' ? -1 : 0;
+        }
+
+        played_ms += frame_ms;
+
+        if (played_ms >= next_report) {
+            next_report = (int64_t)(played_ms / 5000 + 1) * 5000;
+            printf("\r  %4.0f s  lag %ld ms    ",
+                   played_ms / 1000.0, (long)(worst_lag_us / 1000));
+            fflush(stdout);
+        }
+    }
+
+    sid_flush();
+    sid_set_deferred_flush(false);
+    sid_stream_close();
+    return 0;
+}
+
+/* Replay a pre-rendered `.sidreg` buffer. Returns 0 at the end of the buffer,
+ * -1 if the user interrupted. */
 static int replay(const sid_event_t *ev, size_t n, double speed, int pace)
 {
     if (n == 0) return 0;
@@ -322,11 +494,16 @@ static int replay(const sid_event_t *ev, size_t n, double speed, int pace)
          * permanent offset. */
         if (due > spfm_now_us()) {
             sid_flush();      /* ship everything due so far, then block */
-            /* Poll the keyboard while waiting, in small steps, so [q] does not
-             * have to wait for the next note. */
+            /* Interruptible wait: never sleep longer than a few ms, so a key
+             * press takes effect straight away instead of at the next note. */
             while (due > spfm_now_us()) {
-                kb_poll();
-                if (s_stop_requested) { sid_set_deferred_flush(false); return -1; }
+                int k = kb_take();
+                if (k) {
+                    s_interrupt = k;
+                    sid_set_deferred_flush(false);
+                    sid_flush();
+                    return -1;
+                }
                 int64_t left = due - spfm_now_us();
                 spfm_wait_until_us(spfm_now_us() + (left > 5000 ? 5000 : left));
             }
@@ -336,6 +513,16 @@ static int replay(const sid_event_t *ev, size_t n, double speed, int pace)
         }
 
         emit(&ev[i]);
+
+        /* Dense passages have no gap long enough to land in, so check here as
+         * well: one compare per event is nothing next to the USB write. */
+        int k = kb_take();
+        if (k) {
+            s_interrupt = k;
+            sid_set_deferred_flush(false);
+            sid_flush();
+            return -1;
+        }
 
         /* Progress is reported per second of music, not per event: at 1200
          * events/s a per-event line would be unreadable. */
@@ -436,18 +623,16 @@ static int cmd_extract(int argc, char **argv)
 static int cmd_play(int argc, char **argv)
 {
     const char *path = NULL;
-    double seconds = 60.0;
+    double seconds = 0.0;          /* 0 = forever, the default */
     double speed = 1.0;
     int subsong = -1;
     int use_cache = 1;
-    int loops = 1;
     int pace = 0;
 
     for (int i = 0; i < argc; i++) {
         if (!strcmp(argv[i], "--seconds") && i + 1 < argc)      seconds = atof(argv[++i]);
         else if (!strcmp(argv[i], "--speed") && i + 1 < argc)   speed = atof(argv[++i]);
         else if (!strcmp(argv[i], "--subsong") && i + 1 < argc) subsong = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--loops") && i + 1 < argc)   loops = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--no-cache"))                use_cache = 0;
         else if (!strcmp(argv[i], "--cache-dir") && i + 1 < argc)
             sidplay_set_cache_dir(argv[++i]);
@@ -464,47 +649,84 @@ static int cmd_play(int argc, char **argv)
         return 1;
     }
     if (speed <= 0) speed = 1.0;
-    if (loops < 1) loops = 1;
 
-    stream_t st;
-    char err[128];
-    if (load_stream(path, subsong, seconds, use_cache, &st, err, sizeof err) != 0) {
-        fprintf(stderr, "%s\n", err);
-        return 1;
-    }
-    if (st.count == 0) {
-        fprintf(stderr, "no register writes captured (subsong out of range?)\n");
+    sid_song_info_t info;
+    memset(&info, 0, sizeof info);
+
+    /* A pre-rendered .sidreg has a fixed length by construction - it is a
+     * dump, not a song - so that path still replays the buffer once. A real
+     * .sid runs live and forever. */
+    if (is_sidreg(path)) {
+        stream_t st;
+        char err[128];
+        if (load_stream(path, subsong, seconds > 0 ? seconds : 1e9,
+                        use_cache, &st, err, sizeof err) != 0) {
+            fprintf(stderr, "%s\n", err);
+            return 1;
+        }
+        if (st.count == 0) {
+            fprintf(stderr, "no register writes in %s\n", path);
+            stream_free(&st);
+            return 1;
+        }
+        printf("stream: %s\n%lu writes over %.1f s\n", st.info.name,
+               (unsigned long)st.count, st.events[st.count - 1].t_ms / 1000.0);
+        fflush(stdout);
+        if (hw_connect() != 0) { stream_free(&st); return 1; }
+        sid_clear_all_regs(s_opt.slot);
+        sid_flush();
+        kb_start();
+        int rc = replay(st.events, st.count, speed, pace);
+        hw_mute();
+        hw_disconnect();
         stream_free(&st);
-        return 1;
+        return rc == 0 ? 0 : 1;
     }
 
-    printf("song: %s\n", st.info.name);
-    printf("%lu writes over %.1f s (%s), speed %.2fx, %d loop(s)\n",
-           (unsigned long)st.count,
-           st.events[st.count - 1].t_ms / 1000.0,
-           st.info.pal ? "PAL" : "NTSC", speed, loops);
+    sid_song_info_t probe;
+    if (sid_song_probe(path, &probe) != 0) {
+        fprintf(stderr, "cannot read header of %s\n", path);
+        return 1;
+    }
+    if (subsong < 0) subsong = probe.start_song ? probe.start_song - 1 : 0;
+    if (subsong >= (int)probe.n_songs) subsong = probe.n_songs - 1;
+
+    printf("song: %s / %s\n", probe.name, probe.author);
+    if (seconds > 0)
+        printf("playing %.0f s (from the start)\n", seconds);
+    else
+        printf("playing until interrupted: [n] next-track marker, [q] quit\n");
+    printf("subsong %d of %u, speed %.2fx\n", subsong, probe.n_songs, speed);
     fflush(stdout);
 
-    if (hw_connect() != 0) { stream_free(&st); return 1; }
+    if (hw_connect() != 0) return 1;
 
     /* Start from a known state: clear every register, then let the song's own
-     * init writes (all timestamped t=0) define the chip. */
+     * init writes define the chip. */
     sid_clear_all_regs(s_opt.slot);
     sid_flush();
+    kb_start();
 
-    int rc = 0;
-    for (int loop = 0; loop < loops && rc == 0; loop++) {
-        if (loops > 1) printf("--- loop %d/%d ---\n", loop + 1, loops);
+    int rc;
+    if (seconds > 0) {
+        /* Bounded run: render just that much and replay it. Used for quick
+         * checks and for `--seconds` given explicitly. */
+        stream_t st;
+        char err[128];
+        if (load_stream(path, subsong, seconds, 0, &st, err, sizeof err) != 0) {
+            fprintf(stderr, "%s\n", err);
+            hw_disconnect();
+            return 1;
+        }
         rc = replay(st.events, st.count, speed, pace);
-        if (rc != 0) break;
-        hw_mute();
-        if (loop + 1 < loops) spfm_delay_ms(250);
+        stream_free(&st);
+    } else {
+        rc = stream_play_sid(path, subsong, speed, &info);
     }
 
     hw_mute();
     hw_disconnect();
-    stream_free(&st);
-    return rc == 0 ? 0 : 1;
+    return (rc < 0) ? 1 : 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -570,18 +792,16 @@ static int scan_dir(const char *dir, entry_t **out, int *count)
 static int cmd_playlist(int argc, char **argv)
 {
     const char *dir = "sid";
-    double seconds = 60.0;
+    double seconds = 0.0;          /* 0 = play each track forever */
     double speed = 1.0;
     int start_idx = 0;
     int subsong = 0;
-    int use_cache = 1;
 
     for (int i = 0; i < argc; i++) {
         if (!strcmp(argv[i], "--seconds") && i + 1 < argc)      seconds = atof(argv[++i]);
         else if (!strcmp(argv[i], "--speed") && i + 1 < argc)   speed = atof(argv[++i]);
         else if (!strcmp(argv[i], "--subsong") && i + 1 < argc) subsong = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--from") && i + 1 < argc)    start_idx = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--no-cache"))                use_cache = 0;
         else if (!strcmp(argv[i], "--cache-dir") && i + 1 < argc)
             sidplay_set_cache_dir(argv[++i]);
         else if (!strcmp(argv[i], "--raw-filter"))              s_keep_filter = 1;
@@ -601,11 +821,13 @@ static int cmd_playlist(int argc, char **argv)
 
     if (hw_connect() != 0) { free(files); return 1; }
 
+    kb_start();
+
     printf("\n%d files in %s\n", nfiles, dir);
-    printf("keys: [n] next  [b] back  [,] prev subsong  [.] next subsong  [q] quit\n\n");
+    printf("each track plays until you press a key.  "
+           "[n] next   [b] back   [,] prev subsong   [.] next subsong   [q] quit\n\n");
 
     int idx = start_idx < 0 ? 0 : (start_idx >= nfiles ? nfiles - 1 : start_idx);
-    int rc = 0;
 
     while (idx >= 0 && idx < nfiles) {
         char path[768];
@@ -623,46 +845,53 @@ static int cmd_playlist(int argc, char **argv)
         } else {
             printf("[%d/%d] %s\n", idx + 1, nfiles, files[idx].name);
         }
-        printf("        subsong %d\n", subsong);
+        printf("        subsong %d, playing...\n", subsong);
         fflush(stdout);
 
-        stream_t st;
-        char err[128];
-        if (load_stream(path, subsong, seconds, use_cache, &st, err, sizeof err) != 0) {
-            fprintf(stderr, "  skip: %s\n", err);
-            idx++;
-            continue;
+        s_action = 0;
+        s_interrupt = 0;
+
+        sid_clear_all_regs(s_opt.slot);
+        sid_flush();
+
+        int rc;
+        if (seconds > 0) {
+            /* Bounded mode: still available for a quick audition. */
+            stream_t st;
+            char err[128];
+            if (load_stream(path, subsong, seconds, 0, &st, err, sizeof err) != 0) {
+                fprintf(stderr, "  skip: %s\n", err);
+                idx++;
+                continue;
+            }
+            rc = st.count ? replay(st.events, st.count, speed, 1) : 0;
+            stream_free(&st);
+        } else {
+            /* Normal mode: run live, forever, until a key arrives. */
+            rc = stream_play_sid(path, subsong, speed, NULL);
         }
 
-        s_stop_requested = 0;
-        s_next_action = 0;
-
-        if (st.count) {
-            sid_clear_all_regs(s_opt.slot);
-            sid_flush();
-            spfm_capture_clear();   /* per-track byte count in dry-run */
-            /* In dry-run the playlist would otherwise take a minute per track
-             * just to sleep; there is nothing to hear, so skip the pacing. */
-            replay(st.events, st.count, speed, !s_opt.dry_run);
-        }
         hw_mute();
-        stream_free(&st);
 
-        if (s_stop_requested) break;
+        /* If playback was interrupted, that key decides what happens next;
+         * otherwise no key was pressed at all, so advance. */
+        int action = s_interrupt ? s_interrupt : kb_take();
+        if (action == 'q') break;
 
-        switch (s_next_action) {
-        case 'b': idx = idx > 0 ? idx - 1 : 0; printf("[BACK]\n\n"); break;
-        case ',': subsong = subsong > 0 ? subsong - 1 : 0; printf("[SUBSONG %d]\n\n", subsong); break;
-        case '.': subsong++; printf("[SUBSONG %d]\n\n", subsong); break;
+        switch (action) {
+        case 'b': idx = idx > 0 ? idx - 1 : 0; printf("\n[BACK]\n\n"); break;
+        case ',': subsong = subsong > 0 ? subsong - 1 : 0; printf("\n[SUBSONG %d]\n\n", subsong); break;
+        case '.': subsong++; printf("\n[SUBSONG %d]\n\n", subsong); break;
         default:  idx++; break;
         }
-        spfm_delay_ms(300);
+        (void)rc;
+        spfm_delay_ms(200);
     }
 
     printf("\nplaylist end\n");
     hw_disconnect();
     free(files);
-    return rc;
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */

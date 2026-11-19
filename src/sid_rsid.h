@@ -66,6 +66,40 @@ int sid_song_extract(const char *path, int subsong, double seconds,
 
 void sid_song_free(sid_event_t *events);
 
+/* ---- live streaming ------------------------------------------------- *
+ * A .sid header has no length field. A C64 tune plays for as long as the play
+ * routine keeps being called, looping inside itself; there is no end marker
+ * and nothing worth detecting. So the player leaves the emulator running and
+ * advances it one frame at a time, forever, while the hardware plays the
+ * previous frame.
+ *
+ * That keeps the playback unbounded without any stall: one frame of 6502 is
+ * tens of microseconds, paid out of the ~20 ms the previous frame is playing.
+ *
+ *   sid_stream_open(path, subsong, &info, err, sizeof err);
+ *   for (;;) {
+ *       const sid_event_t *ev; size_t n;
+ *       sid_stream_next_frame(&ev, &n);   // one play() call
+ *       ...emit at wall-clock times...
+ *   }
+ *
+ * The first next_frame() call returns the init writes (all at t=0); later
+ * calls return one play frame each. t_ms is monotonic for the whole session.
+ * Only one stream is open at a time. */
+
+int  sid_stream_open(const char *path, int subsong, sid_song_info_t *info,
+                     char *err, size_t errlen);
+
+/* *events points into a buffer owned by the stream and stays valid until the
+ * next call. *count may be 0 for a frame that writes no registers.
+ * Returns 0 on success, -1 on error. */
+int  sid_stream_next_frame(const sid_event_t **events, size_t *count);
+
+/* Length of one frame in ms (19.96 PAL / 16.67 NTSC). */
+double sid_stream_frame_ms(void);
+
+void sid_stream_close(void);
+
 /* ---- .sidreg text cache --------------------------------------------- *
  * The 6502 emulation costs about a second per minute of music, so a
  * playlist wants to pay that once. Format is the one the STC32G tools use,
