@@ -19,7 +19,11 @@ SID 6581 / 8580 挂到 SPFM 并行总线的驱动 + 控制台冒烟测试。
 
 ## 当前状态
 
-**写时序已解决，硬件方案已验证可用。**
+**✅ 已上机验证通过：三个声部同时演奏正常。**
+
+- 写时序已解决，单次写入（`--repeat 1`）稳定，音高正确
+- `music` 命令三声部同时工作：脉冲波旋律 + 三角波低音 + 噪声打击乐
+- 曲目：小星星、欢乐颂、生日快乐、巴赫（移植自 `Arduino_SID/SID_Bach`）
 
 问题曾是：只有 `--repeat` ≥ 4 才能稳定发声，且音高不跟随指令。根因是 `/CS` 与 `R/W`
 两路不同源（一路过两个 NOR 门、一路裸接 `/WR`），SID 在同一 PHI2 沿采样时可能采到不一致的组合。
@@ -32,6 +36,80 @@ SID 6581 / 8580 挂到 SPFM 并行总线的驱动 + 控制台冒烟测试。
 4. `PHI2` 由 1 MHz 晶振独立供给（pin8）。
 
 四颗 IC：74LS374 + 74HCT02 + 74HCT32 + 74HC74。不需要移位寄存器，不需要单稳态。
+
+## 快速上手
+
+先切到 exe 所在目录（`ftd2xx64.dll` 必须和 exe 同目录，已经放好了）：
+
+```cmd
+cd /d E:\working\zcode-projects\spfm_sid6581\build
+```
+
+**① 确认连上硬件**
+
+```cmd
+sidtest.exe list
+```
+
+能看到 FTDI 设备就说明 SPFM 在线。看不到就是 USB / 驱动问题。
+
+**② 列出所有曲子**
+
+```cmd
+sidtest.exe music --list
+```
+
+```
+  twinkle   Twinkle Twinkle Little Star
+  ode       Ode to Joy
+  birthday  Happy Birthday
+  bach      Bach (SID_Bach transcription)
+```
+
+**③ 播放**
+
+```cmd
+sidtest.exe music --song twinkle
+sidtest.exe music --song ode
+sidtest.exe music --song birthday
+sidtest.exe music --song bach
+```
+
+不加 `--song` 默认播小星星。**切换曲目就是换 `--song` 后面的名字。**
+
+| 参数 | 作用 | 默认 | 例子 |
+|---|---|---|---|
+| `--song NAME` | 选曲目 | `twinkle` | `--song bach` |
+| `--bpm N` | 速度 20–400 | 120 | `--bpm 90` 慢 / `--bpm 180` 快 |
+| `--loops N` | 重复次数 | 1 | `--loops 3` 连播三遍 |
+| `--list` | 只列曲目不播放 | — | `music --list` |
+
+组合例子：
+
+```cmd
+sidtest.exe music --song bach --bpm 90
+sidtest.exe music --song twinkle --bpm 150 --loops 2
+```
+
+参数顺序随便，`--song bach music` 也能跑，但建议写成 `music --song bach`。
+
+**④ 不接硬件也能验证**（只打印发出去的字节流）
+
+```cmd
+sidtest.exe --dry-run music --song bach
+```
+
+## 三声部分配
+
+| 声部 | 波形 | 用途 | 包络 |
+|---|---|---|---|
+| 1 | 脉冲波 `0x40` | 旋律 | AD=0x08（A=0，D=300 ms）SR=0x06（S=0，R=204 ms） |
+| 2 | 三角波 `0x10` | 低音 | AD=0x0A（D=1500 ms）SR=0x06 |
+| 3 | 噪声 `0x80` | 打击乐 | 底鼓 0x0400/300 ms、军鼓 0x0E00/240 ms、踩镲 0x2400/168 ms |
+
+**钢琴感来自 `sustain = 0`。** SID 的 sustain 是"按住键时保持的音量"：
+填 15 会让音符一直满音量直到下一个音（风琴感），填 0 才会自然衰减到消失。
+音符时值结束前一个 tick 还会主动降 gate，保证每个音都有干净的 0→1 重触发边沿。
 
 ## 编译
 
@@ -46,29 +124,33 @@ make
 
 ## 用法
 
-```bash
-./build/sidtest.exe list                        # 枚举 FTDI 设备
-./build/sidtest.exe init                        # 复位 + 初始化 slot 3
-./build/sidtest.exe selftest                    # 不上硬件，验证生成的字节流
-./build/sidtest.exe scale                       # C 大调音阶（方波）
-./build/sidtest.exe scale --wave saw --filter   # 锯齿 + 低通滤波
-./build/sidtest.exe chord                       # C / Am / F / G / C 三声部
-./build/sidtest.exe music                       # 三声部小曲（默认小星星）
-./build/sidtest.exe music --song ode            # 欢乐颂
-./build/sidtest.exe music --song birthday       # 生日快乐
-./build/sidtest.exe music --song bach           # 巴赫（移植自 Arduino_SID/SID_Bach）
-./build/sidtest.exe music --list                # 列出所有曲子
-./build/sidtest.exe music --bpm 160 --loops 3   # 改速度和重复次数
-./build/sidtest.exe noise                       # 噪声频率扫描
-./build/sidtest.exe pwm                         # 占空比扫描
-./build/sidtest.exe filter                      # 滤波器截止频率扫描
-./build/sidtest.exe adsr                        # 四组 ADSR 对比
-./build/sidtest.exe checkup                     # 上电五项检查（需要万用表/示波器）
-./build/sidtest.exe interactive                 # 手敲寄存器
-./build/sidtest.exe --dry-run scale             # 不连硬件，打印解码后的总线动作
+在 `build/` 目录下（Windows cmd）：
+
+```cmd
+sidtest.exe list                                # 枚举 FTDI 设备
+sidtest.exe init                                # 复位 + 初始化 slot 3
+sidtest.exe selftest                            # 不上硬件，验证生成的字节流
+sidtest.exe music                               # 三声部小曲（默认小星星）
+sidtest.exe music --song ode                    # 欢乐颂
+sidtest.exe music --song birthday               # 生日快乐
+sidtest.exe music --song bach                   # 巴赫（移植自 Arduino_SID/SID_Bach）
+sidtest.exe music --list                        # 列出所有曲子
+sidtest.exe music --bpm 160 --loops 3           # 改速度和重复次数
+sidtest.exe scale                               # C 大调音阶（方波）
+sidtest.exe scale --wave saw --filter           # 锯齿 + 低通滤波
+sidtest.exe chord                               # C / Am / F / G / C 三声部和弦
+sidtest.exe noise                               # 噪声频率扫描
+sidtest.exe pwm                                 # 占空比扫描
+sidtest.exe filter                              # 滤波器截止频率扫描
+sidtest.exe adsr                                # 四组 ADSR 对比
+sidtest.exe checkup                             # 上电五项检查（需要万用表/示波器）
+sidtest.exe interactive                         # 手敲寄存器
+sidtest.exe --dry-run music --song bach         # 不连硬件，打印解码后的总线动作
 ```
 
-常用选项：`--slot N`（默认 3）、`--device N`（默认 0）、`--write-mode`、`--gap N`、`--verbose`。
+在 git bash 里把 `sidtest.exe` 换成 `./build/sidtest.exe` 即可。
+
+常用选项：`--slot N`（默认 3）、`--device N`（默认 0）、`--write-mode`、`--gap N`、`--verbose`、`--repeat N`。
 
 ## 关键约束
 
