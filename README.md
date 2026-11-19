@@ -56,6 +56,7 @@ make
 ./build/sidtest.exe music                       # 三声部小曲（默认小星星）
 ./build/sidtest.exe music --song ode            # 欢乐颂
 ./build/sidtest.exe music --song birthday       # 生日快乐
+./build/sidtest.exe music --song bach           # 巴赫（移植自 Arduino_SID/SID_Bach）
 ./build/sidtest.exe music --list                # 列出所有曲子
 ./build/sidtest.exe music --bpm 160 --loops 3   # 改速度和重复次数
 ./build/sidtest.exe noise                       # 噪声频率扫描

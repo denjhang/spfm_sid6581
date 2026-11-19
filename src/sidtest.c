@@ -326,15 +326,28 @@ typedef struct {
     const mus_step_t *bass;
 } mus_song_t;
 
-/* Melody envelope: instant attack, full sustain, short release so repeated
- * notes separate without a silent gap. */
-#define MUS_AD_MEL   0x00
-#define MUS_SR_MEL   0xF4
-#define MUS_PW_MEL   0x600
+/* Envelopes. SID ADSR digits are A/D/S/R, each 0..15.
+ *
+ * "Piano" feel comes from sustain = 0: the note decays to silence on its own
+ * (decay time) and the key-up only shortens the tail (release). Without that,
+ * sustain = 15 makes every note hold at full volume until the next one, which
+ * is the "infinite organ" sound.
+ *
+ * AD = (attack<<4) | decay, SR = (sustain<<4) | release.
+ * Decay index 8 = 300 ms, 9 = 750 ms, 7 = 240 ms (see sid_adsr_decay_ms). */
+#define MUS_AD_MEL     0x08   /* A=0 (instant), D=8 (300 ms decay)   */
+#define MUS_SR_MEL     0x06   /* S=0 (fade out), R=6 (204 ms release)*/
+#define MUS_PW_MEL     0x600
 
-/* Bass: same attack, slightly longer release for a rounder tail. */
-#define MUS_AD_BASS  0x00
-#define MUS_SR_BASS  0xF5
+#define MUS_AD_BASS    0x0A   /* A=0, D=10 (1500 ms) -- bass notes are
+                               * held for whole bars, so they need a longer
+                               * decay than the melody's 300 ms */
+#define MUS_SR_BASS    0x06   /* S=0 (fade out), R=6 (204 ms)         */
+
+/* Percussion: attack 0 so the transient is instant, decay sets how long the
+ * hit rings. 240 ms is enough to read as a drum instead of a click. */
+#define MUS_AD_DRUM    0x07   /* A=0, D=7 (240 ms)                    */
+#define MUS_SR_DRUM    0x00   /* S=0, R=0                             */
 
 /* --- Twinkle Twinkle Little Star, C major, 128 ticks ---------------- */
 static const mus_step_t MUS_TWINKLE_MEL[] = {
@@ -399,10 +412,27 @@ static const mus_step_t MUS_BDAY_BASS[] = {
     { 0,0 }
 };
 
+/* --- Bach, transcribed from arduino_sid/Source/SID_Bach ------------
+ * Original note table (OFFS = 36, i.e. C2..C3). Transposed +12 here so the
+ * melody sits above the triangle bass instead of colliding with it. */
+static const mus_step_t MUS_BACH_MEL[] = {
+    { 48,2 },{ 50,2 },{ 51,2 },{ 53,2 },{ 55,2 },{ 56,2 },{ 55,2 },{ 53,2 },
+    { 51,2 },{ 50,2 },{ 51,2 },{ 53,2 },{ 51,2 },{ 50,2 },{ 48,2 },{ 60,2 },
+    { 59,2 },{ 60,2 },{ 56,2 },{ 55,2 },{ 53,2 },{ 60,2 },{ 59,2 },{ 60,2 },
+    { 55,2 },{ 53,2 },{ 51,2 },{ 60,2 },{ 59,2 },{ 60,2 },{ 53,2 },{ 55,2 },
+    { 56,2 },{ 50,2 },{ 55,2 },{ 53,2 },{ 51,2 },{ 0,8 },
+};
+static const mus_step_t MUS_BACH_BASS[] = {
+    /* one root per 16 ticks, walking C - F - G - C - F */
+    { 36,16 },{ 41,16 },{ 43,16 },{ 36,16 },{ 41,10 },
+    { 0,0 }
+};
+
 static const mus_song_t MUS_SONGS[] = {
     { "twinkle",  "Twinkle Twinkle Little Star", MUS_TWINKLE_MEL, MUS_TWINKLE_BASS },
     { "ode",      "Ode to Joy",                  MUS_ODE_MEL,     MUS_ODE_BASS     },
     { "birthday", "Happy Birthday",              MUS_BDAY_MEL,    MUS_BDAY_BASS    },
+    { "bach",     "Bach (SID_Bach transcription)", MUS_BACH_MEL,    MUS_BACH_BASS    },
 };
 #define MUS_COUNT ((int)(sizeof MUS_SONGS / sizeof MUS_SONGS[0]))
 
@@ -418,17 +448,26 @@ static void mus_note_start(uint8_t voice, uint8_t note, uint8_t wave,
     sid_note_on(g_slot, voice, note, wave, ad, sr);
 }
 
-/* Noise percussion on voice 3. The frequency register sets the noise clock
- * rate: low = rumble (kick), high = hiss (hat). AD/SR make the burst die
- * within a few tens of milliseconds so hits stay separated. */
-static void mus_drum_hit(uint16_t freq_reg, uint8_t ad, uint8_t sr)
+/* Noise percussion on voice 3.
+ *
+ * The noise generator is clocked by the voice frequency, so a LOW frequency
+ * gives a dark rumble (kick) and a HIGH one gives bright hiss (hat).
+ *
+ * The envelope is what makes it read as a drum rather than a click: attack 0
+ * for an instant transient, sustain 0 so it decays by itself, and a decay
+ * long enough to be heard (kick 300 ms, snare 240 ms, hat 168 ms). Short
+ * decays were what made the previous version sound like interference. */
+static void mus_drum_hit(uint16_t freq_reg, uint8_t decay_idx, uint8_t release)
 {
     uint8_t base = 0x0E;
+    uint8_t ad = (uint8_t)(decay_idx & 0x0F);          /* A=0, D=decay_idx */
+    uint8_t sr = (uint8_t)(release & 0x0F);            /* S=0, R=release   */
+
     sid_write(g_slot, (uint8_t)(base + SID_REG_FREQ_LO), (uint8_t)(freq_reg & 0xFF));
     sid_write(g_slot, (uint8_t)(base + SID_REG_FREQ_HI), (uint8_t)(freq_reg >> 8));
     sid_write(g_slot, (uint8_t)(base + SID_REG_ATTACK_DECAY), ad);
     sid_write(g_slot, (uint8_t)(base + SID_REG_SUSTAIN_REL), sr);
-    /* Gate down first, then gate up: the second write is what retriggers. */
+    /* Gate down first, then gate up: only the 0->1 edge restarts the ADSR. */
     sid_write(g_slot, (uint8_t)(base + SID_REG_CONTROL), SID_CTL_NOISE);
     sid_write(g_slot, (uint8_t)(base + SID_REG_CONTROL),
               (uint8_t)(SID_CTL_NOISE | SID_CTL_GATE));
@@ -505,6 +544,13 @@ static int cmd_music(int argc, char **argv)
         }
 
         for (uint32_t t = 0; t < total; t++) {
+            /* Release one tick early so consecutive notes are articulated
+             * instead of running together. With sustain 0 the note has already
+             * decayed, but dropping the gate still sharpens the attack of the
+             * next one. */
+            if (mleft == 1 && sc->melody[mi].ticks) sid_note_off(g_slot, 0);
+            if (bleft == 1 && sc->bass[bi].ticks)   sid_note_off(g_slot, 1);
+
             /* ---- melody (voice 1, pulse) ---- */
             if (mleft == 0 && sc->melody[mi].ticks) {
                 const mus_step_t *st = &sc->melody[mi++];
@@ -530,12 +576,17 @@ static int cmd_music(int argc, char **argv)
                 bleft = st->ticks;
             }
 
-            /* ---- drums (voice 3, noise): kick on the beat, snare off
-             * it, hat on the eighth-note offbeats. Noise pitch is the noise
-             * clock rate, so a larger value means a brighter hiss. ---- */
-            if ((t % 8) == 0)      mus_drum_hit(0x0500, 0x04, 0x00);  /* kick  */
-            else if ((t % 8) == 4) mus_drum_hit(0x0C00, 0x02, 0x00);  /* snare */
-            else if ((t % 4) == 2) mus_drum_hit(0x2000, 0x00, 0x00);  /* hat   */
+            /* ---- drums (voice 3, noise) ----
+             * decay index: 8 = 300 ms, 7 = 240 ms, 5 = 168 ms, 3 = 72 ms
+             * (see sid_adsr_decay_ms[]). Longer than a tick so the hit is
+             * heard as a drum, short enough not to smear into the next one. */
+            if ((t % 8) == 0) {                    /* kick, 4-on-the-floor */
+                mus_drum_hit(0x0400, 8, 3);
+            } else if ((t % 8) == 4) {             /* snare on the backbeat */
+                mus_drum_hit(0x0E00, 7, 3);
+            } else if ((t % 4) == 2) {             /* hi-hat on the offbeat  */
+                mus_drum_hit(0x2400, 5, 2);
+            }
 
             sid_flush();
 
