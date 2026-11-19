@@ -310,6 +310,267 @@ static int cmd_chord(int argc, char **argv)
 }
 
 /* ------------------------------------------------------------------ */
+/* music - three voices: pulse melody + triangle bass + noise drums    */
+/* ------------------------------------------------------------------ */
+
+/* One score step: a MIDI note (0 = rest) held for `ticks` sixteenths. */
+typedef struct {
+    uint8_t note;
+    uint8_t ticks;
+} mus_step_t;
+
+typedef struct {
+    const char       *name;
+    const char       *title;
+    const mus_step_t *melody;
+    const mus_step_t *bass;
+} mus_song_t;
+
+/* Melody envelope: instant attack, full sustain, short release so repeated
+ * notes separate without a silent gap. */
+#define MUS_AD_MEL   0x00
+#define MUS_SR_MEL   0xF4
+#define MUS_PW_MEL   0x600
+
+/* Bass: same attack, slightly longer release for a rounder tail. */
+#define MUS_AD_BASS  0x00
+#define MUS_SR_BASS  0xF5
+
+/* --- Twinkle Twinkle Little Star, C major, 128 ticks ---------------- */
+static const mus_step_t MUS_TWINKLE_MEL[] = {
+    { 60,4 },{ 60,4 },{ 67,4 },{ 67,4 },   /* C C G G   */
+    { 69,4 },{ 69,4 },{ 67,8 },            /* A A G     */
+    { 65,4 },{ 65,4 },{ 64,4 },{ 64,4 },   /* F F E E   */
+    { 62,4 },{ 62,4 },{ 60,8 },            /* D D C     */
+    { 67,4 },{ 67,4 },{ 65,4 },{ 65,4 },   /* G G F F   */
+    { 64,4 },{ 64,4 },{ 62,8 },            /* E E D     */
+    { 67,4 },{ 67,4 },{ 65,4 },{ 65,4 },   /* G G F F   */
+    { 64,4 },{ 64,4 },{ 62,8 },            /* E E D     */
+    { 60,4 },{ 60,4 },{ 67,4 },{ 67,4 },   /* C C G G   */
+    { 69,4 },{ 69,4 },{ 67,8 },            /* A A G     */
+    { 65,4 },{ 65,4 },{ 64,4 },{ 64,4 },   /* F F E E   */
+    { 62,4 },{ 62,4 },{ 60,8 },            /* D D C     */
+    { 0,0 }
+};
+static const mus_step_t MUS_TWINKLE_BASS[] = {
+    /* one chord per half line: 12 x 16 = 192, matching the melody */
+    { 48,16 },{ 55,16 },   /* C  G   (C C G G / A A G)   */
+    { 53,16 },{ 48,16 },   /* F  C   (F F E E / D D C)   */
+    { 48,16 },{ 55,16 },   /* C  G   (G G F F / E E D)   */
+    { 48,16 },{ 55,16 },   /* C  G                       */
+    { 48,16 },{ 55,16 },   /* C  G                       */
+    { 53,16 },{ 48,16 },   /* F  C                       */
+    { 0,0 }
+};
+
+/* --- Ode to Joy (Beethoven), C major, 128 ticks --------------------- */
+static const mus_step_t MUS_ODE_MEL[] = {
+    { 64,4 },{ 64,4 },{ 65,4 },{ 67,4 },   /* E E F G */
+    { 67,4 },{ 65,4 },{ 64,4 },{ 62,4 },   /* G F E D */
+    { 60,4 },{ 60,4 },{ 62,4 },{ 64,4 },   /* C C D E */
+    { 64,4 },{ 62,4 },{ 62,8 },            /* E D D   */
+    { 64,4 },{ 64,4 },{ 65,4 },{ 67,4 },   /* E E F G */
+    { 67,4 },{ 65,4 },{ 64,4 },{ 62,4 },   /* G F E D */
+    { 60,4 },{ 60,4 },{ 62,4 },{ 64,4 },   /* C C D E */
+    { 62,4 },{ 60,4 },{ 60,8 },            /* D C C   */
+    { 0,0 }
+};
+static const mus_step_t MUS_ODE_BASS[] = {
+    /* one note per line of 16: 8 x 16 = 128 */
+    { 48,16 },{ 55,16 },{ 48,16 },{ 55,16 },
+    { 48,16 },{ 55,16 },{ 48,16 },{ 55,16 },
+    { 0,0 }
+};
+
+/* --- Happy Birthday, C major, 66 ticks ------------------------------ */
+static const mus_step_t MUS_BDAY_MEL[] = {
+    { 67,2 },{ 67,2 },{ 69,4 },{ 67,4 },{ 72,4 },{ 71,8 },
+    { 67,2 },{ 67,2 },{ 69,4 },{ 67,4 },{ 74,4 },{ 72,8 },
+    { 67,2 },{ 67,2 },{ 79,4 },{ 76,4 },{ 72,4 },{ 71,6 },{ 69,2 },
+    { 77,2 },{ 77,2 },{ 76,4 },{ 72,4 },{ 74,4 },{ 72,8 },
+    { 0,0 }
+};
+static const mus_step_t MUS_BDAY_BASS[] = {
+    /* one chord per phrase: 4 x 24 = 96 */
+    { 48,24 },   /* C    (C C D F E C)     */
+    { 55,24 },   /* G    (C C D G E C)     */
+    { 48,24 },   /* C    (C C C' A F E D)  */
+    { 55,24 },   /* G    (B B A F G E C)   */
+    { 0,0 }
+};
+
+static const mus_song_t MUS_SONGS[] = {
+    { "twinkle",  "Twinkle Twinkle Little Star", MUS_TWINKLE_MEL, MUS_TWINKLE_BASS },
+    { "ode",      "Ode to Joy",                  MUS_ODE_MEL,     MUS_ODE_BASS     },
+    { "birthday", "Happy Birthday",              MUS_BDAY_MEL,    MUS_BDAY_BASS    },
+};
+#define MUS_COUNT ((int)(sizeof MUS_SONGS / sizeof MUS_SONGS[0]))
+
+/* Restart a voice on a fresh note. The envelope only restarts on a 0->1 gate
+ * edge, so the gate has to drop first or two identical notes in a row would
+ * be heard as one long note. */
+static void mus_note_start(uint8_t voice, uint8_t note, uint8_t wave,
+                           uint8_t ad, uint8_t sr)
+{
+    uint8_t base = (uint8_t)(voice * 7);
+    sid_write(g_slot, (uint8_t)(base + SID_REG_CONTROL),
+              (uint8_t)(wave & SID_CTL_WAVE_MASK));
+    sid_note_on(g_slot, voice, note, wave, ad, sr);
+}
+
+/* Noise percussion on voice 3. The frequency register sets the noise clock
+ * rate: low = rumble (kick), high = hiss (hat). AD/SR make the burst die
+ * within a few tens of milliseconds so hits stay separated. */
+static void mus_drum_hit(uint16_t freq_reg, uint8_t ad, uint8_t sr)
+{
+    uint8_t base = 0x0E;
+    sid_write(g_slot, (uint8_t)(base + SID_REG_FREQ_LO), (uint8_t)(freq_reg & 0xFF));
+    sid_write(g_slot, (uint8_t)(base + SID_REG_FREQ_HI), (uint8_t)(freq_reg >> 8));
+    sid_write(g_slot, (uint8_t)(base + SID_REG_ATTACK_DECAY), ad);
+    sid_write(g_slot, (uint8_t)(base + SID_REG_SUSTAIN_REL), sr);
+    /* Gate down first, then gate up: the second write is what retriggers. */
+    sid_write(g_slot, (uint8_t)(base + SID_REG_CONTROL), SID_CTL_NOISE);
+    sid_write(g_slot, (uint8_t)(base + SID_REG_CONTROL),
+              (uint8_t)(SID_CTL_NOISE | SID_CTL_GATE));
+}
+
+static int cmd_music(int argc, char **argv)
+{
+    const char *song_name = "twinkle";
+    uint32_t bpm   = 120;
+    uint32_t loops = 1;
+
+    for (int i = 0; i < argc; i++) {
+        if (!strcmp(argv[i], "--song") && i + 1 < argc) {
+            song_name = argv[++i];
+        } else if (!strcmp(argv[i], "--bpm") && i + 1 < argc) {
+            bpm = (uint32_t)atoi(argv[++i]);
+            if (bpm < 20 || bpm > 400) {
+                fprintf(stderr, "bpm must be 20..400\n");
+                return 1;
+            }
+        } else if (!strcmp(argv[i], "--loops") && i + 1 < argc) {
+            loops = (uint32_t)atoi(argv[++i]);
+            if (loops == 0) loops = 1;
+        } else if (!strcmp(argv[i], "--list")) {
+            for (int k = 0; k < MUS_COUNT; k++)
+                printf("  %-9s %s\n", MUS_SONGS[k].name, MUS_SONGS[k].title);
+            return 0;
+        } else {
+            fprintf(stderr, "unknown option '%s'\n", argv[i]);
+            return 1;
+        }
+    }
+
+    const mus_song_t *sc = NULL;
+    for (int k = 0; k < MUS_COUNT; k++) {
+        if (!strcmp(MUS_SONGS[k].name, song_name)) { sc = &MUS_SONGS[k]; break; }
+    }
+    if (!sc) {
+        fprintf(stderr, "unknown song '%s' (try --list)\n", song_name);
+        return 1;
+    }
+
+    /* Song length comes from the melody; the bass array is written to match. */
+    uint32_t total = 0;
+    for (size_t i = 0; sc->melody[i].ticks; i++) total += sc->melody[i].ticks;
+
+    /* One sixteenth note. Integer maths is fine at these tempos. */
+    uint32_t tick_ms = 60000u / (bpm * 4u);
+    if (tick_ms == 0) tick_ms = 1;
+
+    printf("song: %s\n", sc->title);
+    printf("bpm=%lu  tick=%lu ms  ticks=%lu  loops=%lu\n",
+           (unsigned long)bpm, (unsigned long)tick_ms,
+           (unsigned long)total, (unsigned long)loops);
+    printf("voices: 1=pulse melody  2=triangle bass  3=noise drums\n");
+
+    if (connect_device() != 0) return 1;
+
+    sid_init(g_slot, 15);
+    /* No filter: routing all three voices into a low-pass would swallow the
+     * noise channel and make the drums inaudible. */
+    sid_set_filter(g_slot, 0x7FF, 0x00, 0x00);
+    sid_set_pulse(g_slot, 0, MUS_PW_MEL);
+    sid_flush();
+
+    for (uint32_t loop = 0; loop < loops; loop++) {
+        size_t   mi = 0, bi = 0;
+        uint32_t mleft = 0, bleft = 0;
+        uint8_t  last_mel = 0;
+
+        if (loops > 1) {
+            printf("--- loop %lu/%lu ---\n",
+                   (unsigned long)(loop + 1), (unsigned long)loops);
+        }
+
+        for (uint32_t t = 0; t < total; t++) {
+            /* ---- melody (voice 1, pulse) ---- */
+            if (mleft == 0 && sc->melody[mi].ticks) {
+                const mus_step_t *st = &sc->melody[mi++];
+                last_mel = st->note;
+                if (st->note) {
+                    mus_note_start(0, st->note, SID_CTL_PULSE,
+                                   MUS_AD_MEL, MUS_SR_MEL);
+                } else {
+                    sid_note_off(g_slot, 0);
+                }
+                mleft = st->ticks;
+            }
+
+            /* ---- bass (voice 2, triangle) ---- */
+            if (bleft == 0 && sc->bass[bi].ticks) {
+                const mus_step_t *st = &sc->bass[bi++];
+                if (st->note) {
+                    mus_note_start(1, st->note, SID_CTL_TRI,
+                                   MUS_AD_BASS, MUS_SR_BASS);
+                } else {
+                    sid_note_off(g_slot, 1);
+                }
+                bleft = st->ticks;
+            }
+
+            /* ---- drums (voice 3, noise): kick on the beat, snare off
+             * it, hat on the eighth-note offbeats. Noise pitch is the noise
+             * clock rate, so a larger value means a brighter hiss. ---- */
+            if ((t % 8) == 0)      mus_drum_hit(0x0500, 0x04, 0x00);  /* kick  */
+            else if ((t % 8) == 4) mus_drum_hit(0x0C00, 0x02, 0x00);  /* snare */
+            else if ((t % 4) == 2) mus_drum_hit(0x2000, 0x00, 0x00);  /* hat   */
+
+            sid_flush();
+
+            if ((t % 16) == 0) {
+                char nm[8];
+                if (last_mel) note_name(last_mel, nm, sizeof nm);
+                else          snprintf(nm, sizeof nm, "rest");
+                printf("bar %2lu  %-4s", (unsigned long)(t / 16) + 1, nm);
+                fflush(stdout);
+            }
+            if ((t % 16) == 15) printf("\n");
+
+            sleep_ms(tick_ms);
+            if (mleft) mleft--;
+            if (bleft) bleft--;
+        }
+
+        /* Silence everything between loops and at the end. */
+        sid_note_off(g_slot, 0);
+        sid_note_off(g_slot, 1);
+        sid_write(g_slot, (uint8_t)(0x0E + SID_REG_CONTROL), 0x00);
+        sid_flush();
+        sleep_ms(300);
+    }
+    printf("\n");
+
+    if (g_dry_run) {
+        printf("\n--- captured byte stream ---\n");
+        spfm_capture_dump(stdout);
+    }
+    disconnect();
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* noise                                                               */
 /* ------------------------------------------------------------------ */
 static int cmd_noise(int argc, char **argv)
@@ -1723,6 +1984,8 @@ static void usage(void)
         "  reg <r> <d> ...   raw register writes\n"
         "  scale             C major scale on voice 1\n"
         "  chord             C / Am / F / G / C, three voices\n"
+        "  music             three-voice tune: pulse melody + tri bass + noise drums\n"
+        "                    --song twinkle|ode|birthday   --bpm N   --loops N   --list\n"
         "  noise             noise generator frequency sweep\n"
         "  pwm               pulse width sweep\n"
         "  filter            filter cutoff sweep\n"
@@ -1818,6 +2081,7 @@ int main(int argc, char **argv)
     if (!strcmp(cmd, "reg"))         return cmd_reg(nrest, rest);
     if (!strcmp(cmd, "scale"))       return cmd_scale(nrest, rest);
     if (!strcmp(cmd, "chord"))       return cmd_chord(nrest, rest);
+    if (!strcmp(cmd, "music"))       return cmd_music(nrest, rest);
     if (!strcmp(cmd, "noise"))       return cmd_noise(nrest, rest);
     if (!strcmp(cmd, "pwm"))         return cmd_pwm(nrest, rest);
     if (!strcmp(cmd, "filter"))      return cmd_filter(nrest, rest);

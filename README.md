@@ -53,6 +53,11 @@ make
 ./build/sidtest.exe scale                       # C 大调音阶（方波）
 ./build/sidtest.exe scale --wave saw --filter   # 锯齿 + 低通滤波
 ./build/sidtest.exe chord                       # C / Am / F / G / C 三声部
+./build/sidtest.exe music                       # 三声部小曲（默认小星星）
+./build/sidtest.exe music --song ode            # 欢乐颂
+./build/sidtest.exe music --song birthday       # 生日快乐
+./build/sidtest.exe music --list                # 列出所有曲子
+./build/sidtest.exe music --bpm 160 --loops 3   # 改速度和重复次数
 ./build/sidtest.exe noise                       # 噪声频率扫描
 ./build/sidtest.exe pwm                         # 占空比扫描
 ./build/sidtest.exe filter                      # 滤波器截止频率扫描
