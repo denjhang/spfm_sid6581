@@ -19,11 +19,13 @@ SID 6581 / 8580 挂到 SPFM 并行总线的驱动 + 控制台冒烟测试。
 
 ## 当前状态
 
-**✅ 已上机验证通过：三个声部同时演奏正常。**
+**✅ 已上机验证通过：三个声部同时演奏正常，`.sid` 播放已跑通。**
 
 - 写时序已解决，单次写入（`--repeat 1`）稳定，音高正确
 - `music` 命令三声部同时工作：脉冲波旋律 + 三角波低音 + 噪声打击乐
 - 曲目：小星星、欢乐颂、生日快乐、巴赫（移植自 `Arduino_SID/SID_Bach`）
+- `sidplay` 可以直接放 C64 的 `.sid` 文件：内嵌 6502 跑一遍，把寄存器流按时序推到
+  真芯片上；10 秒 R-Type 实测最大滞后 2 ms（一帧 19.96 ms）
 
 问题曾是：只有 `--repeat` ≥ 4 才能稳定发声，且音高不跟随指令。根因是 `/CS` 与 `R/W`
 两路不同源（一路过两个 NOR 门、一路裸接 `/WR`），SID 在同一 PHI2 沿采样时可能采到不一致的组合。
@@ -98,6 +100,49 @@ sidtest.exe music --song twinkle --bpm 150 --loops 2
 ```cmd
 sidtest.exe --dry-run music --song bach
 ```
+
+## 播放 C64 的 .sid 文件
+
+`sid/` 下面有 6 首单曲和 `sid/rsid/` 里 93 首 RSID。`.sid` 里不是音符而是 6502 代码，
+所以播放流程是：**内嵌 6502 跑一遍 → 记录每一条寄存器写入和时间戳 → 按原速推给真芯片**。
+全程纯 C，不依赖 Python。
+
+```cmd
+sidtest.exe sidinfo sid/Commando.sid              :: 看标题、PAL/NTSC、子曲数
+sidtest.exe sidplay sid/Commando.sid              :: 播 60 秒
+sidtest.exe sidplay sid/R-Type.sid --seconds 120  :: 指定时长
+sidtest.exe sidplay sid/R-Type.sid --subsong 3    :: 换子曲（0 起）
+sidtest.exe sidplay sid/R-Type.sid --speed 1.5    :: 1.5 倍速
+sidtest.exe sidplay sid/Robots.sid --loops 2      :: 循环两遍
+sidtest.exe sidlist sid                           :: 整个目录连着放
+sidtest.exe sidlist sid/rsid --from 10            :: 从第 11 首开始
+```
+
+播放列表里按键：`n` 下一首、`b` 上一首、`,` 上一个子曲、`.` 下一个子曲、`q` 退出。
+
+| 参数 | 作用 | 默认 |
+|---|---|---|
+| `--seconds N` | 提取/播放多长 | 60 |
+| `--subsong N` | 子曲序号，0 起 | 文件默认 |
+| `--speed X` | 播放倍速 | 1.0 |
+| `--loops N` | 循环次数 | 1 |
+| `--no-cache` | 不读也不写 `.sidreg` 缓存 | 关 |
+| `--cache-dir DIR` | 缓存目录 | `sid_cache` |
+
+离线渲染（不需要硬件，也不需要 FTDI）：
+
+```cmd
+build\sidextract.exe sid/R-Type.sid rtype.sidreg --seconds 120 --subsong 0
+```
+
+`.sidreg` 是纯文本 `时间(ms) 寄存器 值`，可以直接喂回 `sidplay`，也可以拿来差分对比：
+
+```cmd
+sidtest.exe sidplay rtype.sidreg
+```
+
+**性能**：30 秒的音乐提取约 30 ms（旧 Python/py65 版要几分钟）；实机 10 秒 R-Type
+最大滞后 2 ms。缓存目录 `sid_cache/` 已在 `.gitignore` 里。
 
 ## 三声部分配
 

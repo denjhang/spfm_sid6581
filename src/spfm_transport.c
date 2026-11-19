@@ -15,8 +15,10 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <mmsystem.h>
 #else
 #include <unistd.h>
+#include <time.h>
 #endif
 
 static FT_HANDLE s_handle = NULL;
@@ -27,6 +29,10 @@ static bool      s_dry_run = false;
 static uint8_t  *s_cap = NULL;
 static size_t    s_cap_len = 0;
 static size_t    s_cap_cap = 0;
+
+#ifdef _WIN32
+static bool      s_timer_res_raised = false;
+#endif
 
 /* ------------------------------------------------------------------ */
 /* internal helpers                                                    */
@@ -113,6 +119,15 @@ int spfm_open(int dev_index)
     FT_SetUSBParameters(s_handle, 65536, 65536);
     FT_Purge(s_handle, FT_PURGE_RX | FT_PURGE_TX);
 
+    /* Drop the scheduler tick from 15.6 ms to 1 ms for as long as the device is
+     * open. Without this a Sleep(4) inside the playback wait can block for 15.6
+     * ms, which is most of a C64 frame - the stream then arrives late and the
+     * music drags. Same reasoning as the reference player's hybrid timer. */
+#ifdef _WIN32
+    timeBeginPeriod(1);
+    s_timer_res_raised = true;
+#endif
+
     /* Same DTR/RTS dance the reference driver does before the first byte. */
     FT_SetDtr(s_handle); FT_SetRts(s_handle);
     spfm_delay_ms(1);
@@ -138,6 +153,12 @@ void spfm_close(void)
         s_handle = NULL;
     }
     s_len = 0;
+#ifdef _WIN32
+    if (s_timer_res_raised) {
+        timeEndPeriod(1);
+        s_timer_res_raised = false;
+    }
+#endif
 }
 
 bool spfm_is_open(void)
@@ -314,6 +335,46 @@ void spfm_delay_us(uint32_t us)
     usleep(us);
 #endif
 }
+
+int64_t spfm_now_us(void)
+{
+#ifdef _WIN32
+    LARGE_INTEGER freq, now;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    /* Integer maths keeps the replay timeline free of float drift over a
+     * multi-minute song. */
+    return (int64_t)(now.QuadPart / freq.QuadPart) * 1000000
+         + (int64_t)((now.QuadPart % freq.QuadPart) * 1000000 / freq.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+#endif
+}
+
+void spfm_wait_until_us(int64_t deadline_us)
+{
+    if (s_dry_run) return;
+
+    /* Hybrid wait, the same shape as sleep_hybrid_us() in the reference
+     * player (Denjhang_Music_Player, ym2608_window.cpp): Sleep() for the bulk,
+     * busy-wait the last millisecond.
+     *
+     * Sleep() alone cannot pace a 20 ms frame: Windows rounds it up to the
+     * scheduler tick, 15.6 ms by default, so "sleep 8 ms" can block for 15.
+     * spfm_open() raises the timer resolution to 1 ms with timeBeginPeriod,
+     * which makes the bulk sleep land within about a millisecond; the spin then
+     * removes the remainder. The loop re-reads the clock each pass, so the wait
+     * always targets an absolute deadline rather than accumulating drift. */
+    for (;;) {
+        int64_t left = deadline_us - spfm_now_us();
+        if (left <= 0) return;
+        if (left > 1500) spfm_delay_ms((uint32_t)((left - 1000) / 1000));
+        else             spfm_delay_us((uint32_t)left);
+    }
+}
+
 
 /* ------------------------------------------------------------------ */
 /* dry-run capture                                                     */

@@ -59,6 +59,21 @@ static uint32_t         s_addr_rep = 4;
 static uint32_t         s_data_rep = 8;
 static uint32_t         s_gap_random = 0;
 
+/* See sid6581.h: off for the console commands (one USB flush per write, so a
+ * typed register takes effect at once), on for stream playback (one flush per
+ * frame). */
+static bool             s_deferred = false;
+
+void sid_set_deferred_flush(bool on)
+{
+    s_deferred = on;
+}
+
+bool sid_get_deferred_flush(void)
+{
+    return s_deferred;
+}
+
 void sid_set_write_hook(sid_write_hook_t hook, void *user)
 {
     s_hook = hook;
@@ -209,7 +224,7 @@ void sid_write(uint8_t slot, uint8_t reg, uint8_t data)
         /* YM7129 pattern: one 6-byte record, flush, then host sleep. */
         for (uint32_t i = 0; i < s_write_repeat; i++) {
             spfm_write_two_phase(slot, r, data);
-            spfm_flush();
+            if (!s_deferred) spfm_flush();
             if (s_write_delay_us) spfm_delay_us(s_write_delay_us);
         }
         break;

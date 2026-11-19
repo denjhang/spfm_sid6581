@@ -179,6 +179,21 @@ uint32_t sid_get_write_repeat(void);
 void sid_set_write_mode(sid_write_mode_t mode);
 sid_write_mode_t sid_get_write_mode(void);
 
+/* Deferred flushing.
+ *
+ * In the default two-phase mode every sid_write() ends with a USB flush, so
+ * one register write costs one USB transfer. That is what the interactive and
+ * smoke-test commands want (each command feels immediate), but it is fatal for
+ * .sid playback: one C64 frame carries up to ~50 register writes, and with the
+ * FTDI latency timer at 2 ms a flush per write would inject ~100 ms of USB
+ * turnaround into a 20 ms frame.
+ *
+ * With deferred mode on, sid_write() only buffers and the caller flushes once
+ * per frame. The bus records keep their order, so the SID sees exactly the
+ * same write sequence for a fraction of the transfers. */
+void sid_set_deferred_flush(bool on);
+bool sid_get_deferred_flush(void);
+
 /* NOP ticks inserted between the two phases in PHASED modes (1 tick is one
  * firmware loop iteration, roughly a byte time at 1.5 Mbaud). */
 void     sid_set_phase_gap(uint32_t ticks);

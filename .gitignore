@@ -11,3 +11,9 @@ refs/x/
 *.swp
 .DS_Store
 Thumbs.db
+
+# rendered .sid streams (regenerated on demand, seconds per file)
+sid_cache/
+
+# local music library (copyrighted HVSC tunes, not published here)
+sid/

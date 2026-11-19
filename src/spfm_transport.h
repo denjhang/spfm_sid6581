@@ -105,6 +105,19 @@ bool spfm_flush(void);
 void spfm_delay_ms(uint32_t ms);
 void spfm_delay_us(uint32_t us);
 
+/* Monotonic microsecond clock, plus a wait that targets an absolute deadline.
+ *
+ * Replaying a .sid means pushing each register write out at the wall-clock
+ * time recorded in the stream. Sleeping "for N us" per event would accumulate
+ * the scheduler's error over the whole song, so the player keeps one start
+ * timestamp and waits until start + t_event; the error then stays bounded
+ * instead of growing. Returns immediately if the deadline already passed.
+ *
+ * In dry-run mode now_us() still returns the real clock (so the player's
+ * pacing code runs for real) while the wait itself is skipped. */
+int64_t spfm_now_us(void);
+void    spfm_wait_until_us(int64_t deadline_us);
+
 /* ---- Dry-run capture (no hardware) ---------------------------------- *
  * When enabled, nothing is sent to USB; every byte is appended to an
  * in-memory log so the generated stream can be inspected or asserted. */

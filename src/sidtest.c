@@ -22,6 +22,7 @@
 
 #include "spfm_transport.h"
 #include "sid6581.h"
+#include "sidplay.h"
 
 /* ------------------------------------------------------------------ */
 /* midi.c defaults                                                     */
@@ -2036,7 +2037,16 @@ static void usage(void)
         "  scale             C major scale on voice 1\n"
         "  chord             C / Am / F / G / C, three voices\n"
         "  music             three-voice tune: pulse melody + tri bass + noise drums\n"
-        "                    --song twinkle|ode|birthday   --bpm N   --loops N   --list\n"
+        "                    --song twinkle|ode|birthday|bach   --bpm N   --loops N   --list\n"
+        "\n"
+        "  .sid files (PSID/RSID) - run the 6502 once, replay the register stream:\n"
+        "  sidinfo <f.sid>       header only (title, clock, subsong count)\n"
+        "  sidextract <f.sid> <out.sidreg> [--seconds N] [--subsong N]\n"
+        "                        render the stream, no hardware needed\n"
+        "  sidplay <f.sid|.sidreg> [--seconds N] [--subsong N] [--speed X] [--loops N]\n"
+        "                        play one file\n"
+        "  sidlist [dir=sid]     playlist, keys: n next, b back, , / . subsong, q quit\n"
+        "                        --from N  --seconds N  --no-cache  --cache-dir DIR\n"
         "  noise             noise generator frequency sweep\n"
         "  pwm               pulse width sweep\n"
         "  filter            filter cutoff sweep\n"
@@ -2126,6 +2136,19 @@ int main(int argc, char **argv)
     const char *cmd = argv[i++];
     char **rest = argv + i;
     int nrest = strip_common_opts(rest, argc - i);
+
+    /* .sid playback shares the write-timing options above, so build one
+     * options struct and hand it over. */
+    sidplay_opts_t po;
+    po.slot = g_slot;
+    po.device = g_device;
+    po.dry_run = g_dry_run;
+    po.write_mode = 0;      /* already applied by strip_common_opts / main */
+
+    if (!strcmp(cmd, "sidplay"))     return sidplay_do_play(nrest, rest, &po);
+    if (!strcmp(cmd, "sidextract"))  return sidplay_do_extract(nrest, rest, &po);
+    if (!strcmp(cmd, "sidinfo"))     return sidplay_do_info(nrest, rest, &po);
+    if (!strcmp(cmd, "sidlist"))     return sidplay_do_list(nrest, rest, &po);
 
     if (!strcmp(cmd, "list"))        return cmd_list();
     if (!strcmp(cmd, "init"))        return cmd_init(nrest, rest);
