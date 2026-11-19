@@ -179,9 +179,17 @@ void sid_write(uint8_t slot, uint8_t reg, uint8_t data)
     switch (s_mode_w) {
     case SID_WRITE_BURST:
         /* Path A, no host interaction at all: the firmware fires both bus
-         * cycles itself. Cheapest possible sequence, 4 bytes per write. */
-        for (uint32_t i = 0; i < s_write_repeat; i++)
+         * cycles itself. Cheapest possible sequence, 4 bytes per write.
+         *
+         * The flush has to honour deferred mode like the two-phase case does,
+         * otherwise playback would never get the bytes out because it is the
+         * caller's job to flush once per frame. Outside playback a flush per
+         * write keeps the console commands immediate. */
+        for (uint32_t i = 0; i < s_write_repeat; i++) {
             spfm_write_path_a(slot, 0x00, r, data);
+            if (!s_deferred) spfm_flush();
+            if (s_write_delay_us) spfm_delay_us(s_write_delay_us);
+        }
         break;
 
     case SID_WRITE_PATH_A_SOFT:

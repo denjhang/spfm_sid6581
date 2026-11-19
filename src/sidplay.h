@@ -28,6 +28,24 @@ typedef struct {
                            * sid_write_mode_t value */
 } sidplay_opts_t;
 
+/* Write protocol, i.e. how one register write becomes bus cycles.
+ *
+ *   "2step" (default) - two separate Path B commands, gap under host control:
+ *                       [slot,0x80,addr] then [slot,0x81,data]
+ *   "1step"           - one Path A command, firmware emits both bus cycles
+ *                       itself: [slot,0x00,addr,data]
+ *
+ * These are the two settings worth judging by ear; the exotic variants
+ * (split, nop-paced, path-a-soft) stay reachable through --write-mode.
+ * Returns 0 if the name was recognised, -1 otherwise. */
+int         sidplay_set_proto(const char *name);
+const char *sidplay_proto_name(void);
+
+/* Tell the player that the write mode was already chosen elsewhere (sidtest's
+ * --write-mode calls sid_set_write_mode directly), so it must not fall back to
+ * its own playback default. */
+void sidplay_set_proto_explicit(void);
+
 /* Each returns 0 on success, 1 on a usage or hardware error. */
 int sidplay_do_play(int argc, char **argv, const sidplay_opts_t *opts);
 int sidplay_do_extract(int argc, char **argv, const sidplay_opts_t *opts);

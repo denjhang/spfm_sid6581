@@ -114,25 +114,29 @@ sidtest.exe --dry-run music --song bach
 
 ```cmd
 sidtest.exe sidinfo sid/Commando.sid              :: 看标题、PAL/NTSC、子曲数
-sidtest.exe sidplay sid/Commando.sid              :: 播 60 秒
-sidtest.exe sidplay sid/R-Type.sid --seconds 120  :: 指定时长
+sidtest.exe sidplay sid/Commando.sid              :: 无限播，按键停
+sidtest.exe sidplay sid/R-Type.sid --seconds 120  :: 只播 120 秒
 sidtest.exe sidplay sid/R-Type.sid --subsong 3    :: 换子曲（0 起）
 sidtest.exe sidplay sid/R-Type.sid --speed 1.5    :: 1.5 倍速
-sidtest.exe sidplay sid/Robots.sid --loops 2      :: 循环两遍
 sidtest.exe sidlist sid                           :: 整个目录连着放
 sidtest.exe sidlist sid/rsid --from 10            :: 从第 11 首开始
 ```
 
 播放列表里按键：`n` 下一首、`b` 上一首、`,` 上一个子曲、`.` 下一个子曲、`q` 退出。
+不带 `--seconds` 时每首一直播到你按键，没有时长上限，也不去猜循环点。
 
 | 参数 | 作用 | 默认 |
 |---|---|---|
-| `--seconds N` | 提取/播放多长 | 60 |
+| `--seconds N` | 提取/播放多长 | 0 = 无限 |
 | `--subsong N` | 子曲序号，0 起 | 文件默认 |
 | `--speed X` | 播放倍速 | 1.0 |
-| `--loops N` | 循环次数 | 1 |
+| `--proto P` | 写入协议：`1step`（一条 Path A）或 `2step`（两条 Path B） | `1step` |
 | `--no-cache` | 不读也不写 `.sidreg` 缓存 | 关 |
 | `--cache-dir DIR` | 缓存目录 | `sid_cache` |
+
+写协议是唯一需要按硬件调的参数：这套接线下 SID 是异步写器件，`1step` 实测兼容性
+更好（`2step` 会放坏一部分曲子）；换回旧的四芯片接线时用 `--proto 2step`。
+启动时会打印实际用的协议。
 
 离线渲染（不需要硬件，也不需要 FTDI）：
 

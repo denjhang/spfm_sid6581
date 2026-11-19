@@ -637,6 +637,12 @@ static int cmd_play(int argc, char **argv)
         else if (!strcmp(argv[i], "--cache-dir") && i + 1 < argc)
             sidplay_set_cache_dir(argv[++i]);
         else if (!strcmp(argv[i], "--raw-filter"))              s_keep_filter = 1;
+        else if (!strcmp(argv[i], "--proto") && i + 1 < argc) {
+            if (sidplay_set_proto(argv[++i]) != 0) {
+                fprintf(stderr, "--proto must be 1step or 2step\n");
+                return 1;
+            }
+        }
         else if (!strcmp(argv[i], "--pace"))                    pace = 1;
         else if (argv[i][0] == '-') {
             fprintf(stderr, "unknown option '%s'\n", argv[i]);
@@ -645,7 +651,9 @@ static int cmd_play(int argc, char **argv)
     }
 
     if (!path) {
-        fprintf(stderr, "usage: sidplay <file.sid|file.sidreg> [options]\n");
+        fprintf(stderr, "usage: sidplay <file.sid|file.sidreg> [options]\n"
+                        "  --proto 1step|2step   write protocol (default 2step)\n"
+                        "  --seconds N  --subsong N  --speed X  --no-cache\n");
         return 1;
     }
     if (speed <= 0) speed = 1.0;
@@ -696,7 +704,8 @@ static int cmd_play(int argc, char **argv)
         printf("playing %.0f s (from the start)\n", seconds);
     else
         printf("playing until interrupted: [n] next-track marker, [q] quit\n");
-    printf("subsong %d of %u, speed %.2fx\n", subsong, probe.n_songs, speed);
+    printf("subsong %d of %u, speed %.2fx, %s writes\n", subsong, probe.n_songs,
+           speed, sidplay_proto_name());
     fflush(stdout);
 
     if (hw_connect() != 0) return 1;
@@ -805,6 +814,12 @@ static int cmd_playlist(int argc, char **argv)
         else if (!strcmp(argv[i], "--cache-dir") && i + 1 < argc)
             sidplay_set_cache_dir(argv[++i]);
         else if (!strcmp(argv[i], "--raw-filter"))              s_keep_filter = 1;
+        else if (!strcmp(argv[i], "--proto") && i + 1 < argc) {
+            if (sidplay_set_proto(argv[++i]) != 0) {
+                fprintf(stderr, "--proto must be 1step or 2step\n");
+                return 1;
+            }
+        }
         else if (argv[i][0] == '-') {
             fprintf(stderr, "unknown option '%s'\n", argv[i]);
             return 1;
@@ -825,7 +840,8 @@ static int cmd_playlist(int argc, char **argv)
 
     printf("\n%d files in %s\n", nfiles, dir);
     printf("each track plays until you press a key.  "
-           "[n] next   [b] back   [,] prev subsong   [.] next subsong   [q] quit\n\n");
+           "[n] next   [b] back   [,] prev subsong   [.] next subsong   [q] quit\n");
+    printf("write protocol: %s\n\n", sidplay_proto_name());
 
     int idx = start_idx < 0 ? 0 : (start_idx >= nfiles ? nfiles - 1 : start_idx);
 
@@ -895,6 +911,56 @@ static int cmd_playlist(int argc, char **argv)
 }
 
 /* ------------------------------------------------------------------ */
+/* write protocol                                                      */
+/* ------------------------------------------------------------------ */
+
+/* The two protocols that matter for the "is one step enough?" experiment.
+ * Everything else in sid_write_mode_t is a probe for a specific failure
+ * (split to separate the two phases, *-soft to isolate USB pacing); these two
+ * are the honest candidates for production. */
+/* Set when the caller named a protocol (or a write mode) on the command line.
+ * Without it, apply_common() would keep overwriting an explicit choice with
+ * the playback default. */
+static int s_proto_explicit = 0;
+
+int sidplay_set_proto(const char *name)
+{
+    if (!name) return -1;
+    if (!strcmp(name, "2step") || !strcmp(name, "two-phase") ||
+        !strcmp(name, "two_phase") || !strcmp(name, "2")) {
+        sid_set_write_mode(SID_WRITE_TWO_PHASE);
+        s_proto_explicit = 1;
+        return 0;
+    }
+    if (!strcmp(name, "1step") || !strcmp(name, "path-a") ||
+        !strcmp(name, "burst") || !strcmp(name, "1")) {
+        sid_set_write_mode(SID_WRITE_BURST);
+        s_proto_explicit = 1;
+        return 0;
+    }
+    return -1;
+}
+
+void sidplay_set_proto_explicit(void)
+{
+    s_proto_explicit = 1;
+}
+
+/* Read back from the driver rather than remembering a name, so --write-mode
+ * and --proto cannot disagree about what is actually on the bus. */
+const char *sidplay_proto_name(void)
+{
+    switch (sid_get_write_mode()) {
+    case SID_WRITE_BURST:          return "1step";
+    case SID_WRITE_TWO_PHASE:      return "2step";
+    case SID_WRITE_TWO_PHASE_NOP:  return "2step+nop";
+    case SID_WRITE_PATH_A_SOFT:    return "1step+flush";
+    case SID_WRITE_SPLIT:          return "split";
+    default:                       return "?";
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* dispatcher                                                          */
 /* ------------------------------------------------------------------ */
 
@@ -905,8 +971,17 @@ static void apply_common(const sidplay_opts_t *opts)
 {
     if (!opts) return;
     s_opt = *opts;
-    if (s_opt.write_mode > 0)
+    if (s_opt.write_mode > 0) {
         sid_set_write_mode((sid_write_mode_t)s_opt.write_mode);
+        s_proto_explicit = 1;
+    }
+    /* Playback default: one Path A command per register write. Measured on
+     * this board, 1step played several tunes that 2step mangled, which fits
+     * the async model - the SID latches on /CS and R/W, so there is nothing
+     * for a host-controlled gap to accomplish. 2step stays one flag away
+     * because it is what the earlier wiring needed. */
+    if (!s_proto_explicit)
+        sid_set_write_mode(SID_WRITE_BURST);
 }
 
 int sidplay_do_play(int argc, char **argv, const sidplay_opts_t *opts)

@@ -1991,6 +1991,11 @@ static int strip_common_opts(char **argv, int argc)
             else if (!strcmp(m, "burst") ||
                      !strcmp(m, "path-a"))          sid_set_write_mode(SID_WRITE_BURST);
             else if (!strcmp(m, "path-a-soft"))     sid_set_write_mode(SID_WRITE_PATH_A_SOFT);
+            sidplay_set_proto_explicit();
+            consumed = 2;
+        } else if (!strcmp(argv[r], "--proto") && r + 1 < argc) {
+            if (sidplay_set_proto(argv[r + 1]) != 0)
+                fprintf(stderr, "--proto must be 1step or 2step\n");
             consumed = 2;
         } else if (!strcmp(argv[r], "--single")) {
             sid_set_write_repeat(1);
@@ -2018,6 +2023,8 @@ static void usage(void)
         "  --verbose       print every register write\n"
         "  --write-mode M  two-phase (default) | two-phase-nop | burst | "
         "path-a-soft | split\n"
+        "  --proto P       1step | 2step: the write protocol used for playback\n"
+        "                  (2step = two Path B commands, 1step = one Path A)\n"
         "  --delay US      per-write host sleep (default 0)\n"
         "  --repeat N      send each write N times (default 1)\n"
         "  --gap N         NOP ticks between phases (default 0)\n"
@@ -2100,6 +2107,7 @@ int main(int argc, char **argv)
                         "burst|path-a-soft|two-phase|two-phase-nop|split\n");
                 return 1;
             }
+            sidplay_set_proto_explicit();
         } else if (!strcmp(argv[i], "--delay") && i + 1 < argc) {
             sid_set_write_delay((uint32_t)strtoul(argv[++i], NULL, 0));
         } else if (!strcmp(argv[i], "--repeat") && i + 1 < argc) {
@@ -2112,6 +2120,11 @@ int main(int argc, char **argv)
             sid_set_phase_gap((uint32_t)strtoul(argv[++i], NULL, 0));
         } else if (!strcmp(argv[i], "--gap-rand") && i + 1 < argc) {
             sid_set_gap_random((uint32_t)strtoul(argv[++i], NULL, 0));
+        } else if (!strcmp(argv[i], "--proto") && i + 1 < argc) {
+            if (sidplay_set_proto(argv[++i]) != 0) {
+                fprintf(stderr, "--proto must be 1step or 2step\n");
+                return 1;
+            }
         } else if (!strcmp(argv[i], "--verbose")) {
             g_verbose = 1;
             sid_set_write_hook(hook_print, NULL);
