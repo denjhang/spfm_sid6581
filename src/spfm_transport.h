@@ -101,6 +101,23 @@ void spfm_nop(uint32_t n);
 /* Push everything buffered to USB. Returns false on write error. */
 bool spfm_flush(void);
 
+/* Bytes still sitting in the FTDI driver's transmit queue. Zero when the
+ * device is closed or in dry-run mode, so a caller can treat it as "drained".
+ *
+ * This is the counterpart of MDPlayer's IsBufferEmpty(): without it the player
+ * has no way to tell "the bytes are queued" from "the bytes are on the wire",
+ * and a dense stream just fills the queue until the driver starts refusing
+ * them. */
+size_t spfm_tx_pending(void);
+
+/* Flush, then wait until the transmit queue drops below `low_water` bytes or
+ * `deadline_us` passes (pass 0 for "no deadline"). Returns the byte count still
+ * pending when it gave up, so the caller can report a sustained backlog.
+ *
+ * The wait is coalesced: it queries the queue once every ~200 us rather than
+ * spinning, and it never sleeps past the deadline. */
+size_t spfm_flush_drain(size_t low_water, int64_t deadline_us);
+
 /* Wall-clock delay for long waits; the byte buffer is flushed first. */
 void spfm_delay_ms(uint32_t ms);
 void spfm_delay_us(uint32_t us);

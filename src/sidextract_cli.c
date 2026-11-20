@@ -25,6 +25,7 @@ static void usage(const char *argv0)
 {
     fprintf(stderr,
             "usage: %s <file.sid> [<out.sidreg>] [--seconds N] [--subsong N] [--rsid]\n"
+            "          [--limit HZ]\n"
             "       %s <file.sid> --info\n",
             argv0, argv0);
 }
@@ -44,6 +45,8 @@ int main(int argc, char **argv)
             subsong = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--rsid")) {
             sid_set_rsid_mode(1);
+        } else if (!strcmp(argv[i], "--limit") && i + 1 < argc) {
+            sid_set_volume_limit(atof(argv[++i]));
         } else if (!strcmp(argv[i], "--info") || !strcmp(argv[i], "-i")) {
             info_only = 1;
         } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
@@ -102,6 +105,19 @@ int main(int argc, char **argv)
                "for digi/sample playback\n");
     else
         printf("  model   : RSID (full clock + interrupts)\n");
+
+    double lim = sid_get_volume_limit();
+    if (lim > 0.0) {
+        unsigned long made = 0, kept = 0;
+        sid_get_limit_stats(&made, &kept);
+        double secs = ev && n ? ev[n - 1].t_ms / 1000.0 : seconds;
+        printf("  $D418   : limited to %.0f Hz - %lu of %lu samples kept",
+               lim, kept, made);
+        if (secs > 0.0)
+            printf(" (%.0f/s, was %.0f/s)", (double)kept / secs,
+                   (double)made / secs);
+        printf("\n");
+    }
     if (getenv("SIDR_DEBUG")) sidr_debug_report();
 
     if (out_path) {

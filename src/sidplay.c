@@ -60,6 +60,22 @@ static sidplay_opts_t s_opt;
  * whatever cutoff a 6581-specific init wrote. Off by default - see --no-touch. */
 static int s_keep_filter = 0;
 
+/* ---- link-side throttling ------------------------------------------ *
+ * The emulator side can be told to decimate $D418 (--limit); this is the other
+ * half, and it mirrors MDPlayer's SendData() + IsBufferEmpty() pair: after
+ * pushing a batch, ask the driver how much is still queued and wait for it to
+ * go out before queueing more.
+ *
+ * Without it the player has no feedback at all. Bytes are handed to the FTDI
+ * driver faster than 1.5 Mbaud drains them, the driver's queue grows, and once
+ * it is full FT_Write either blocks or fails - which looks like a stutter or a
+ * dropout rather than a clean rate limit. Checking is cheap (one FT_GetStatus)
+ * and only done when --limit is in use, so the sparse PSID path is untouched. */
+static int      s_drain = 0;
+static size_t   s_drain_low = 64;        /* bytes allowed to remain queued */
+static size_t   s_peak_pending = 0;
+static int      s_starved = 0;           /* times a deadline expired with a backlog */
+
 /* ------------------------------------------------------------------ */
 /* hardware                                                            */
 /* ------------------------------------------------------------------ */
@@ -90,6 +106,24 @@ static int hw_connect(void)
 static void hw_disconnect(void)
 {
     if (!s_opt.dry_run) spfm_close();
+}
+
+/* Ship the frame, then (in --limit mode) confirm the link actually drained.
+ *
+ * Called where a flush already happens: at the start of a wait, and at the end
+ * of a frame. `deadline_us` bounds the drain so a slow link still lets the
+ * player keep its schedule - being late is recoverable, blocking forever is
+ * not. */
+static void flush_paced(int64_t deadline_us)
+{
+    if (!s_drain) { sid_flush(); return; }
+
+    size_t left = spfm_flush_drain(s_drain_low, deadline_us);
+    if (left > s_peak_pending) s_peak_pending = left;
+    /* A leftover backlog means the link could not keep up within this frame's
+     * budget. Counted rather than reported immediately: one occurrence is
+     * normal jitter, a steady stream of them is the real bandwidth ceiling. */
+    if (deadline_us > 0 && left > s_drain_low) s_starved++;
 }
 
 /* Stop all three voices without waiting for the release phase, so a song
@@ -249,6 +283,27 @@ void sidplay_set_cache_dir(const char *dir)
     g_cache_dir_override = dir;
 }
 
+/* Renders of the same song under different emulator settings are different
+ * streams, so they must not share a cache file. Empty means "the default,
+ * settings-independent render" - the name that already exists on disk from
+ * before --rsid and --limit were added. */
+static char g_cache_tag[32] = "";
+
+static void update_cache_tag(void)
+{
+    char *p = g_cache_tag;
+    size_t left = sizeof g_cache_tag;
+
+    g_cache_tag[0] = 0;
+    if (sid_get_rsid_mode()) {
+        int n = snprintf(p, left, "rsid");
+        p += n; left -= (size_t)n;
+    }
+    double hz = sid_get_volume_limit();
+    if (hz > 0.0 && left > 1)
+        snprintf(p, left, "%sl%g", g_cache_tag[0] ? "_" : "", hz);
+}
+
 static int cache_dir_for(const char *sid_path, char *buf, size_t len)
 {
     (void)sid_path;
@@ -298,8 +353,9 @@ static int load_stream(const char *path, int subsong, double seconds,
     if (use_cache) {
         char cache_dir[512], cache_path[768];
         cache_dir_for(path, cache_dir, sizeof cache_dir);
+        update_cache_tag();
         if (sid_sidreg_cache_name(cache_path, sizeof cache_path, cache_dir,
-                                  path, subsong, seconds) == 0 &&
+                                  path, subsong, seconds, g_cache_tag) == 0 &&
             sid_sidreg_exists(cache_path)) {
             if (sid_sidreg_read(cache_path, &st->events, &st->count) == 0) {
                 st->borrowed = 1;
@@ -319,8 +375,9 @@ static int load_stream(const char *path, int subsong, double seconds,
     if (use_cache && st->count) {
         char cache_dir[512], cache_path[768];
         cache_dir_for(path, cache_dir, sizeof cache_dir);
+        update_cache_tag();
         if (sid_sidreg_cache_name(cache_path, sizeof cache_path, cache_dir,
-                                  path, subsong, seconds) == 0) {
+                                  path, subsong, seconds, g_cache_tag) == 0) {
             /* Failing to write the cache is never worth aborting playback. */
             _mkdir(cache_dir);
             sid_sidreg_write(cache_path, st->events, st->count);
@@ -409,7 +466,7 @@ static int stream_play_sid(const char *path, int subsong, double speed,
         for (size_t i = 0; i < n; i++) {
             int64_t due = start + (int64_t)(ev[i].t_ms * us_per_ms);
             if (due > spfm_now_us()) {
-                sid_flush();
+                flush_paced(due);
                 while (due > spfm_now_us()) {
                     int k = kb_take();
                     if (k) {
@@ -444,13 +501,18 @@ static int stream_play_sid(const char *path, int subsong, double speed,
 
         if (played_ms >= next_report) {
             next_report = (int64_t)(played_ms / 5000 + 1) * 5000;
-            printf("\r  %4.0f s  lag %ld ms    ",
-                   played_ms / 1000.0, (long)(worst_lag_us / 1000));
+            if (s_drain)
+                printf("\r  %4.0f s  lag %ld ms  tx %lu B  starved %d    ",
+                       played_ms / 1000.0, (long)(worst_lag_us / 1000),
+                       (unsigned long)s_peak_pending, s_starved);
+            else
+                printf("\r  %4.0f s  lag %ld ms    ",
+                       played_ms / 1000.0, (long)(worst_lag_us / 1000));
             fflush(stdout);
         }
     }
 
-    sid_flush();
+    flush_paced(0);
     sid_set_deferred_flush(false);
     sid_stream_close();
     return 0;
@@ -493,7 +555,7 @@ static int replay(const sid_event_t *ev, size_t n, double speed, int pace)
          * is emitted immediately so a stall turns into a bunch rather than a
          * permanent offset. */
         if (due > spfm_now_us()) {
-            sid_flush();      /* ship everything due so far, then block */
+            flush_paced(due);  /* ship everything due so far, then block */
             /* Interruptible wait: never sleep longer than a few ms, so a key
              * press takes effect straight away instead of at the next note. */
             while (due > spfm_now_us()) {
@@ -632,6 +694,7 @@ static int cmd_play(int argc, char **argv)
     /* PSID model unless asked otherwise: see sid_rsid.h. Digi tracks need
      * --rsid, and their write rate is beyond what the SPFM link can carry. */
     sid_set_rsid_mode(0);
+    sid_set_volume_limit(0.0);
 
     for (int i = 0; i < argc; i++) {
         if (!strcmp(argv[i], "--seconds") && i + 1 < argc)      seconds = atof(argv[++i]);
@@ -639,6 +702,7 @@ static int cmd_play(int argc, char **argv)
         else if (!strcmp(argv[i], "--subsong") && i + 1 < argc) subsong = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--no-cache"))                use_cache = 0;
         else if (!strcmp(argv[i], "--rsid"))                    sid_set_rsid_mode(1);
+        else if (!strcmp(argv[i], "--limit") && i + 1 < argc)   sid_set_volume_limit(atof(argv[++i]));
         else if (!strcmp(argv[i], "--cache-dir") && i + 1 < argc)
             sidplay_set_cache_dir(argv[++i]);
         else if (!strcmp(argv[i], "--raw-filter"))              s_keep_filter = 1;
@@ -660,10 +724,13 @@ static int cmd_play(int argc, char **argv)
                         "  --proto 1step|2step   write protocol (default 1step)\n"
                         "  --rsid                run the machine with clocks and "
                         "interrupts (digi drums; heavy)\n"
+                        "  --limit HZ            cap the $D418 volume-write rate "
+                        "(with --rsid; e.g. 200)\n"
                         "  --seconds N  --subsong N  --speed X  --no-cache\n");
         return 1;
     }
     if (speed <= 0) speed = 1.0;
+    s_drain = sid_get_volume_limit() > 0.0;
 
     sid_song_info_t info;
     memset(&info, 0, sizeof info);
@@ -714,6 +781,9 @@ static int cmd_play(int argc, char **argv)
     printf("subsong %d of %u, speed %.2fx, %s writes, %s model\n",
            subsong, probe.n_songs, speed, sidplay_proto_name(),
            sid_get_rsid_mode() ? "RSID" : "PSID");
+    if (sid_get_volume_limit() > 0.0)
+        printf("$D418 limited to %.0f Hz on a fixed timebase (link drain-aware)\n",
+               sid_get_volume_limit());
     fflush(stdout);
 
     if (hw_connect() != 0) return 1;
@@ -815,12 +885,14 @@ static int cmd_playlist(int argc, char **argv)
     int subsong = 0;
 
     sid_set_rsid_mode(0);
+    sid_set_volume_limit(0.0);
 
     for (int i = 0; i < argc; i++) {
         if (!strcmp(argv[i], "--seconds") && i + 1 < argc)      seconds = atof(argv[++i]);
         else if (!strcmp(argv[i], "--speed") && i + 1 < argc)   speed = atof(argv[++i]);
         else if (!strcmp(argv[i], "--subsong") && i + 1 < argc) subsong = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--rsid"))                    sid_set_rsid_mode(1);
+        else if (!strcmp(argv[i], "--limit") && i + 1 < argc)   sid_set_volume_limit(atof(argv[++i]));
         else if (!strcmp(argv[i], "--from") && i + 1 < argc)    start_idx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cache-dir") && i + 1 < argc)
             sidplay_set_cache_dir(argv[++i]);
@@ -845,6 +917,8 @@ static int cmd_playlist(int argc, char **argv)
         return 1;
     }
 
+    s_drain = sid_get_volume_limit() > 0.0;
+
     if (hw_connect() != 0) { free(files); return 1; }
 
     kb_start();
@@ -854,6 +928,9 @@ static int cmd_playlist(int argc, char **argv)
            "[n] next   [b] back   [,] prev subsong   [.] next subsong   [q] quit\n");
     printf("write protocol: %s, %s model\n\n", sidplay_proto_name(),
            sid_get_rsid_mode() ? "RSID" : "PSID");
+    if (sid_get_volume_limit() > 0.0)
+        printf("$D418 limited to %.0f Hz on a fixed timebase\n\n",
+               sid_get_volume_limit());
 
     int idx = start_idx < 0 ? 0 : (start_idx >= nfiles ? nfiles - 1 : start_idx);
 

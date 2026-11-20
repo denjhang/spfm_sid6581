@@ -254,10 +254,10 @@ if (ctYM2612[chipID].realChipInfo[0].OnlyPCMEmulation) {
 |---|---|
 | `SetRegister` 只转发，不缓冲 | `sid_write()` → `spfm_write_path_a()` 只进缓冲 |
 | `SendData()` 批量推出 | `spfm_flush()`（`deferred` 模式下每帧一次） |
-| `IsBufferEmpty()` 等排空 | FTDI 发送缓冲 / 固件忙信号（**目前没有检查**） |
-| 每 100 条命令一次排空 | **没有对应机制** |
+| `IsBufferEmpty()` 等排空 | `spfm_flush_drain()` → `FT_GetStatus` 查发送队列（`--limit` 时启用） |
+| 每 100 条命令一次排空 | 目前按 deadline 排空，不按条数 |
 | `SetRegister(-1, wait)` 插等待 | `spfm_nop()`（固件 NOP tick），但播放路径没用 |
-| `dacControl` 44100 Hz 固定时基重采样 + 超界丢弃 | **没有对应机制** |
+| `dacControl` 44100 Hz 固定时基重采样 + 超界丢弃 | `sid_set_volume_limit()`：`$D418` 固定时基 + 同格覆盖 + 重复值丢弃 |
 
 SID 的 `$D418` digi 在结构上更接近 **SSG PCM**（都是"高频写一个音量寄存器"），
 而不是 YM2612 的 `0x2A` DAC 流：
@@ -277,6 +277,11 @@ SID 的 `$D418` digi 在结构上更接近 **SSG PCM**（都是"高频写一个�
 
 带宽本身不是问题：1.5 Mbaud 8N1 = 187.5 kB/s，6785 条/秒 × 4 字节 = 27.1 kB/s，
 只占 14%。瓶颈在每批的往返次数，不在数据量。
+
+以上第 2、3 两条已经落地为 `--limit`（见 `docs/驱动说明.md` §6.10）：
+生成侧 `on_sid_write()` 按固定时基抽取 `$D418`，链路侧 `spfm_flush_drain()`
+每批之后问一次 FTDI 发送队列。第 1 条没有照做——用户要求的是"限速"，
+不是"先攒后丢"，整批保留会让延迟以排空时间为步长增长。
 
 ## 8. 数据来源
 

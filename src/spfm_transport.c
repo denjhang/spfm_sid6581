@@ -304,6 +304,44 @@ bool spfm_flush(void)
     return true;
 }
 
+/* Bytes still queued in the driver. The FTDI chip reports its send buffer
+ * separately from the USB transfer, so this is the closest thing to "has the
+ * data actually gone out" that the host can ask for. */
+size_t spfm_tx_pending(void)
+{
+    if (s_dry_run || !s_handle) return 0;
+    DWORD rx = 0, tx = 0, ev = 0;
+    if (FT_GetStatus(s_handle, &rx, &tx, &ev) != FT_OK) return 0;
+    return (size_t)tx;
+}
+
+size_t spfm_flush_drain(size_t low_water, int64_t deadline_us)
+{
+    size_t had = s_len;
+    spfm_flush();
+    if (s_dry_run || !s_handle) return 0;
+
+    /* Nothing new went out and the queue was already at the low-water mark:
+     * return without touching the device. A dense stream calls this thousands
+     * of times a second, and a status query per call would cost more than the
+     * transfers it is trying to police. */
+    static size_t s_last_pending = 0;
+    if (had == 0 && s_last_pending <= low_water) return s_last_pending;
+
+    size_t pending = spfm_tx_pending();
+    for (int guard = 0; pending > low_water; guard++) {
+        if (deadline_us > 0 && spfm_now_us() >= deadline_us) break;
+        if (guard > 5000) break;              /* ~1 s of polling, then give up */
+        /* Short poll: the latency timer is 2 ms, so anything finer than that
+         * only burns CPU. 200 us keeps the worst-case overshoot off the end of
+         * a 1 ms sample window. */
+        spfm_delay_us(200);
+        pending = spfm_tx_pending();
+    }
+    s_last_pending = pending;
+    return pending;
+}
+
 /* ------------------------------------------------------------------ */
 /* delays                                                              */
 /* ------------------------------------------------------------------ */

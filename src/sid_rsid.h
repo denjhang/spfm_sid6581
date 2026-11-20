@@ -79,6 +79,28 @@ typedef struct {
 void sid_set_rsid_mode(int on);
 int  sid_get_rsid_mode(void);
 
+/* ---- digi sample-rate limit ---------------------------------------- *
+ * A digi tune writes $D418 (volume) thousands of times per second, which the
+ * SPFM link cannot carry in real time. `hz` caps how many of those writes make
+ * it into the stream: the value is resampled onto a fixed 1/hz timebase
+ * (sample and hold) and a sample is dropped when it repeats the previous one.
+ * That is the same mechanism MDPlayer's YM2612 DAC uses - a fixed timebase plus
+ * "only send what is ahead of the play head" - rather than a burst of writes
+ * followed by a stall.
+ *
+ * Only register 0x18 is decimated. Every other register keeps its exact
+ * timestamp, so notes, gates and the ADSR programming are untouched.
+ *
+ * hz = 0 (the default) disables it; the stream then contains every write the
+ * 6502 made. Must be set before sid_song_extract / sid_stream_open. */
+void   sid_set_volume_limit(double hz);
+double sid_get_volume_limit(void);
+
+/* Counters behind the limiter: how many $D418 writes the 6502 actually made,
+ * and how many survived decimation (before the duplicate filter runs). Both are
+ * zero when the limiter is off, since nothing is counted then. */
+void sid_get_limit_stats(unsigned long *written, unsigned long *kept);
+
 /* Header-only probe: fills info without running any 6502 code, so a playlist
  * can show song titles and subsong counts instantly.
  * Returns 0 on success, -1 on error. */
@@ -145,10 +167,13 @@ int sid_sidreg_read(const char *path, sid_event_t **events, size_t *count);
 int sid_sidreg_exists(const char *path);
 
 /* Build the conventional cache name for a song:
- *   <cache_dir>/<basename>_s<subsong>_d<seconds>.sidreg
- * Returns 0 if the result fit, -1 if it had to be truncated. */
+ *   <cache_dir>/<basename>_s<subsong>_d<seconds>[_<tag>].sidreg
+ * `tag` distinguishes renders of the same song made under different settings
+ * (RSID model, decimated volume) and may be NULL. Returns 0 if the result fit,
+ * -1 if it had to be truncated. */
 int sid_sidreg_cache_name(char *buf, size_t len, const char *cache_dir,
-                          const char *sid_path, int subsong, double seconds);
+                          const char *sid_path, int subsong, double seconds,
+                          const char *tag);
 
 #ifdef __cplusplus
 }

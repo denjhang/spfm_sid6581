@@ -901,20 +901,129 @@ typedef struct { int64_t cycle; uint8_t reg, val; } CapEvent;
 static CapEvent *cap_buf = NULL;
 static size_t cap_n = 0, cap_cap = 0;
 
-static void on_sid_write(uint8_t reg, uint8_t val) {
+/* ---- $D418 decimation --------------------------------------------- *
+ * A digi tune writes the volume register thousands of times a second, one
+ * sample per NMI. None of that is carried by the header, so the only place to
+ * cut the rate is here, while the samples are being produced.
+ *
+ * The model is MDPlayer's dacControl (docs/MDPlayer硬体写入链路考察.md §5):
+ * a fixed timebase plus "only emit what is due". Each $D418 write is mapped to
+ * a slot of 1/hz seconds; the first write in a slot becomes that slot's sample,
+ * later writes in the same slot overwrite it (sample and hold - the value the
+ * DAC would rest at by the end of the window), and writes that repeat the
+ * currently held value are dropped outright because the chip is already holding
+ * it. The result is a stream whose volume-update rate is <= hz no matter how
+ * fast the 6502 ran.
+ *
+ * Only register 0x18 is touched. Every other register keeps its exact
+ * timestamp, so note timing, gates and ADSR bytes are untouched. */
+static double        s_vol_limit_hz  = 0.0;
+static double        s_vol_cpu_hz    = 985248.0;
+static unsigned long s_vol_written   = 0;
+static unsigned long s_vol_kept      = 0;
+static int64_t       s_vol_last_slot = -1;
+static size_t        s_vol_last_idx  = (size_t)-1;
+static int           s_vol_hold_valid = 0;
+static uint8_t       s_vol_hold_val   = 0;
+/* Highest cycle the capture buffer has emitted. Quantising onto the slot grid
+ * can land a sample before the previous frame's last event when a slot
+ * straddles the boundary, so every timestamp is clamped up to this. */
+static int64_t       s_vol_floor_cycle = 0;
+
+void sid_set_volume_limit(double hz)
+{
+    s_vol_limit_hz = (hz > 0.0) ? hz : 0.0;
+}
+
+double sid_get_volume_limit(void)
+{
+    return s_vol_limit_hz;
+}
+
+void sid_get_limit_stats(unsigned long *written, unsigned long *kept)
+{
+    if (written) *written = s_vol_written;
+    if (kept)    *kept    = s_vol_kept;
+}
+
+/* Called whenever the capture buffer is emptied, so a stale index can never
+ * point into the previous frame's data. */
+static void limit_reset_window(void)
+{
+    s_vol_last_idx = (size_t)-1;
+}
+
+static void limit_reset_all(void)
+{
+    s_vol_written = 0;
+    s_vol_kept = 0;
+    s_vol_last_slot = -1;
+    s_vol_hold_valid = 0;
+    s_vol_hold_val = 0;
+    s_vol_floor_cycle = 0;
+    limit_reset_window();
+}
+
+static void cap_append(int64_t cycle, uint8_t reg, uint8_t val)
+{
     if (cap_n >= cap_cap) {
         cap_cap = cap_cap ? cap_cap * 2 : 65536;
         cap_buf = (CapEvent*)realloc(cap_buf, cap_cap * sizeof(CapEvent));
     }
-    /* Init writes all land at t=0. Without this they would carry the CPU
-     * cycles the init routine burned (R-Type spends ~9 ms in init), which
-     * sorts them *after* the first play frame even though they ran first. */
-    cap_buf[cap_n].cycle = (g_current_frame < 0)
-                           ? 0
-                           : g_current_cycle + (int64_t)(clockticks6502 - g_frame_base_cycle);
+    cap_buf[cap_n].cycle = cycle;
     cap_buf[cap_n].reg   = reg;
     cap_buf[cap_n].val   = val;
     cap_n++;
+}
+
+static void on_sid_write(uint8_t reg, uint8_t val)
+{
+    /* Init writes all land at t=0. Without this they would carry the CPU
+     * cycles the init routine burned (R-Type spends ~9 ms in init), which
+     * sorts them *after* the first play frame even though they ran first. */
+    int64_t cycle = (g_current_frame < 0)
+                    ? 0
+                    : g_current_cycle + (int64_t)(clockticks6502 - g_frame_base_cycle);
+    if (cycle < 0) cycle = 0;
+
+    if (s_vol_limit_hz <= 0.0 || reg != 0x18) {
+        cap_append(cycle, reg, val);
+        return;
+    }
+
+    s_vol_written++;
+
+    const double slot_cycles = s_vol_cpu_hz / s_vol_limit_hz;
+    int64_t slot = (int64_t)((double)cycle / slot_cycles);
+
+    /* Same window as the sample we just placed: the newer value is the one the
+     * DAC would be holding when the window closes, so it replaces in place
+     * instead of costing another write. */
+    if (slot == s_vol_last_slot && s_vol_last_idx < cap_n) {
+        cap_buf[s_vol_last_idx].val = val;
+        return;
+    }
+
+    /* Already holding this value: the chip needs no write to stay there. */
+    if (s_vol_hold_valid && val == s_vol_hold_val)
+        return;
+
+    /* Quantise the timestamp onto the fixed grid, but never let it run
+     * backwards. Two things can push it back: another register written earlier
+     * in this same slot, and a slot that straddles the frame boundary (the
+     * capture buffer is emptied every frame, so cap_buf[] only knows about this
+     * frame). s_vol_floor_cycle remembers across frames. */
+    int64_t q = (int64_t)((double)slot * slot_cycles);
+    if (q < s_vol_floor_cycle) q = s_vol_floor_cycle;
+    if (cap_n && q < cap_buf[cap_n - 1].cycle) q = cap_buf[cap_n - 1].cycle;
+    s_vol_floor_cycle = q;
+
+    s_vol_kept++;
+    s_vol_last_slot  = slot;
+    s_vol_hold_valid = 1;
+    s_vol_hold_val   = val;
+    cap_append(q, reg, val);
+    s_vol_last_idx = cap_n - 1;
 }
 
 /* ============================================================
@@ -1272,6 +1381,11 @@ int sid_song_extract(const char *path, int subsong, double seconds,
     if (clk == 0x08) { VIC_lines = 263; VIC_cpr = 65; }
     else            { VIC_lines = 312; VIC_cpr = 63; }
 
+    /* The decimator maps cycles to a wall-clock grid, so it needs the CPU clock
+     * and a clean slate before the init routine starts writing. */
+    s_vol_cpu_hz = cpu_hz;
+    limit_reset_all();
+
     for (uint32_t i = 0; i < si.code_size; i++)
         RAM[(si.load_addr + i) & 0xFFFF] = si.code[i];
 
@@ -1424,6 +1538,11 @@ int sid_stream_open(const char *path, int subsong, sid_song_info_t *info,
     s_stream_cpu_hz = cpu_hz;
     g_cycles_per_frame = (int32_t)(cpu_hz / vsync_hz);
 
+    /* The decimator works off the CPU clock, and its slot counter must start
+     * fresh so the first play frame is not merged into the init writes. */
+    s_vol_cpu_hz = cpu_hz;
+    limit_reset_all();
+
     for (uint32_t i = 0; i < si.code_size; i++)
         RAM[(si.load_addr + i) & 0xFFFF] = si.code[i];
 
@@ -1502,6 +1621,10 @@ int sid_stream_next_frame(const sid_event_t **events, size_t *count)
         s_frame_ev[i].val = cap_buf[i].val;
     }
     cap_n = 0;
+    /* A slot that straddles the frame boundary has already been handed to the
+     * caller, so the "replace in place" index is dead from here on. The held
+     * value stays valid: it is what the chip is still resting at. */
+    limit_reset_window();
 
     if (events) *events = s_frame_ev;
     if (count)  *count = n;
@@ -1594,7 +1717,8 @@ int sid_sidreg_exists(const char *path)
 }
 
 int sid_sidreg_cache_name(char *buf, size_t len, const char *cache_dir,
-                          const char *sid_path, int subsong, double seconds)
+                          const char *sid_path, int subsong, double seconds,
+                          const char *tag)
 {
     const char *base = sid_path;
     for (const char *p = sid_path; *p; p++)
@@ -1608,7 +1732,12 @@ int sid_sidreg_cache_name(char *buf, size_t len, const char *cache_dir,
     }
     stem[k] = 0;
 
-    int r = snprintf(buf, len, "%s/%s_s%d_d%d.sidreg", cache_dir, stem,
+    int r;
+    if (tag && *tag)
+        r = snprintf(buf, len, "%s/%s_s%d_d%d_%s.sidreg", cache_dir, stem,
+                     subsong, (int)seconds, tag);
+    else
+        r = snprintf(buf, len, "%s/%s_s%d_d%d.sidreg", cache_dir, stem,
                      subsong, (int)seconds);
     return (r < 0 || (size_t)r >= len) ? -1 : 0;
 }
