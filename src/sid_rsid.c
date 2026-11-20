@@ -2,20 +2,30 @@
  *
  * A .sid file is 6502 code; the music only exists as writes to $D400-$D41F.
  * This file emulates the CPU (fake6502, from rubbermallet.org via the
- * ChristmasSID sketch), the VIC raster counter and the two CIA timers, runs
- * init once and play once per frame, and records every SID write with a
- * timestamp.
+ * ChristmasSID sketch), the VIC raster counter, both CIA timers, and the
+ * NMI/IRQ lines those timers drive. It runs init once and then advances the
+ * machine a fixed number of CPU cycles per tick - the video frame for a normal
+ * tune, the CIA timer period for a CIA-timed subsong - recording every SID
+ * write with a timestamp.
+ *
+ * Why cycles and not just "call play once per frame": the frame is only the
+ * pacing unit. Most tunes do all their work inside play(), but the classic
+ * "volume-register digi" tracks (The Great Giana Sisters) put their sample
+ * player in an NMI handler fired by CIA2 timer A thousands of times per
+ * second. Nothing inside play() would ever reach that code, so the loop has to
+ * keep the clocks running and take interrupts at instruction boundaries, with
+ * the CPU idling at IDLE_PC once play() has RTS'd.
  *
  * Where it came from: the 6502/CIA/VIC part is copied from the STC32G
  * chiptune project (usb_cdc_test/tools/sid_extract.c) so both projects agree
- * on what a .sid sounds like. Only the entry points and the machine reset
- * changed: it is now a library that the player links against, not a
- * stand-alone tool that writes a file.
+ * on what a .sid sounds like. Only the entry points, the machine reset, the
+ * interrupt plumbing and the cycle accounting changed: it is now a library
+ * that the player links against, not a stand-alone tool that writes a file.
  *
  * Timestamps: init-phase writes are all pinned to t=0 (they must be applied
- * before the first play frame), play-frame writes use
- * frame*cycles_per_frame + intra-frame cycle, so PCM/digi songs keep their
- * sub-frame ordering.
+ * before the first play tick), play-tick writes use
+ * tick*cycles_per_tick + intra-tick cycle, so PCM/digi songs keep their
+ * sub-tick ordering.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,6 +78,10 @@ static uint16_t pc = 0, oldpc, ea, reladdr, value, result;
 static uint8_t  opcode, useaccum;
 static int32_t  clockticks6502 = 0;
 static uint16_t temp16, startpage, eahelp, eahelp2;
+/* Set by absx/absy/indy, consumed by getvalue(): a read that carries into the
+ * next page costs one extra cycle, a store never does. */
+static uint8_t  s_page_crossed = 0;
+static uint8_t  s_page_extra = 0;
 
 /* SID 寄存器写入捕获 */
 static uint8_t SID[32];
@@ -85,24 +99,122 @@ static uint16_t VIC_y = 0;        /* 当前 raster 行 */
 static uint16_t VIC_lines = 312;  /* PAL 312 行 */
 static uint8_t VIC_cpr = 63;      /* PAL 63 周期/行 */
 
-/* CIA timer (完整 timer A/B, 照 WebSid cia.c 核心逻辑, 覆盖 KERNAL CIA 场景).
- * CIA1 ($DC00-) timer A 是 C64 vsync/IRQ 主时钟 (KERNAL 用).
- * $DC04/05 = timer A latch lo/hi (写入设 latch, 启动时重装 counter)
- * $DC06/07 = timer B latch lo/hi
- * $DC0D = ICR: 读=中断状态(bit7=有IRQ, bit0=timerA, bit1=timerB) 读后清;
- *          写=设/清 mask (bit7=1设 bit7=0清, 低2位是 timer A/B 使能)
- * $DC0E = timer A ctrl (bit0=start, bit3=one-shot, bit4=force load)
- * $DC0F = timer B ctrl */
-static uint16_t CIA_latchA = 0, CIA_latchB = 0;     /* latch (DC04/05, DC06/07) */
-static uint16_t CIA_counterA = 0, CIA_counterB = 0; /* 当前计数 (递减) */
-static uint8_t  CIA_startedA = 0, CIA_startedB = 0; /* DC0E/0F bit0 */
-static uint8_t  CIA_icr_status = 0;   /* 中断状态 (读后清) */
-static uint8_t  CIA_icr_mask = 0;     /* 中断 mask (DC0D 写入) */
-static uint8_t  CIA_DC0E_reg = 0, CIA_DC0F_reg = 0; /* ctrl 寄存器原值 */
-static uint8_t  CIA_force_load_A = 0, CIA_force_load_B = 0; /* force load 待处理 */
+/* CIA1 ($DC00) and CIA2 ($DD00).
+ *
+ * Both chips share one register map and both are needed. CIA1 timer A is the
+ * usual IRQ/vsync clock; CIA2 timer A is what the classic "volume-register
+ * digi" tunes use to fire an NMI thousands of times per second (The Great
+ * Giana Sisters is the textbook case - see docs/驱动说明.md §6.8).
+ *
+ * Modelled after WebSid cia.c: a counter decrements once per CPU cycle, an
+ * underflow reloads it from the latch and sets the matching ICR source bit.
+ *
+ *   $xx04/05 timer A latch lo/hi     $xx06/07 timer B latch lo/hi
+ *   $xx0D    ICR: read = status (bit7 asserting, bit0 A, bit1 B), clears on
+ *                 read; write = set/clear mask, bit7 of the byte selects
+ *   $xx0E    timer A control (bit0 start, bit3 one-shot, bit4 force load)
+ *   $xx0F    timer B control
+ *
+ * On the C64 CIA1's ICR bit7 drives /IRQ and CIA2's drives /NMI, which is why
+ * the same code path serves both: only the destination signal differs.
+ */
+typedef struct {
+    uint16_t latchA, latchB;
+    /* Remaining cycles until underflow, i.e. the latch value plus one. The
+     * +1 is not cosmetic: on a real 6526 a latch of 0 means 65536 cycles, not
+     * "fire immediately". Getting that wrong turns a latch-0 timer into a
+     * per-cycle interrupt storm that starves the play routine completely
+     * (seen as 842000 NMIs in 6 s and zero register writes). */
+    uint32_t counterA, counterB;
+    uint8_t  startedA, startedB;
+    uint8_t  icr_status;      /* bit0 timer A, bit1 timer B, bit7 asserting */
+    uint8_t  icr_mask;
+    uint8_t  ctrlA, ctrlB;    /* raw $xx0E / $xx0F */
+    uint8_t  force_loadA, force_loadB;
+} cia_t;
 
-/* 硬件 IRQ 信号 (VIC 或 CIA 触发, 供 cpu 注入) */
+static cia_t cia1, cia2;
+
+/* /IRQ can be pulled by CIA1 or the VIC raster; /NMI only by CIA2. */
 static uint8_t hw_irq_pending = 0;
+static uint8_t hw_nmi_pending = 0;
+
+/* Diagnostics: how many interrupts were actually taken. A digi tune that plays
+ * silence shows zero NMI here, which distinguishes "the timer never fired"
+ * from "the handler ran but wrote nothing useful". */
+unsigned long sidr_dbg_nmi_taken = 0;
+unsigned long sidr_dbg_nmi_ticks = 0;
+unsigned long sidr_dbg_irq_taken = 0;
+
+static uint16_t s_dbg_nmi_vector = 0, s_dbg_irq_vector = 0;
+static uint16_t s_dbg_cia1_latchA = 0, s_dbg_cia2_latchA = 0;
+static uint8_t  s_dbg_cia1_ctrlA = 0, s_dbg_cia2_ctrlA = 0, s_dbg_cia2_started = 0;
+
+/* 6526 counts `latch + 1` cycles before underflow, and a latch of 0 is the
+ * longest setting (65536), not the shortest. A 0 latch treated as 1 cycle
+ * turns the timer into a per-cycle NMI storm: Giana Sisters' title subsong
+ * produced 561000 NMIs in 4 s and zero register writes that way. */
+static inline uint32_t cia_period(uint16_t latch)
+{
+    return latch ? (uint32_t)latch + 1u : 65536u;
+}
+
+static inline uint8_t cia_read(cia_t *c, uint8_t off){
+    switch (off) {
+    case 0x04: return (uint8_t)(c->counterA & 0xff);
+    case 0x05: return (uint8_t)((c->counterA >> 8) & 0xff);
+    case 0x06: return (uint8_t)(c->counterB & 0xff);
+    case 0x07: return (uint8_t)((c->counterB >> 8) & 0xff);
+    case 0x0D: {
+        uint8_t st = c->icr_status;
+        c->icr_status = 0;          /* reading the ICR clears every source bit */
+        return st;
+    }
+    case 0x0E: return c->ctrlA;
+    case 0x0F: return c->ctrlB;
+    default:   return 0;
+    }
+}
+
+static inline void cia_write(cia_t *c, uint8_t off, uint8_t v)
+{
+    switch (off) {
+    case 0x04:
+        c->latchA = (uint16_t)((c->latchA & 0xff00) | v);
+        if (!c->startedA) c->counterA = cia_period(c->latchA);
+        break;
+    case 0x05:
+        c->latchA = (uint16_t)((c->latchA & 0x00ff) | (v << 8));
+        if (!c->startedA) c->counterA = cia_period(c->latchA);
+        break;
+    case 0x06:
+        c->latchB = (uint16_t)((c->latchB & 0xff00) | v);
+        if (!c->startedB) c->counterB = cia_period(c->latchB);
+        break;
+    case 0x07:
+        c->latchB = (uint16_t)((c->latchB & 0x00ff) | (v << 8));
+        if (!c->startedB) c->counterB = cia_period(c->latchB);
+        break;
+    case 0x0D:
+        if (v & 0x80) c->icr_mask |= (uint8_t)(v & 0x1f);
+        else          c->icr_mask &= (uint8_t)~(v & 0x1f);
+        break;
+    case 0x0E:
+        c->ctrlA = v;
+        c->startedA = v & 0x01;
+        if (v & 0x10) c->force_loadA = 1;
+        if ((v & 0x01) && c->counterA == 0) c->counterA = cia_period(c->latchA);
+        break;
+    case 0x0F:
+        c->ctrlB = v;
+        c->startedB = v & 0x01;
+        if (v & 0x10) c->force_loadB = 1;
+        if ((v & 0x01) && c->counterB == 0) c->counterB = cia_period(c->latchB);
+        break;
+    default:
+        break;
+    }
+}
 
 static inline uint8_t read6502(uint16_t address) {
     /* 标准 SID 寄存器 (0-0x1c) 读 SID 数组 */
@@ -114,19 +226,9 @@ static inline uint8_t read6502(uint16_t address) {
     if (address == 0xD012) return VIC_D012;
     if (address == 0xD019) return VIC_D019;
     if (address == 0xD01A) return VIC_D01A;
-    /* CIA1 timer A/B counter (读返回当前计数, 对齐真实 CIA/WebSid) */
-    if (address == 0xDC04) return CIA_counterA & 0xff;
-    if (address == 0xDC05) return (CIA_counterA >> 8) & 0xff;
-    if (address == 0xDC06) return CIA_counterB & 0xff;
-    if (address == 0xDC07) return (CIA_counterB >> 8) & 0xff;
-    if (address == 0xDC0D) {
-        /* DC0D 读: 返回中断状态 (bit7=有IRQ, bit0=timerA, bit1=timerB), 读后清 */
-        uint8_t st = CIA_icr_status;
-        CIA_icr_status = 0;
-        return st;
-    }
-    if (address == 0xDC0E) return CIA_DC0E_reg;
-    if (address == 0xDC0F) return CIA_DC0F_reg;
+    /* CIA1 ($DC00) / CIA2 ($DD00) */
+    if (address >= 0xDC00 && address <= 0xDC0F) return cia_read(&cia1, (uint8_t)(address & 0x0F));
+    if (address >= 0xDD00 && address <= 0xDD0F) return cia_read(&cia2, (uint8_t)(address & 0x0F));
     return RAM[address];
 }
 
@@ -147,39 +249,9 @@ static inline void write6502(uint16_t address, uint8_t value) {
         return;
     }
     if (address == 0xD01A) { VIC_D01A = value; return; }
-    /* CIA1 timer latch/ctrl (照 WebSid cia.c setTimerLatch/setControl) */
-    if (address == 0xDC04) {
-        CIA_latchA = (CIA_latchA & 0xff00) | value;
-        if (!CIA_startedA) CIA_counterA = CIA_latchA;   /* stopped 时写 lo 也重装 */
-        return;
-    }
-    if (address == 0xDC05) {
-        CIA_latchA = (CIA_latchA & 0xff) | (value << 8);
-        if (!CIA_startedA) CIA_counterA = CIA_latchA;   /* hi 写入重装 */
-        return;
-    }
-    if (address == 0xDC06) { CIA_latchB = (CIA_latchB & 0xff00) | value; if (!CIA_startedB) CIA_counterB = CIA_latchB; return; }
-    if (address == 0xDC07) { CIA_latchB = (CIA_latchB & 0xff) | (value << 8); if (!CIA_startedB) CIA_counterB = CIA_latchB; return; }
-    if (address == 0xDC0D) {
-        /* DC0D 写: bit7=1 设 mask, bit7=0 清 mask (对齐 WebSid setInterruptMask) */
-        if (value & 0x80) CIA_icr_mask |= (value & 0x1f);
-        else CIA_icr_mask &= ~(value & 0x1f);
-        return;
-    }
-    if (address == 0xDC0E) {
-        CIA_DC0E_reg = value;
-        CIA_startedA = value & 0x01;
-        if (value & 0x10) CIA_force_load_A = 1;   /* force load (bit4) */
-        if ((value & 0x01) && CIA_counterA == 0) CIA_counterA = CIA_latchA;
-        return;
-    }
-    if (address == 0xDC0F) {
-        CIA_DC0F_reg = value;
-        CIA_startedB = value & 0x01;
-        if (value & 0x10) CIA_force_load_B = 1;
-        if ((value & 0x01) && CIA_counterB == 0) CIA_counterB = CIA_latchB;
-        return;
-    }
+    /* CIA1 ($DC00) / CIA2 ($DD00) */
+    if (address >= 0xDC00 && address <= 0xDC0F) { cia_write(&cia1, (uint8_t)(address & 0x0F), value); return; }
+    if (address >= 0xDD00 && address <= 0xDD0F) { cia_write(&cia2, (uint8_t)(address & 0x0F), value); return; }
     RAM[address] = value;
 }
 
@@ -219,12 +291,14 @@ static inline void absx(void) {
     ea = (read6502(pc) | (read6502(pc + 1) << 8));
     startpage = ea & 0xFF00;
     ea += x;
+    s_page_crossed = (startpage != (ea & 0xFF00));
     pc += 2;
 }
 static inline void absy(void) {
     ea = (read6502(pc) | (read6502(pc + 1) << 8));
     startpage = ea & 0xFF00;
     ea += y;
+    s_page_crossed = (startpage != (ea & 0xFF00));
     pc += 2;
 }
 static inline void ind(void) {
@@ -243,10 +317,15 @@ static inline void indy(void) {
     ea = read6502(eahelp) | (read6502(eahelp2) << 8);
     startpage = ea & 0xFF00;
     ea += y;
+    s_page_crossed = (startpage != (ea & 0xFF00));
 }
 
 static inline uint16_t getvalue(void) {
     if (useaccum) return a;
+    /* Absolute,X / Absolute,Y / (Ind),Y reads pay one extra cycle when the
+     * index carries into the next page. Stores never do, which is why this
+     * lives in the read path and not in absx()/absy()/indy(). */
+    if (s_page_crossed) s_page_extra = 1;
     return read6502(ea);
 }
 static inline void putvalue(uint16_t saveval) {
@@ -272,19 +351,19 @@ static inline void asl(void) {
 static inline void bcc(void) {
     if ((cpustatus & FLAG_CARRY) == 0) {
         oldpc = pc; pc += reladdr;
-        if ((oldpc & 0xFF00) != (pc & 0xFF00)) clockticks6502 += 2; else clockticks6502++;
+        s_page_extra = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;   /* taken +1, page cross +2 */
     }
 }
 static inline void bcs(void) {
     if ((cpustatus & FLAG_CARRY) == FLAG_CARRY) {
         oldpc = pc; pc += reladdr;
-        if ((oldpc & 0xFF00) != (pc & 0xFF00)) clockticks6502 += 2; else clockticks6502++;
+        s_page_extra = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;   /* taken +1, page cross +2 */
     }
 }
 static inline void beq(void) {
     if ((cpustatus & FLAG_ZERO) == FLAG_ZERO) {
         oldpc = pc; pc += reladdr;
-        if ((oldpc & 0xFF00) != (pc & 0xFF00)) clockticks6502 += 2; else clockticks6502++;
+        s_page_extra = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;   /* taken +1, page cross +2 */
     }
 }
 static inline void op_bit(void) {
@@ -294,19 +373,19 @@ static inline void op_bit(void) {
 static inline void bmi(void) {
     if ((cpustatus & FLAG_SIGN) == FLAG_SIGN) {
         oldpc = pc; pc += reladdr;
-        if ((oldpc & 0xFF00) != (pc & 0xFF00)) clockticks6502 += 2; else clockticks6502++;
+        s_page_extra = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;   /* taken +1, page cross +2 */
     }
 }
 static inline void bne(void) {
     if ((cpustatus & FLAG_ZERO) == 0) {
         oldpc = pc; pc += reladdr;
-        if ((oldpc & 0xFF00) != (pc & 0xFF00)) clockticks6502 += 2; else clockticks6502++;
+        s_page_extra = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;   /* taken +1, page cross +2 */
     }
 }
 static inline void bpl(void) {
     if ((cpustatus & FLAG_SIGN) == 0) {
         oldpc = pc; pc += reladdr;
-        if ((oldpc & 0xFF00) != (pc & 0xFF00)) clockticks6502 += 2; else clockticks6502++;
+        s_page_extra = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;   /* taken +1, page cross +2 */
     }
 }
 static inline void brk(void) {
@@ -328,6 +407,29 @@ static inline void irq6502(void) {
     hw_irq_pending = 0;
 }
 
+/* 硬件 NMI (CIA2 timer A/B 的 ICR bit7 驱动). 真机 6502 上 NMI 不可屏蔽,
+ * 优先级高于 IRQ, 向量在 $FFFA/$FFFB。Giana Sisters 这类 digi 鼓靠它每毫秒
+ * 进一次中断, 往 $D418 丢一个 4 bit 采样值。 */
+
+/* NMI 向量: 真机取 $FFFA/$FFFB. 我们没有 KERNAL ROM, 而这类曲子几乎都在 init
+ * 里把 $0318/$0319 写成自己的处理程序(C64 上 $FFFA 的 ROM 内容就是跳向 $0318),
+ * 所以先看 $0318/$0319, 再退到 $FFFA/$FFFB。零页地址视为未设。 */
+static inline uint16_t nmi_vector(void) {
+    uint16_t v = (uint16_t)(RAM[0x0318] | (RAM[0x0319] << 8));
+    if (v >= 0x0100) return v;
+    v = (uint16_t)(RAM[0xFFFA] | (RAM[0xFFFB] << 8));
+    if (v >= 0x0100) return v;
+    return 0;
+}
+
+static inline void nmi_jump(void) {
+    push16(pc);
+    push8(cpustatus & ~FLAG_BREAK);
+    setinterrupt();
+    pc = nmi_vector();
+    hw_nmi_pending = 0;
+}
+
 /* VIC II raster 时钟: 每行推进 _y, 命中 raster_latch 时触发 IRQ.
  * 对齐 WebSid vic.c CHECK_IRQ (L131-147). PAL: 312 行/帧. */
 static inline void vicClock(void) {
@@ -344,61 +446,60 @@ static inline void vicClock(void) {
     }
 }
 
-/* CIA timer 时钟: 每 CPU 周期调一次, timer A/B 递减, underflow 触发 ICR.
- * 照 WebSid cia.c clockT 核心 (去掉 scripted_transition 复杂状态机, KERNAL 场景够用).
- * underflow: counter→0 时重装 latch, 设 ICR 对应位, 若 mask 使能则触发 IRQ. */
-static inline void ciaClock(void) {
-    /* force load 处理 (DC0E/0F bit4 写入时设的标志) */
-    if (CIA_force_load_A) { CIA_counterA = CIA_latchA; CIA_force_load_A = 0; }
-    if (CIA_force_load_B) { CIA_counterB = CIA_latchB; CIA_force_load_B = 0; }
+/* 一块 CIA 的每周期推进。sources: ICR 里能出现的源位 (CIA1 = A+B, CIA2 = A+B)。
+ * `assert_irq` / `assert_nmi` 决定 underflow 且 mask 打开时拉哪根线:
+ * C64 上 CIA1 的 ICR bit7 拉 /IRQ, CIA2 的拉 /NMI. */
+static inline void cia_clock(cia_t *c, int assert_irq, int assert_nmi)
+{
+    if (c->force_loadA) { c->counterA = cia_period(c->latchA); c->force_loadA = 0; }
+    if (c->force_loadB) { c->counterB = cia_period(c->latchB); c->force_loadB = 0; }
 
-    /* timer A */
-    if (CIA_startedA) {
-        if (CIA_counterA == 0) {
-            /* underflow: 重装 + 设 ICR bit0 */
-            CIA_counterA = CIA_latchA;
-            CIA_icr_status |= 0x01;   /* timer A 中断源 */
-            if (CIA_icr_mask & 0x01) {
-                CIA_icr_status |= 0x80;  /* 有 IRQ */
-                hw_irq_pending = 1;
+    if (c->startedA) {
+        if (--c->counterA == 0) {
+            c->counterA = cia_period(c->latchA);
+            c->icr_status |= 0x01;
+            if (c->icr_mask & 0x01) {
+                c->icr_status |= 0x80;
+                if (assert_nmi) hw_nmi_pending = 1;
+                else if (assert_irq) hw_irq_pending = 1;
             }
-            /* one-shot (bit3): underflow 后停止 */
-            if (CIA_DC0E_reg & 0x08) { CIA_startedA = 0; CIA_DC0E_reg &= ~0x01; }
-        } else {
-            CIA_counterA--;
+            if (c->ctrlA & 0x08) { c->startedA = 0; c->ctrlA &= ~0x01; }
         }
     }
-    /* timer B (同理, 简化无 link 模式) */
-    if (CIA_startedB) {
-        if (CIA_counterB == 0) {
-            CIA_counterB = CIA_latchB;
-            CIA_icr_status |= 0x02;   /* timer B 中断源 */
-            if (CIA_icr_mask & 0x02) {
-                CIA_icr_status |= 0x80;
-                hw_irq_pending = 1;
+    if (c->startedB) {
+        if (--c->counterB == 0) {
+            c->counterB = cia_period(c->latchB);
+            c->icr_status |= 0x02;
+            if (c->icr_mask & 0x02) {
+                c->icr_status |= 0x80;
+                if (assert_nmi) hw_nmi_pending = 1;
+                else if (assert_irq) hw_irq_pending = 1;
             }
-            if (CIA_DC0F_reg & 0x08) { CIA_startedB = 0; CIA_DC0F_reg &= ~0x01; }
-        } else {
-            CIA_counterB--;
+            if (c->ctrlB & 0x08) { c->startedB = 0; c->ctrlB &= ~0x01; }
         }
     }
 }
 
-/* 每 raster 行调一次 (63 周期): 推进 VIC + CIA, 检测 IRQ */
+/* 每 CPU 周期调一次: VIC 每 VIC_cpr 个周期推进一行, 两个 CIA 各递减一次。 */
+static uint8_t s_cyc_in_line = 0;
 static inline void check_hardware_irq(void) {
-    vicClock();
-    ciaClock();
+    if (++s_cyc_in_line >= VIC_cpr) {
+        s_cyc_in_line = 0;
+        vicClock();
+    }
+    cia_clock(&cia1, 1, 0);   /* CIA1 -> /IRQ */
+    cia_clock(&cia2, 0, 1);   /* CIA2 -> /NMI */
 }
 static inline void bvc(void) {
     if ((cpustatus & FLAG_OVERFLOW) == 0) {
         oldpc = pc; pc += reladdr;
-        if ((oldpc & 0xFF00) != (pc & 0xFF00)) clockticks6502 += 2; else clockticks6502++;
+        s_page_extra = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;   /* taken +1, page cross +2 */
     }
 }
 static inline void bvs(void) {
     if ((cpustatus & FLAG_OVERFLOW) == FLAG_OVERFLOW) {
         oldpc = pc; pc += reladdr;
-        if ((oldpc & 0xFF00) != (pc & 0xFF00)) clockticks6502 += 2; else clockticks6502++;
+        s_page_extra = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;   /* taken +1, page cross +2 */
     }
 }
 static inline void clc(void) { clearcarry(); }
@@ -509,10 +610,37 @@ static inline void tya(void) { a = y; zerocalc(a); signcalc(a); }
 #define sre nop
 #define rra nop
 
-static void exec6502(void) {
+/* Base cycle count for each opcode (NMOS 6502). Taken branches add one cycle,
+ * a taken branch or an indexed read that crosses a page adds another; both are
+ * handled outside the table. Undefined opcodes are treated as 2-cycle NOPs,
+ * matching the switch statement's default. */
+static const uint8_t op_cycles[256] = {
+/*       0  1  2  3  4  5  6  7  8  9  A  B  C  D  E  F */
+/* 0 */  7, 6, 2, 8, 3, 3, 5, 5, 3, 2, 2, 2, 4, 4, 6, 6,
+/* 1 */  2, 5, 2, 8, 4, 4, 6, 6, 2, 4, 2, 7, 4, 4, 7, 7,
+/* 2 */  6, 6, 2, 8, 3, 3, 5, 5, 4, 2, 2, 2, 4, 4, 6, 6,
+/* 3 */  2, 5, 2, 8, 4, 4, 6, 6, 2, 4, 2, 7, 4, 4, 7, 7,
+/* 4 */  6, 6, 2, 8, 3, 3, 5, 5, 3, 2, 2, 2, 3, 4, 6, 6,
+/* 5 */  2, 5, 2, 8, 4, 4, 6, 6, 2, 4, 2, 7, 4, 4, 7, 7,
+/* 6 */  6, 6, 2, 8, 3, 3, 5, 5, 4, 2, 2, 2, 5, 4, 6, 6,
+/* 7 */  2, 5, 2, 8, 4, 4, 6, 6, 2, 4, 2, 7, 4, 4, 7, 7,
+/* 8 */  2, 6, 2, 6, 3, 3, 3, 3, 2, 2, 2, 2, 4, 4, 4, 4,
+/* 9 */  2, 6, 2, 6, 4, 4, 4, 4, 2, 5, 2, 5, 5, 5, 5, 5,
+/* A */  2, 6, 2, 6, 3, 3, 3, 3, 2, 2, 2, 2, 4, 4, 4, 4,
+/* B */  2, 5, 2, 5, 4, 4, 4, 4, 2, 4, 2, 4, 4, 4, 4, 4,
+/* C */  2, 6, 2, 8, 3, 3, 5, 5, 2, 2, 2, 2, 4, 4, 6, 6,
+/* D */  2, 5, 2, 8, 4, 4, 6, 6, 2, 4, 2, 7, 4, 4, 7, 7,
+/* E */  2, 6, 2, 8, 3, 3, 5, 5, 2, 2, 2, 2, 4, 4, 6, 6,
+/* F */  2, 5, 2, 8, 4, 4, 6, 6, 2, 4, 2, 7, 4, 4, 7, 7
+};
+
+/* Execute one instruction and return how many CPU cycles it took. */
+static int exec6502(void) {
     opcode = read6502(pc++);
     cpustatus |= FLAG_CONSTANT;
     useaccum = 0;
+    s_page_crossed = 0;
+    s_page_extra = 0;
     switch (opcode) {
     case 0x00: imp(); brk(); break;
     case 0x01: indx(); ora(); break;
@@ -667,6 +795,7 @@ static void exec6502(void) {
     case 0xFE: absx(); inc(); break;
     default: break;   /* 未定义 opcode 当 nop */
     }
+    return op_cycles[opcode] + s_page_extra;
 }
 
 /* ============================================================
@@ -783,6 +912,112 @@ static void reset_cpu(void) {
  * 不用 BRK (BRK 会跳 $FFFE, 破坏 init 安装的 IRQ handler).
  * JSR 到目标, 目标 RTS 时返回到假地址 0, pc=0<1 停止.
  * 关键: 不动 $FFFE, 让 init 自由安装 IRQ handler (RSID 需要). */
+/* IRQ 向量: 真机 $FFFE/$FFFF 指向 KERNAL 的 IRQ 入口, KERNAL 再经 $0314 分发。
+ * 我们没有 KERNAL, 所以 $FFFE 没被写(零页)时就退到 $0314 —— 很多 PSID 只写
+ * $0314。两者都没有就没有 IRQ 可用。 */
+static inline uint16_t irq_vector(void) {
+    uint16_t v = (uint16_t)(RAM[0xFFFE] | (RAM[0xFFFF] << 8));
+    if (v >= 0x0100) return v;
+    v = (uint16_t)(RAM[0x0314] | (RAM[0x0315] << 8));
+    if (v >= 0x0100) return v;
+    return 0;
+}
+
+static inline void irq_jump(void) {
+    push16(pc);
+    push8(cpustatus & ~FLAG_BREAK);
+    setinterrupt();
+    pc = irq_vector();
+    hw_irq_pending = 0;
+}
+
+/* Where the CPU sits once the frame's play routine has returned. Zero page is
+ * never executable code, so any pc below $0100 is a safe marker: run_machine()
+ * recognises it and just advances the clocks instead of fetching an opcode. */
+#define IDLE_PC 0x0002
+
+/* 中断响应本身 7 个周期, 和真 6502 一致 (push3 + 取向量)。 */
+#define IRQ_CYCLES 7
+
+/* 指令边界上响应中断: 先 NMI 后 IRQ, 和真机一致。响应本身 7 个周期。 */
+static int service_interrupt(void)
+{
+    if (hw_nmi_pending && nmi_vector() >= 0x0100) {
+        sidr_dbg_nmi_taken++;
+        nmi_jump();
+        return IRQ_CYCLES;
+    }
+    if (hw_irq_pending && !(cpustatus & FLAG_INTERRUPT) && irq_vector() >= 0x0100) {
+        sidr_dbg_irq_taken++;
+        irq_jump();
+        return IRQ_CYCLES;
+    }
+    return 0;
+}
+
+/* Run the machine for exactly `cycles` CPU cycles starting at `entry_pc`.
+ *
+ * This is what makes digi tracks work. The old code called play() once per
+ * video frame and only counted the cycles play() itself burned; between
+ * frames nothing ran, so a CIA-timed NMI that is supposed to fire thousands of
+ * times per second never fired at all. Here the clock is the loop counter: every
+ * cycle advances VIC and both CIAs, interrupts are taken at instruction
+ * boundaries, and once play() has RTS'd the CPU parks at IDLE_PC while the
+ * clocks keep running for the rest of the tick. */
+static void run_machine(uint16_t entry_pc, uint32_t cycles)
+{
+    if (entry_pc >= 0x0100) {
+        pc = entry_pc;
+        sp = 0xFF;
+        push16(0);
+        push16(0);
+    } else {
+        pc = IDLE_PC;
+    }
+
+    uint32_t spent = 0;
+    while (spent < cycles) {
+        /* Play routines are allowed to RTS; from then on we are idling. */
+        if (pc < 2) pc = IDLE_PC;
+
+        int n = service_interrupt();
+        if (n == 0 && pc != IDLE_PC) n = exec6502();
+        else if (n == 0) n = 1;               /* idle: one cycle at a time */
+
+        for (int i = 0; i < n && spent < cycles; i++) {
+            check_hardware_irq();
+            clockticks6502++;
+            spent++;
+        }
+    }
+}
+
+void sidr_debug_report(void)
+{
+    fprintf(stderr, "  [dbg] nmi vector=$%04X  irq vector=$%04X\n",
+            (unsigned)s_dbg_nmi_vector, (unsigned)s_dbg_irq_vector);
+    fprintf(stderr, "  [dbg] cia1 latchA=%u ctrlA=0x%02X | cia2 latchA=%u ctrlA=0x%02X started=%u\n",
+            (unsigned)s_dbg_cia1_latchA, s_dbg_cia1_ctrlA,
+            (unsigned)s_dbg_cia2_latchA, s_dbg_cia2_ctrlA, (unsigned)s_dbg_cia2_started);
+    fprintf(stderr, "  [dbg] nmi taken=%lu  irq taken=%lu\n",
+            sidr_dbg_nmi_taken, sidr_dbg_irq_taken);
+}
+
+/* Snapshot taken while the machine is still alive: reset_machine() wipes RAM at
+ * the end of every extract, so the vectors have to be copied out first. */
+static void debug_snapshot(void)
+{
+    s_dbg_nmi_vector  = nmi_vector();
+    s_dbg_irq_vector  = irq_vector();
+    s_dbg_cia1_latchA = cia1.latchA;
+    s_dbg_cia1_ctrlA  = cia1.ctrlA;
+    s_dbg_cia2_latchA = cia2.latchA;
+    s_dbg_cia2_ctrlA  = cia2.ctrlA;
+    s_dbg_cia2_started = cia2.startedA;
+}
+
+/* init 只跑一次, 而且它的写入全部钉在 t=0, 所以这里不需要走硬件时钟:
+ * 只要把那串寄存器写出来就行。跑满周期预算或 RTS 即止。 */
 static void call_init(uint16_t init_addr, uint8_t song, uint32_t max_cycles) {
     reset_cpu();
     a = song;            /* SIDPod: na=song (init 用 A 传子曲目) */
@@ -792,22 +1027,18 @@ static void call_init(uint16_t init_addr, uint8_t song, uint32_t max_cycles) {
     push16(0);           /* SIDPod push 两次 (额外保护) */
     uint32_t cy = 0;
     while (pc > 1 && cy < max_cycles) {
-        exec6502();
-        cy++;
+        int n = exec6502();
+        cy += (uint32_t)n;
+        clockticks6502 += n;
     }
 }
 
-/* 调 play: 保留 init 后的 a/x/y/sp 状态 (play 可能依赖), 只重设 pc + push 假返回 */
-static void call_play(uint16_t play_addr, uint32_t max_cycles) {
-    pc = play_addr;
-    sp = 0xFF;
-    push16(0);
-    push16(0);
-    uint32_t cy = 0;
-    while (pc > 1 && cy < max_cycles) {
-        exec6502();
-        cy++;
-    }
+/* A tick is one unit of real time: the video frame for a normal tune, the CIA
+ * timer period for a CIA-timed subsong. run_machine() fills exactly that many
+ * cycles, so both the play routine and the interrupts it depends on advance at
+ * the right wall-clock rate. */
+static void call_play(uint16_t play_addr, uint32_t cycles) {
+    run_machine(play_addr, cycles);
 }
 
 /* play_addr == 0 means "there is no play routine entry point in the header".
@@ -833,6 +1064,42 @@ static uint16_t get_play_addr(uint16_t play_addr_field) {
 }
 
 /* ============================================================
+ * play rate
+ *
+ * Almost every tune wants play() once per video frame. The header's speed
+ * word can say otherwise for an individual subsong: bit N set means subsong N
+ * is driven by CIA timer A, i.e. play() belongs at the timer's own rate, not
+ * at the frame rate. SIDPod (src/audio/C64.cpp: useCIA()) makes exactly this
+ * test - IS_BIT_SET(info.speed, currentSong) - and Diderik recommends it in
+ * "SID file format" §2.2. Getting it wrong is not a musical detail: a
+ * CIA-timed tune wants its play routine called far more often than 50 Hz, and
+ * at 50 Hz the digi/PCM writes land 20 ms apart and turn into silence or
+ * noise.
+ *
+ * The period is read back from the latch the init routine left at $DC04/05,
+ * because that is the only place the value exists - a header probe cannot see
+ * it, so the caller has to run init first, which is what playSong() does in
+ * SIDPod.
+ * ============================================================ */
+static int subsong_uses_cia(const PSID *si, int subsong)
+{
+    if (subsong < 0 || subsong > 31) return 0;
+    return (si->speed >> subsong) & 1u;
+}
+
+/* Cycles between two play() calls. `vsync_cycles` is the PAL/NTSC frame in CPU
+ * cycles; a CIA-timed subsong replaces it with timer A's latch. Timer A
+ * decrements once per cycle in the emulator, so the latch value IS the period
+ * in cycles. A zero latch means the init routine never programmed it, which
+ * would divide by zero and would also mean the tune cannot be CIA-timed, so
+ * the frame rate is the right fallback. */
+static uint32_t pick_play_cycles(uint32_t vsync_cycles, int cia, uint32_t cia_latch)
+{
+    if (cia && cia_latch > 0) return cia_latch;
+    return vsync_cycles;
+}
+
+/* ============================================================
  * machine reset
  *
  * The extractor was a one-shot tool, so every global could start at its
@@ -854,17 +1121,15 @@ static void reset_machine(void)
 
     sid_write_hook = NULL;
     hw_irq_pending = 0;
+    hw_nmi_pending = 0;
 
     VIC_D011 = 0x1b; VIC_D012 = 0; VIC_D019 = 0; VIC_D01A = 0;
     VIC_y = 0;
     VIC_lines = 312; VIC_cpr = 63;
+    s_cyc_in_line = 0;
 
-    CIA_latchA = CIA_latchB = 0;
-    CIA_counterA = CIA_counterB = 0;
-    CIA_startedA = CIA_startedB = 0;
-    CIA_icr_status = 0; CIA_icr_mask = 0;
-    CIA_DC0E_reg = CIA_DC0F_reg = 0;
-    CIA_force_load_A = CIA_force_load_B = 0;
+    memset(&cia1, 0, sizeof(cia1));
+    memset(&cia2, 0, sizeof(cia2));
 
     g_current_cycle = -1;
     g_frame_base_cycle = 0;
@@ -963,19 +1228,34 @@ int sid_song_extract(const char *path, int subsong, double seconds,
     g_frame_base_cycle = clockticks6502;
     call_init(si.init_addr, (uint8_t)subsong, 2000000);
 
-    int32_t n_frames = (int32_t)(seconds * vsync_hz);
-    if (n_frames < 0) n_frames = 0;
-    uint16_t play_addr = get_play_addr(si.play_addr);
-    if (play_addr == 0) n_frames = 0;
+    /* Now that init has run, the header's speed bit and the timer latch are
+     * both knowable, and together they decide how often play() belongs to be
+     * called. See pick_play_cycles() above. */
+    int      cia_timed = subsong_uses_cia(&si, subsong);
+    uint32_t play_cycles = pick_play_cycles((uint32_t)g_cycles_per_frame,
+                                            cia_timed, cia1.latchA);
+    if (play_cycles == 0) play_cycles = (uint32_t)g_cycles_per_frame;
 
-    for (int32_t fr = 0; fr < n_frames; fr++) {
+    info->cia_timed   = cia_timed;
+    info->play_cycles = play_cycles;
+    info->play_hz     = (double)cpu_hz / (double)play_cycles;
+
+    int32_t n_plays = (int32_t)(seconds * cpu_hz / (double)play_cycles);
+    if (n_plays < 0) n_plays = 0;
+    uint16_t play_addr = get_play_addr(si.play_addr);
+
+    /* Each tick covers play_cycles of real time. Timestamps stay absolute
+     * because g_current_cycle is set from the tick index, and on_buf writes
+     * add the intra-tick offset. */
+    for (int32_t fr = 0; fr < n_plays; fr++) {
         g_current_frame = fr;
-        g_current_cycle = (int64_t)fr * (int64_t)g_cycles_per_frame;
+        g_current_cycle = (int64_t)fr * (int64_t)play_cycles;
         g_frame_base_cycle = clockticks6502;
-        call_play(play_addr, 1000000);
+        call_play(play_addr, play_cycles);
     }
 
     sid_write_hook = NULL;
+    debug_snapshot();
 
     /* Hand the buffer over, then convert cycle counts to milliseconds. */
     size_t n = cap_n;
@@ -1027,7 +1307,8 @@ void sid_song_free(sid_event_t *events)
 static int       s_streaming = 0;
 static uint16_t  s_stream_play_addr = 0;
 static double    s_stream_cpu_hz = 985248.0;
-static int32_t   s_stream_frame = 0;
+static int32_t   s_stream_tick = 0;
+static int32_t   s_stream_play_cycles = 19656;  /* frame, or CIA latch */
 static sid_event_t *s_frame_ev = NULL;
 static size_t      s_frame_cap = 0;
 
@@ -1074,10 +1355,22 @@ int sid_stream_open(const char *path, int subsong, sid_song_info_t *info,
     g_frame_base_cycle = clockticks6502;
     call_init(si.init_addr, (uint8_t)subsong, 2000000);
 
-    /* The init writes are handed out as the first frame, so the caller gets
+    /* After init the speed bit and the CIA latch are both readable. A
+     * CIA-timed subsong (Giana Sisters' in-game tracks are the classic case)
+     * wants play() at the timer's rate, not at 50 Hz - see pick_play_cycles(). */
+    int      cia_timed = subsong_uses_cia(&si, subsong);
+    uint32_t play_cycles = pick_play_cycles((uint32_t)g_cycles_per_frame,
+                                            cia_timed, cia1.latchA);
+
+    info->cia_timed   = cia_timed;
+    info->play_cycles = play_cycles;
+    info->play_hz     = (double)cpu_hz / (double)play_cycles;
+
+    /* The init writes are handed out as the first tick, so the caller gets
      * them before it starts counting time. */
-    s_stream_play_addr = get_play_addr(si.play_addr);
-    s_stream_frame = 0;
+    s_stream_play_addr   = get_play_addr(si.play_addr);
+    s_stream_play_cycles = (int32_t)play_cycles;
+    s_stream_tick = 0;
     s_streaming = 1;
 
     free(si.code);
@@ -1093,11 +1386,11 @@ int sid_stream_next_frame(const sid_event_t **events, size_t *count)
         g_current_frame = 0;
     } else {
         if (s_stream_play_addr != 0) {
-            g_current_cycle = (int64_t)s_stream_frame * (int64_t)g_cycles_per_frame;
+            g_current_cycle = (int64_t)s_stream_tick * (int64_t)s_stream_play_cycles;
             g_frame_base_cycle = clockticks6502;
-            call_play(s_stream_play_addr, 1000000);
+            call_play(s_stream_play_addr, (uint32_t)s_stream_play_cycles);
         }
-        s_stream_frame++;
+        s_stream_tick++;
     }
 
     /* Convert the accumulated cycles to milliseconds into a stable buffer.
@@ -1126,10 +1419,14 @@ int sid_stream_next_frame(const sid_event_t **events, size_t *count)
     return 0;
 }
 
+/* How long one sid_stream_next_frame() tick lasts. For a video-frame tune this
+ * is 19.96 ms; for a CIA-timed one it is the timer period, which can be a few
+ * milliseconds. The player's scheduler needs the real number or it will space
+ * the whole stream wrongly. */
 double sid_stream_frame_ms(void)
 {
-    if (g_cycles_per_frame <= 0) return 19.96;
-    return (double)g_cycles_per_frame / s_stream_cpu_hz * 1000.0;
+    if (s_stream_play_cycles <= 0 || s_stream_cpu_hz <= 0) return 19.96;
+    return (double)s_stream_play_cycles / s_stream_cpu_hz * 1000.0;
 }
 
 void sid_stream_close(void)
@@ -1139,7 +1436,8 @@ void sid_stream_close(void)
     reset_machine();
     s_streaming = 0;
     s_stream_play_addr = 0;
-    s_stream_frame = 0;
+    s_stream_tick = 0;
+    s_stream_play_cycles = 19656;
 }
 
 

@@ -87,6 +87,10 @@ int main(int argc, char **argv)
     }
     printf("  %lu register writes over %.2f s\n", (unsigned long)n,
            n ? ev[n - 1].t_ms / 1000.0 : 0.0);
+    printf("  play rate: %.2f Hz (%s, %lu cycles)\n", info.play_hz,
+           info.cia_timed ? "CIA timer A" : "video frame",
+           (unsigned long)info.play_cycles);
+    if (getenv("SIDR_DEBUG")) sidr_debug_report();
 
     if (out_path) {
         if (sid_sidreg_write(out_path, ev, n) != 0) {

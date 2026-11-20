@@ -49,6 +49,15 @@ typedef struct {
     uint16_t start_song;        /* 1-based */
     uint32_t speed;
     uint16_t flags;
+    /* Filled by sid_song_extract / sid_stream_open (a probe cannot know these,
+     * they only exist after the init routine has run):
+     *   cia_timed   - 1 if the speed word says this subsong is driven by CIA
+     *                 timer A instead of the video frame
+     *   play_cycles - CPU cycles between two play() calls
+     *   play_hz     - 1e6 / (play_cycles / clock_hz), for printing */
+    int      cia_timed;
+    uint32_t play_cycles;
+    double   play_hz;
 } sid_song_info_t;
 
 /* Header-only probe: fills info without running any 6502 code, so a playlist
@@ -65,6 +74,11 @@ int sid_song_extract(const char *path, int subsong, double seconds,
                      sid_song_info_t *info, char *err, size_t errlen);
 
 void sid_song_free(sid_event_t *events);
+
+/* Diagnostics for the interrupt wiring: how many NMIs/IRQs the emulator took,
+ * and what vectors the tune installed. Printed by sidextract when the
+ * SIDR_DEBUG environment variable is set; cheap enough to keep always on. */
+void sidr_debug_report(void);
 
 /* ---- live streaming ------------------------------------------------- *
  * A .sid header has no length field. A C64 tune plays for as long as the play
