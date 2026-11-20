@@ -60,6 +60,25 @@ typedef struct {
     double   play_hz;
 } sid_song_info_t;
 
+/* ---- playback model ------------------------------------------------- *
+ * Two ways to advance the 6502, and the difference is not cosmetic:
+ *
+ *   PSID model (default) - call play() once per video frame and stop when it
+ *     returns. Nothing else runs. This is what almost every tune expects and
+ *     what the player has always done; it produces a sparse stream (~50
+ *     registers per 20 ms) that the SPFM's USB link can actually keep up with.
+ *
+ *   RSID model - keep the machine's clocks running for the whole tick and
+ *     service NMI/IRQ between instructions (CIA2 timer A, VIC raster). Needed
+ *     by digi tracks, which put their sample player in an interrupt handler
+ *     and write $D418 thousands of times per second. That is far more than
+ *     1.5 Mbaud can carry, so it is opt-in: a stream at that density will
+ *     stutter on real hardware.
+ *
+ * The choice is per-process, set before sid_song_extract / sid_stream_open. */
+void sid_set_rsid_mode(int on);
+int  sid_get_rsid_mode(void);
+
 /* Header-only probe: fills info without running any 6502 code, so a playlist
  * can show song titles and subsong counts instantly.
  * Returns 0 on success, -1 on error. */

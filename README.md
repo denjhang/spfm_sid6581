@@ -131,11 +131,24 @@ sidtest.exe sidlist sid/rsid --from 10            :: 从第 11 首开始
 | `--subsong N` | 子曲序号，0 起 | 文件默认 |
 | `--speed X` | 播放倍速 | 1.0 |
 | `--proto P` | 写入协议：`1step`（一条 Path A）或 `2step`（两条 Path B） | `1step` |
+| `--rsid` | 改用 RSID 模型（完整时钟 + 中断，digi 采样能跑） | 关 |
 | `--no-cache` | 不读也不写 `.sidreg` 缓存 | 关 |
 | `--cache-dir DIR` | 缓存目录 | `sid_cache` |
 
 写协议是唯一需要按硬件调的参数：这套接线下 SID 是异步写器件，`1step` 实测兼容性
 更好（`2step` 会放坏一部分曲子）；换回旧的四芯片接线时用 `--proto 2step`。
+
+**`--rsid` 是另一套仿真模型，默认不开。** 默认（PSID）每视频帧调一次 play 就结束，
+20 ms 里约 50 条寄存器写入，SPFM 的 1.5 Mbaud 链路刚好跟得上。`--rsid` 会让机器在
+整个 tick 里一直跑并响应 NMI/IRQ，这是 Giana Sisters 那种"音量寄存器 digi"鼓声唯一
+能出来的方式，但写入量达到 **6800 条/秒**，远超链路能力，实机放会卡。
+只有你确认某首曲子必须靠 digi 才有鼓时才用它。
+
+```cmd
+sidtest.exe sidplay sid/Great_Giana_Sisters-rsid.sid              :: 普通播放，鼓声不出来
+sidtest.exe sidplay sid/Great_Giana_Sisters-rsid.sid --rsid       :: 鼓声出来，但链路吃紧
+build\sidextract.exe sid/Great_Giana_Sisters-rsid.sid out.sidreg --rsid
+```
 启动时会打印实际用的协议。
 
 离线渲染（不需要硬件，也不需要 FTDI）：

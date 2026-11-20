@@ -5,10 +5,15 @@
  * machine without the FTDI driver or a board attached; this is what batch
  * processing a music directory uses.
  *
- *   sidextract <file.sid> [<out.sidreg>] [--seconds N] [--subsong N]
+ *   sidextract <file.sid> [<out.sidreg>] [--seconds N] [--subsong N] [--rsid]
  *
  * With no output path the stream is summarised instead of written, which is
  * the quick way to check a file converted at all.
+ *
+ * --rsid switches the emulator to the RSID model (full clock + interrupts, so
+ * digi sample players fire). It is off by default because those streams carry
+ * thousands of writes per second, which the SPFM link cannot carry in real
+ * time; see sid_rsid.h.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,7 +24,7 @@
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "usage: %s <file.sid> [<out.sidreg>] [--seconds N] [--subsong N]\n"
+            "usage: %s <file.sid> [<out.sidreg>] [--seconds N] [--subsong N] [--rsid]\n"
             "       %s <file.sid> --info\n",
             argv0, argv0);
 }
@@ -37,6 +42,8 @@ int main(int argc, char **argv)
             seconds = atof(argv[++i]);
         } else if (!strcmp(argv[i], "--subsong") && i + 1 < argc) {
             subsong = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--rsid")) {
+            sid_set_rsid_mode(1);
         } else if (!strcmp(argv[i], "--info") || !strcmp(argv[i], "-i")) {
             info_only = 1;
         } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
@@ -90,6 +97,11 @@ int main(int argc, char **argv)
     printf("  play rate: %.2f Hz (%s, %lu cycles)\n", info.play_hz,
            info.cia_timed ? "CIA timer A" : "video frame",
            (unsigned long)info.play_cycles);
+    if (!sid_get_rsid_mode())
+        printf("  model   : PSID (play per frame, no interrupts) - use --rsid "
+               "for digi/sample playback\n");
+    else
+        printf("  model   : RSID (full clock + interrupts)\n");
     if (getenv("SIDR_DEBUG")) sidr_debug_report();
 
     if (out_path) {

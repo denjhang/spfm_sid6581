@@ -82,6 +82,10 @@ static uint16_t temp16, startpage, eahelp, eahelp2;
  * next page costs one extra cycle, a store never does. */
 static uint8_t  s_page_crossed = 0;
 static uint8_t  s_page_extra = 0;
+/* Cycle cost of a taken branch (1) or a taken branch that crosses a page (2).
+ * The PSID model stamps writes from branch penalties alone - that is all the
+ * original code ever accumulated - so it needs its own copy of this number. */
+static uint8_t  s_branch_ticks = 0;
 
 /* SID 寄存器写入捕获 */
 static uint8_t SID[32];
@@ -138,6 +142,19 @@ static cia_t cia1, cia2;
 /* /IRQ can be pulled by CIA1 or the VIC raster; /NMI only by CIA2. */
 static uint8_t hw_irq_pending = 0;
 static uint8_t hw_nmi_pending = 0;
+
+/* PSID model by default: play() once per frame, nothing else runs.
+ *
+ * The RSID model (full clock + interrupts for the whole tick) is what digi
+ * tracks need, but it multiplies the write rate by two to three orders of
+ * magnitude - Giana's drums alone are ~6800 $D418 writes per second, where a
+ * normal tune has ~50 register writes per 20 ms frame. Neither 1.5 Mbaud nor
+ * the FTDI latency timer can carry that in real time, so making it the default
+ * would trade one working class of tunes for another. Opt in with --rsid. */
+static int s_rsid_mode = 0;
+
+void sid_set_rsid_mode(int on) { s_rsid_mode = on ? 1 : 0; }
+int  sid_get_rsid_mode(void)   { return s_rsid_mode; }
 
 /* Diagnostics: how many interrupts were actually taken. A digi tune that plays
  * silence shows zero NMI here, which distinguishes "the timer never fired"
@@ -351,19 +368,19 @@ static inline void asl(void) {
 static inline void bcc(void) {
     if ((cpustatus & FLAG_CARRY) == 0) {
         oldpc = pc; pc += reladdr;
-        s_page_extra = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;   /* taken +1, page cross +2 */
+        s_branch_ticks = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
     }
 }
 static inline void bcs(void) {
     if ((cpustatus & FLAG_CARRY) == FLAG_CARRY) {
         oldpc = pc; pc += reladdr;
-        s_page_extra = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;   /* taken +1, page cross +2 */
+        s_branch_ticks = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
     }
 }
 static inline void beq(void) {
     if ((cpustatus & FLAG_ZERO) == FLAG_ZERO) {
         oldpc = pc; pc += reladdr;
-        s_page_extra = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;   /* taken +1, page cross +2 */
+        s_branch_ticks = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
     }
 }
 static inline void op_bit(void) {
@@ -373,19 +390,19 @@ static inline void op_bit(void) {
 static inline void bmi(void) {
     if ((cpustatus & FLAG_SIGN) == FLAG_SIGN) {
         oldpc = pc; pc += reladdr;
-        s_page_extra = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;   /* taken +1, page cross +2 */
+        s_branch_ticks = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
     }
 }
 static inline void bne(void) {
     if ((cpustatus & FLAG_ZERO) == 0) {
         oldpc = pc; pc += reladdr;
-        s_page_extra = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;   /* taken +1, page cross +2 */
+        s_branch_ticks = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
     }
 }
 static inline void bpl(void) {
     if ((cpustatus & FLAG_SIGN) == 0) {
         oldpc = pc; pc += reladdr;
-        s_page_extra = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;   /* taken +1, page cross +2 */
+        s_branch_ticks = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
     }
 }
 static inline void brk(void) {
@@ -493,13 +510,13 @@ static inline void check_hardware_irq(void) {
 static inline void bvc(void) {
     if ((cpustatus & FLAG_OVERFLOW) == 0) {
         oldpc = pc; pc += reladdr;
-        s_page_extra = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;   /* taken +1, page cross +2 */
+        s_branch_ticks = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
     }
 }
 static inline void bvs(void) {
     if ((cpustatus & FLAG_OVERFLOW) == FLAG_OVERFLOW) {
         oldpc = pc; pc += reladdr;
-        s_page_extra = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;   /* taken +1, page cross +2 */
+        s_branch_ticks = ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
     }
 }
 static inline void clc(void) { clearcarry(); }
@@ -641,6 +658,7 @@ static int exec6502(void) {
     useaccum = 0;
     s_page_crossed = 0;
     s_page_extra = 0;
+    s_branch_ticks = 0;
     switch (opcode) {
     case 0x00: imp(); brk(); break;
     case 0x01: indx(); ora(); break;
@@ -955,15 +973,53 @@ static int service_interrupt(void)
     return 0;
 }
 
-/* Run the machine for exactly `cycles` CPU cycles starting at `entry_pc`.
+/* PSID model: call play() and stop when it returns. This is the original
+ * behaviour, kept byte-identical in output because almost every tune was
+ * verified against it.
  *
- * This is what makes digi tracks work. The old code called play() once per
- * video frame and only counted the cycles play() itself burned; between
- * frames nothing ran, so a CIA-timed NMI that is supposed to fire thousands of
- * times per second never fired at all. Here the clock is the loop counter: every
- * cycle advances VIC and both CIAs, interrupts are taken at instruction
- * boundaries, and once play() has RTS'd the CPU parks at IDLE_PC while the
- * clocks keep running for the rest of the tick. */
+ * Two details matter and both were nearly lost when the RSID model was added:
+ *
+ * 1. **No cycle budget.** A play routine is allowed to burn more cycles than a
+ *    video frame contains - plenty of tunes do - and cutting it off at the
+ *    frame boundary truncates it mid-way. When the cut happens before the code
+ *    that writes $D418 (volume), the chip stays stuck at whatever volume value
+ *    was reached, which sounds exactly like "the volume stopped changing".
+ *    The original capped at 1,000,000 instructions, which is never reached.
+ * 2. **The clocks do not advance.** Only branch penalties feed the intra-frame
+ *    timestamp, so a play routine's writes are stamped within a fraction of a
+ *    millisecond of the frame start. Advancing VIC/CIA here instead would also
+ *    fire interrupts the PSID model is not supposed to service. */
+static void call_play_psid(uint16_t play_addr)
+{
+    pc = play_addr;
+    sp = 0xFF;
+    push16(0);
+    push16(0);
+    uint32_t guard = 0;
+    while (pc > 1 && guard++ < 1000000) {
+        exec6502();
+        /* Only branch penalties were ever accumulated here, and the intra-frame
+         * timestamps were calibrated against that. Adding full opcode cycles
+         * would shift every event later within its frame (and was the other
+         * half of the "timing looks different" complaint). */
+        clockticks6502 += s_branch_ticks;
+    }
+}
+
+/* PSID model wrapper that keeps the two timestamp accounting rules the old
+ * code had: init pinned to 0, play writes stamped from the frame base. */
+static void tick_psid(uint16_t play_addr)
+{
+    if (play_addr >= 0x0100) call_play_psid(play_addr);
+}/* Run the machine for exactly `cycles` CPU cycles starting at `entry_pc`.
+ *
+ * This is what makes digi tracks work. Under the PSID model play() is called
+ * once per video frame and only the cycles play() itself burns are counted;
+ * between frames nothing runs, so a CIA-timed NMI that is supposed to fire
+ * thousands of times per second never fires at all. Here the clock is the loop
+ * counter: every cycle advances VIC and both CIAs, interrupts are taken at
+ * instruction boundaries, and once play() has RTS'd the CPU parks at IDLE_PC
+ * while the clocks keep running for the rest of the tick. */
 static void run_machine(uint16_t entry_pc, uint32_t cycles)
 {
     if (entry_pc >= 0x0100) {
@@ -1228,30 +1284,54 @@ int sid_song_extract(const char *path, int subsong, double seconds,
     g_frame_base_cycle = clockticks6502;
     call_init(si.init_addr, (uint8_t)subsong, 2000000);
 
-    /* Now that init has run, the header's speed bit and the timer latch are
-     * both knowable, and together they decide how often play() belongs to be
-     * called. See pick_play_cycles() above. */
-    int      cia_timed = subsong_uses_cia(&si, subsong);
-    uint32_t play_cycles = pick_play_cycles((uint32_t)g_cycles_per_frame,
-                                            cia_timed, cia1.latchA);
-    if (play_cycles == 0) play_cycles = (uint32_t)g_cycles_per_frame;
+    /* Two playback models, chosen by the caller (see sid_rsid.h).
+     *
+     * PSID: play() once per video frame, no clock, no interrupts - the shape
+     * the player has always used, byte-identical in output to the version
+     * before the digi work. RSID: run the machine for a full tick so interrupt
+     * handlers (digi samples) actually execute. */
+    if (!s_rsid_mode) {
+        int32_t n_frames = (int32_t)(seconds * vsync_hz);
+        if (n_frames < 0) n_frames = 0;
+        uint16_t play_addr = get_play_addr(si.play_addr);
+        if (play_addr == 0) n_frames = 0;
 
-    info->cia_timed   = cia_timed;
-    info->play_cycles = play_cycles;
-    info->play_hz     = (double)cpu_hz / (double)play_cycles;
+        info->cia_timed   = 0;
+        info->play_cycles = (uint32_t)g_cycles_per_frame;
+        info->play_hz     = vsync_hz;
 
-    int32_t n_plays = (int32_t)(seconds * cpu_hz / (double)play_cycles);
-    if (n_plays < 0) n_plays = 0;
-    uint16_t play_addr = get_play_addr(si.play_addr);
+        for (int32_t fr = 0; fr < n_frames; fr++) {
+            g_current_frame = fr;
+            g_current_cycle = (int64_t)fr * (int64_t)g_cycles_per_frame;
+            g_frame_base_cycle = clockticks6502;
+            tick_psid(play_addr);
+        }
+    } else {
+        /* Now that init has run, the header's speed bit and the timer latch are
+         * both knowable, and together they decide how often play() belongs to be
+         * called. See pick_play_cycles() above. */
+        int      cia_timed = subsong_uses_cia(&si, subsong);
+        uint32_t play_cycles = pick_play_cycles((uint32_t)g_cycles_per_frame,
+                                                cia_timed, cia1.latchA);
+        if (play_cycles == 0) play_cycles = (uint32_t)g_cycles_per_frame;
 
-    /* Each tick covers play_cycles of real time. Timestamps stay absolute
-     * because g_current_cycle is set from the tick index, and on_buf writes
-     * add the intra-tick offset. */
-    for (int32_t fr = 0; fr < n_plays; fr++) {
-        g_current_frame = fr;
-        g_current_cycle = (int64_t)fr * (int64_t)play_cycles;
-        g_frame_base_cycle = clockticks6502;
-        call_play(play_addr, play_cycles);
+        info->cia_timed   = cia_timed;
+        info->play_cycles = play_cycles;
+        info->play_hz     = (double)cpu_hz / (double)play_cycles;
+
+        int32_t n_plays = (int32_t)(seconds * cpu_hz / (double)play_cycles);
+        if (n_plays < 0) n_plays = 0;
+        uint16_t play_addr = get_play_addr(si.play_addr);
+
+        /* Each tick covers play_cycles of real time. Timestamps stay absolute
+         * because g_current_cycle is set from the tick index, and on_sid_write
+         * adds the intra-tick offset. */
+        for (int32_t fr = 0; fr < n_plays; fr++) {
+            g_current_frame = fr;
+            g_current_cycle = (int64_t)fr * (int64_t)play_cycles;
+            g_frame_base_cycle = clockticks6502;
+            call_play(play_addr, play_cycles);
+        }
     }
 
     sid_write_hook = NULL;
@@ -1355,16 +1435,26 @@ int sid_stream_open(const char *path, int subsong, sid_song_info_t *info,
     g_frame_base_cycle = clockticks6502;
     call_init(si.init_addr, (uint8_t)subsong, 2000000);
 
-    /* After init the speed bit and the CIA latch are both readable. A
-     * CIA-timed subsong (Giana Sisters' in-game tracks are the classic case)
-     * wants play() at the timer's rate, not at 50 Hz - see pick_play_cycles(). */
-    int      cia_timed = subsong_uses_cia(&si, subsong);
-    uint32_t play_cycles = pick_play_cycles((uint32_t)g_cycles_per_frame,
-                                            cia_timed, cia1.latchA);
-
-    info->cia_timed   = cia_timed;
-    info->play_cycles = play_cycles;
-    info->play_hz     = (double)cpu_hz / (double)play_cycles;
+    /* PSID model (default): the tick is always a video frame and play() is
+     * called once and left to return. RSID model: the tick may be the CIA
+     * timer period and the machine runs for the whole tick. See sid_rsid.h. */
+    uint32_t play_cycles;
+    if (!s_rsid_mode) {
+        play_cycles = (uint32_t)g_cycles_per_frame;
+        info->cia_timed   = 0;
+        info->play_cycles = play_cycles;
+        info->play_hz     = vsync_hz;
+    } else {
+        /* After init the speed bit and the CIA latch are both readable. A
+         * CIA-timed subsong (Giana Sisters' in-game tracks are the classic
+         * case) wants play() at the timer's rate, not at 50 Hz. */
+        int cia_timed = subsong_uses_cia(&si, subsong);
+        play_cycles = pick_play_cycles((uint32_t)g_cycles_per_frame,
+                                       cia_timed, cia1.latchA);
+        info->cia_timed   = cia_timed;
+        info->play_cycles = play_cycles;
+        info->play_hz     = (double)cpu_hz / (double)play_cycles;
+    }
 
     /* The init writes are handed out as the first tick, so the caller gets
      * them before it starts counting time. */
@@ -1385,11 +1475,10 @@ int sid_stream_next_frame(const sid_event_t **events, size_t *count)
         /* First call: hand over the init writes captured by sid_stream_open. */
         g_current_frame = 0;
     } else {
-        if (s_stream_play_addr != 0) {
-            g_current_cycle = (int64_t)s_stream_tick * (int64_t)s_stream_play_cycles;
-            g_frame_base_cycle = clockticks6502;
-            call_play(s_stream_play_addr, (uint32_t)s_stream_play_cycles);
-        }
+        g_current_cycle = (int64_t)s_stream_tick * (int64_t)s_stream_play_cycles;
+        g_frame_base_cycle = clockticks6502;
+        if (s_rsid_mode) call_play(s_stream_play_addr, (uint32_t)s_stream_play_cycles);
+        else             tick_psid(s_stream_play_addr);
         s_stream_tick++;
     }
 

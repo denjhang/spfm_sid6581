@@ -629,11 +629,16 @@ static int cmd_play(int argc, char **argv)
     int use_cache = 1;
     int pace = 0;
 
+    /* PSID model unless asked otherwise: see sid_rsid.h. Digi tracks need
+     * --rsid, and their write rate is beyond what the SPFM link can carry. */
+    sid_set_rsid_mode(0);
+
     for (int i = 0; i < argc; i++) {
         if (!strcmp(argv[i], "--seconds") && i + 1 < argc)      seconds = atof(argv[++i]);
         else if (!strcmp(argv[i], "--speed") && i + 1 < argc)   speed = atof(argv[++i]);
         else if (!strcmp(argv[i], "--subsong") && i + 1 < argc) subsong = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--no-cache"))                use_cache = 0;
+        else if (!strcmp(argv[i], "--rsid"))                    sid_set_rsid_mode(1);
         else if (!strcmp(argv[i], "--cache-dir") && i + 1 < argc)
             sidplay_set_cache_dir(argv[++i]);
         else if (!strcmp(argv[i], "--raw-filter"))              s_keep_filter = 1;
@@ -652,7 +657,9 @@ static int cmd_play(int argc, char **argv)
 
     if (!path) {
         fprintf(stderr, "usage: sidplay <file.sid|file.sidreg> [options]\n"
-                        "  --proto 1step|2step   write protocol (default 2step)\n"
+                        "  --proto 1step|2step   write protocol (default 1step)\n"
+                        "  --rsid                run the machine with clocks and "
+                        "interrupts (digi drums; heavy)\n"
                         "  --seconds N  --subsong N  --speed X  --no-cache\n");
         return 1;
     }
@@ -704,8 +711,9 @@ static int cmd_play(int argc, char **argv)
         printf("playing %.0f s (from the start)\n", seconds);
     else
         printf("playing until interrupted: [n] next-track marker, [q] quit\n");
-    printf("subsong %d of %u, speed %.2fx, %s writes\n", subsong, probe.n_songs,
-           speed, sidplay_proto_name());
+    printf("subsong %d of %u, speed %.2fx, %s writes, %s model\n",
+           subsong, probe.n_songs, speed, sidplay_proto_name(),
+           sid_get_rsid_mode() ? "RSID" : "PSID");
     fflush(stdout);
 
     if (hw_connect() != 0) return 1;
@@ -806,10 +814,13 @@ static int cmd_playlist(int argc, char **argv)
     int start_idx = 0;
     int subsong = 0;
 
+    sid_set_rsid_mode(0);
+
     for (int i = 0; i < argc; i++) {
         if (!strcmp(argv[i], "--seconds") && i + 1 < argc)      seconds = atof(argv[++i]);
         else if (!strcmp(argv[i], "--speed") && i + 1 < argc)   speed = atof(argv[++i]);
         else if (!strcmp(argv[i], "--subsong") && i + 1 < argc) subsong = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--rsid"))                    sid_set_rsid_mode(1);
         else if (!strcmp(argv[i], "--from") && i + 1 < argc)    start_idx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cache-dir") && i + 1 < argc)
             sidplay_set_cache_dir(argv[++i]);
@@ -841,7 +852,8 @@ static int cmd_playlist(int argc, char **argv)
     printf("\n%d files in %s\n", nfiles, dir);
     printf("each track plays until you press a key.  "
            "[n] next   [b] back   [,] prev subsong   [.] next subsong   [q] quit\n");
-    printf("write protocol: %s\n\n", sidplay_proto_name());
+    printf("write protocol: %s, %s model\n\n", sidplay_proto_name(),
+           sid_get_rsid_mode() ? "RSID" : "PSID");
 
     int idx = start_idx < 0 ? 0 : (start_idx >= nfiles ? nfiles - 1 : start_idx);
 
