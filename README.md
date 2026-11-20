@@ -140,9 +140,24 @@ sidtest.exe sidlist sid/rsid --from 10            :: 从第 11 首开始
 更好（`2step` 会放坏一部分曲子）；换回旧的四芯片接线时用 `--proto 2step`。
 
 **`--rsid` 是另一套仿真模型，默认不开。** 默认（PSID）每视频帧调一次 play 就结束，
-20 ms 里约 50 条寄存器写入，SPFM 的 1.5 Mbaud 链路刚好跟得上。`--rsid` 会让机器在
-整个 tick 里一直跑并响应 NMI/IRQ，这是 Giana Sisters 那种"音量寄存器 digi"鼓声唯一
-能出来的方式，但写入量达到 **6800 条/秒**，实机放会卡。
+20 ms 里约 50 条寄存器写入。`--rsid` 会让机器在整个 tick 里一直跑并响应 NMI/IRQ，
+这是 Giana Sisters 那种"音量寄存器 digi"鼓声唯一能出来的方式，写入量升到
+**6800 条/秒**。
+
+**链路容量（实测口径，别再用 187.5 kB/s）**：1.5 Mbaud 配 8N1 是 10 bit/字节，
+线速 150000 B/s = 6.667 µs/字节，一条 Path A（4 字节）= 26.667 µs，所以
+**上限 37500 条/秒**。而每次 flush 之后 FTDI 的 2 ms latency timer 会让线路空转，
+所以真正决定吞吐的是**一批装多少**：256 条/批 ≈ 29000 条/s，4096 字节/批 ≈
+34900 条/s。`sidplay` 每视频帧 flush 一次，Giana 最密的一帧 172 条 = 688 字节，
+线上 4.59 ms + 2 ms = 6.59 ms，只占 19.96 ms 帧预算的 33%——**不限速其实也装得下**。
+
+基线来自 `Denjhang_Music_Player_v16` 的 YM2608 ADPCM 预载（零节流、上机验证过，
+V0 是 256 条/批、V1 是 4096 字节切片）。`sidtest bench` 在本机复现这两种形状：
+
+```cmd
+sidtest.exe bench              :: V1/V0/每帧批量 全部实测，附实测/理论比
+sidtest.exe bench --quick      :: 每种两万条，快速看数
+```
 
 **`--limit HZ` 是给 `--rsid` 配的限速**：只把 `$D418`（音量）的更新率钉在固定时基上，
 同一格里后来的值就地覆盖、和当前保持值相同的直接丢。其它 24 个寄存器一条不动，
@@ -153,7 +168,7 @@ sidtest.exe sidlist sid/rsid --from 10            :: 从第 11 首开始
 
 ```cmd
 sidtest.exe sidplay sid/Great_Giana_Sisters-rsid.sid              :: 普通播放，鼓声不出来
-sidtest.exe sidplay sid/Great_Giana_Sisters-rsid.sid --rsid       :: 鼓声出来，但链路吃紧
+sidtest.exe sidplay sid/Great_Giana_Sisters-rsid.sid --rsid       :: 鼓声出来
 sidtest.exe sidplay sid/Great_Giana_Sisters-rsid.sid --rsid --limit 2000   :: 鼓声 + 限速
 build\sidextract.exe sid/Great_Giana_Sisters-rsid.sid out.sidreg --rsid --limit 2000
 ```

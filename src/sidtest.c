@@ -1604,6 +1604,191 @@ static int cmd_checkup(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* bench - the link ceiling, anchored on the ADPCM preload             */
+/* ------------------------------------------------------------------ */
+
+/* The reference player's YM2608 ADPCM preload is the one path in the family
+ * that is known to work on real hardware at full speed, so it defines the
+ * ceiling this board must be measured against. It throttles nothing - no
+ * acknowledgement, no drain check, no sleep - and it has two batch shapes
+ * (windows/ym2608/ym2608_window.cpp:426-561):
+ *
+ *   V0  chunk-per-flush : CHUNK = 256 commands (1024 B) per spfm_flush()
+ *   V1  raw buffer      : init+data+finalize as one buffer, spfm_write_raw in
+ *                         4096-byte slices, one flush at the end
+ *
+ * node-spfm (src/player/ym2608-ram-write.ts) does the same thing in 256-command
+ * chunks, i.e. the V0 shape.
+ *
+ * Line rate: 1.5 Mbaud with 8N1 framing is 10 bits per byte -> 150000 B/s,
+ * 6.667 us/byte. A 4-byte Path A record is 26.667 us -> 37500 commands/s; a
+ * 3-byte Path B record is 20 us -> 50000/s. (The "about 40000 writes/s" in the
+ * reference docs is the Path B figure measured after firmware overhead, which
+ * is why it sits between the two.)
+ *
+ * Batch size sets how much of that survives the 2 ms FTDI latency timer: each
+ * flush ends with one latency period of dead wire time.
+ *
+ *   1024 B/批 -> 6.83 ms wire + 2 ms ->  29000 条/s  (78%)
+ *   4096 B/批 -> 27.31 ms wire + 2 ms -> 34900 条/s  (93%)  <- V1
+ *  64 KiB/批 -> 436.9 ms wire + 2 ms -> 37300 条/s  (99.5%)
+ *
+ * So V1 is the shape that actually reaches the ceiling; V0 gives up about a
+ * fifth of it to round trips. Everything below measures this board against
+ * that. Register 0x04 with data 0 keeps the chip silent, and the firmware does
+ * not dedupe, so the bus work per command is identical to a real write. */
+
+typedef struct { int64_t us; uint32_t writes; size_t peak; } bench_res;
+
+static bench_res bench_run(const char *label, int path_a, uint32_t writes,
+                           uint32_t chunk, int drain)
+{
+    if (chunk == 0 || chunk > writes) chunk = writes;
+    const uint32_t bytes = path_a ? 4u : 3u;
+
+    size_t peak_pending = 0;
+    int64_t t0 = spfm_now_us();
+    for (uint32_t done = 0; done < writes; ) {
+        uint32_t n = writes - done;
+        if (n > chunk) n = chunk;
+
+        if (path_a)
+            for (uint32_t i = 0; i < n; i++)
+                spfm_write_path_a(g_slot, 0x00, 0x04, 0x00);
+        else
+            for (uint32_t i = 0; i < n; i++)
+                spfm_write_path_b(g_slot, 0x04, 0x00);
+
+        if (drain) {
+            size_t p = spfm_flush_drain(64, 0);
+            if (p > peak_pending) peak_pending = p;
+        } else {
+            spfm_flush();
+        }
+        done += n;
+    }
+    int64_t us = spfm_now_us() - t0;
+    if (us <= 0) us = 1;
+
+    double per_s = (double)writes * 1e6 / (double)us;
+    double kb_s  = per_s * (double)bytes / 1024.0;
+    printf("  %-30s %8.2f ms  %7.0f 条/s  %6.1f kB/s  %.2f µs/条",
+           label, (double)us / 1000.0, per_s, kb_s,
+           (double)us / (double)writes);
+    if (drain) printf("  backlog≤%lu", (unsigned long)peak_pending);
+    printf("\n");
+
+    bench_res r;
+    r.us = us;
+    r.writes = writes;
+    r.peak = peak_pending;
+    return r;
+}
+
+static double res_rate(const bench_res *r)
+{
+    return (double)r->writes * 1e6 / (double)(r->us > 0 ? r->us : 1);
+}
+
+/* What the same batch shape should reach on the wire, latency timer included.
+ * Printed next to the measurement so a shortfall is visible as a ratio rather
+ * than as an opinion. */
+static double bench_theory(uint32_t batch_bytes)
+{
+    const double line_bps = 150000.0;      /* 1.5 Mbaud / 10 bits per byte */
+    const double latency_s = 0.002;        /* FT_SetLatencyTimer(2) */
+    double wire = (double)batch_bytes / line_bps;
+    return (double)batch_bytes / (wire + latency_s) / 4.0;
+}
+
+static int cmd_bench(int argc, char **argv)
+{
+    uint32_t writes = 200000;
+    int      quick  = 0;
+
+    for (int i = 0; i < argc; i++) {
+        if (!strcmp(argv[i], "--writes") && i + 1 < argc) writes = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--quick")) quick = 1;
+        else {
+            fprintf(stderr, "bench options: --writes N  --quick\n");
+            return 1;
+        }
+    }
+    if (writes < 1000) writes = 1000;
+    if (quick) writes = 20000;
+
+    if (g_dry_run) {
+        fprintf(stderr, "bench needs the real device: dry-run measures nothing\n");
+        return 1;
+    }
+    if (connect_device() != 0) return 1;
+
+    sid_set_write_mode(SID_WRITE_BURST);
+    sid_clear_all_regs(g_slot);
+    sid_flush();
+    sleep_ms(50);
+
+    printf("SPFM 写入速率实测：%u 条 Path A（0x04 <- 0x00，gate 关，静音）\n", writes);
+    printf("线速：1.5 Mbaud 8N1 = 10 bit/B = 150000 B/s = 6.667 µs/B\n");
+    printf("      Path A 4B = 26.667 µs/条 = 37500 条/s（理论天花板）\n");
+    printf("基准：ADPCM 预载两种形状（零节流，已上机验证）\n\n");
+
+    bench_res v1    = bench_run("V1  全量单批（4096B 切片）", 1, writes, 0, 0);
+    bench_res b4k   = bench_run("4096B/批 = 1024 条",        1, writes, 1024, 0);
+    bench_res v0    = bench_run("V0  256 条/批（1024B）",     1, writes, 256, 0);
+    bench_res v0d   = bench_run("V0 形状 + 每批等排空",       1, writes, 256, 1);
+    bench_res unlim = bench_run("一帧 172 条（不限速最密）",  1, writes, 172, 0);
+    bench_res lim2k = bench_run("一帧 34 条（--limit 2000）", 1, writes, 34, 0);
+    bench_res b_one = bench_run("每条 flush（最坏情况）",     1, writes, 1, 0);
+
+    double r1 = res_rate(&v1), r4 = res_rate(&b4k), r0 = res_rate(&v0);
+    double rd = res_rate(&v0d), ru = res_rate(&unlim), rl = res_rate(&lim2k);
+    double rn = res_rate(&b_one);
+
+    struct { const char *name; double got, want; const char *note; } rows[] = {
+        { "V1 4096B 切片", r1, bench_theory(4096), "ADPCM V1 实际形状" },
+        { "1024 条/批",    r4, bench_theory(4096), "" },
+        { "V0 256 条/批",  r0, bench_theory(1024), "ADPCM V0 / node-spfm" },
+        { "一帧 172 条",   ru, bench_theory(688),  "sidplay 不限速，Giana 最密" },
+        { "一帧 34 条",    rl, bench_theory(136),  "sidplay --limit 2000" },
+        { "每条都 flush",  rn, bench_theory(4),    "4 B/批" },
+    };
+
+    printf("\n          实测        理论(含 2ms latency)   实测/理论   备注\n");
+    for (size_t i = 0; i < sizeof rows / sizeof rows[0]; i++) {
+        printf("  %-14s %7.0f 条/s   %7.0f 条/s        %5.1f%%    %s\n",
+               rows[i].name, rows[i].got, rows[i].want,
+               100.0 * rows[i].got / (rows[i].want > 0 ? rows[i].want : 1),
+               rows[i].note);
+    }
+    printf("  %-14s %7.0f 条/s   %7.0f 条/s        %5.1f%%    等排空比不等慢 %.0f%%\n",
+           "V0 + 等排空", rd, bench_theory(1024),
+           100.0 * rd / (bench_theory(1024) > 0 ? bench_theory(1024) : 1),
+           100.0 * (1.0 - rd / (r0 > 1.0 ? r0 : 1.0)));
+
+    /* The number that matters: the shape sidplay actually uses, one batch per
+     * 19.96 ms video frame. */
+    printf("\n按 ADPCM 基准下推本项目的上限：\n");
+    printf("  V1 形状（4096B/批）       实测 %.0f 条/s = %.0f kB/s\n",
+           r1, r1 * 4.0 / 1024.0);
+    printf("  V0 形状（256 条/批）      实测 %.0f 条/s = %.0f kB/s  <- 保守基准\n",
+           r0, r0 * 4.0 / 1024.0);
+    printf("  sidplay 不限速（一帧 172 条 = 688B/批）理论上限 %.0f 条/s，实测 %.0f\n",
+           bench_theory(688), ru);
+    printf("  sidplay --limit 2000（一帧 34 条 = 136B/批）理论上限 %.0f 条/s，实测 %.0f\n",
+           bench_theory(136), rl);
+    printf("\nGiana 的 $D418：平均 5434 条/s，最密一帧 172 条 = 688 B\n");
+    printf("  占 V0 基准 %.0f%%，占 V1 基准 %.0f%%——整条流装得下\n",
+           100.0 * 5434.0 / (r0 > 1 ? r0 : 1), 100.0 * 5434.0 / (r1 > 1 ? r1 : 1));
+    printf("一帧 688 B：线上 4.59 ms + 2 ms = 6.59 ms，占 19.96 ms 帧预算的 33%%\n");
+
+    sid_clear_all_regs(g_slot);
+    sid_flush();
+    disconnect();
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* selftest - verify the generated byte stream without hardware        */
 /* ------------------------------------------------------------------ */
 static int failures = 0;
@@ -2072,6 +2257,7 @@ static void usage(void)
         "  split             sweep address-repeat x data-repeat independently\n"
         "  norep             one write per transfer, gap swept 0..8, no retries\n"
         "  checkup           guided power-on checks (needs meters)\n"
+        "  bench             measure the real write rate (--writes N  --quick)\n"
         "  selftest          verify the byte stream, no hardware\n"
         "  interactive       type register writes by hand\n");
 }
@@ -2186,6 +2372,7 @@ int main(int argc, char **argv)
     if (!strcmp(cmd, "split"))       return cmd_split();
     if (!strcmp(cmd, "norep"))       return cmd_norep();
     if (!strcmp(cmd, "checkup"))     return cmd_checkup();
+    if (!strcmp(cmd, "bench"))       return cmd_bench(nrest, rest);
     if (!strcmp(cmd, "selftest"))    return cmd_selftest();
     if (!strcmp(cmd, "interactive")) return cmd_interactive();
 

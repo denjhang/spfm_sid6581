@@ -37,8 +37,9 @@ extern "C" {
 /* 1.000 MHz can oscillator on the module (8580 boards use 0.985 MHz). */
 #define SID_PHI2_HZ_DEFAULT  1000000.0
 
-/* Register write cost: 4 bytes at 1.5 Mbaud ≈ 21 µs, two bus cycles. */
-#define SID_WRITE_US         21u
+/* Register write cost: 4 bytes at 1.5 Mbaud 8N1 = 10 bit/byte = 26.67 µs.
+ * (The 21 µs quoted in older notes assumed 8 bit/byte, which is wrong.) */
+#define SID_WRITE_US         27u
 
 /* ------------------------------------------------------------------ */
 /* register map                                                        */
