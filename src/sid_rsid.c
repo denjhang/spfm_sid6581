@@ -92,6 +92,253 @@ static uint8_t SID[32];
 /* 捕获回调 (由 main 设置): 写 $D400-$D41F 时调用 */
 static void (*sid_write_hook)(uint8_t reg, uint8_t val) = NULL;
 
+/* ------------------------------------------------------------------ *
+ * SID 地址空间
+ *
+ * 真机把 $D400-$D7FF 整块交给 SID，芯片只用低 5 位译码，所以 $D5xx、
+ * $D6xx 都是同一颗 SID 的镜像。Aliens_Symphony 这类曲子就写在 $D5xx 上
+ * （WebSid sid.cpp:536-540 的注释点名的例子），我们以前把这片当 RAM，
+ * 等于它写了 SID 却没有声音。
+ *
+ * 多颗 SID 则按 header 的 $7A/$7B 分窗口：落在某颗已声明窗口里的地址属于
+ * 那颗芯片，其余全部镜射到第一颗。这张表照 WebSid 的 _mem2sid[] 做法
+ * （sid.cpp:911-930），默认全 0，再给每颗额外的 SID 填 0x1F 字节索引。
+ *
+ * 本机只有 slot 3 一颗 SID，所以索引非 0 的写入不可能是我们发得出去的：
+ * 丢弃并计数，而不是把它们折进第一颗——旧代码 `& 0x1F` 就是这么把
+ * $D438（第二颗的音量）折成 $D418，把第一颗的音量连 filter 模式一起改掉。
+ * ------------------------------------------------------------------ */
+#define SID_MAP_BASE 0xD400
+#define SID_MAP_SIZE 0x400                 /* $D400-$D7FF */
+#define SID_MAX_EXTRA 2                    /* header 只给得出第 2、3 颗 */
+static uint8_t s_sid_map[SID_MAP_SIZE];    /* 0 = 我们这颗, n = 第 n 颗 */
+static uint8_t s_sid_extra = 0;            /* header 里声明的额外 SID 数 */
+
+/* 上一次写到总线上的值（任何寄存器）。真机读只写寄存器得到的是它，
+ * 不是该寄存器自己的影子——libresidfp SID.cpp:331-360 的 busValue /
+ * WebSid sid.cpp:427-451 的 _bus_write 都是这个语义。 */
+static uint8_t s_bus_write = 0;
+
+/* ------------------------------------------------------------------ *
+ * SID 声部模型（振荡器 + 包络）
+ *
+ * 只有两个用途：给 $D41B/$D41C 提供真实数据源，以及让"用 SID 自己的包络/
+ * 振荡器当噪声源做 digi"的曲子（Echoes、Echofied_6581 读 $D41C 七万多次）
+ * 有东西可读。这不是一个发声用的合成器——我们的输出永远是寄存器流，
+ * 芯片在硬件上发声。所以只要读数对，模型就算对。
+ *
+ * 结构照 WebSid：wavegenerator.cpp 的 24 bit 相位累加器 + getOsc()，
+ * envelope.cpp 的 15 bit LFSR 阈值 + ADSR 状态机。我们紧跟它的语义，
+ * 因为它的 getOsc()/getOutput() 正是 $D41B/$D41C 的定义。
+ * ------------------------------------------------------------------ */
+typedef struct {
+    /* 相位累加器: 每周期 += freq, 24 bit。$D41B 读的是波形输出高 8 位。 */
+    uint32_t counter;
+    uint16_t freq;          /* $D400/01 */
+    uint16_t pw;            /* $D402/03, 12 bit */
+    uint8_t  ctrl;          /* $D404: gate/sync/ring/test/tri/saw/pulse/noise */
+    uint8_t  ad, sr;        /* $D405, $D406 */
+
+    /* ADSR。阈值来自 WebSid 的 COUNTER_PERIOD[]，LFSR 每周期 +1 到 0x8000。 */
+    uint16_t env_lfsr;
+    uint8_t  env;           /* 当前包络值 0..255，$D41C 读它 */
+    uint8_t  env_phase;     /* 0 attack, 1 decay, 2 sustain, 3 release */
+    uint8_t  zero_lock;
+    uint8_t  exp_counter;
+
+    /* 噪声: 23 bit LFSR，和 WebSid 同一位置位/反馈方案 */
+    uint32_t noise_lfsr;
+    uint16_t noise_out;     /* 当前噪声波形输出（16 bit） */
+} sid_voice_t;
+
+static sid_voice_t sidv[3];
+
+/* WebSid envelope.cpp:56 —— attack/decay/release 的阈值表 */
+static const uint16_t env_period[16] = {
+    8, 32, 63, 95, 150, 220, 267, 314, 393, 942, 1961, 3138, 3922, 11765, 19608, 31373
+};
+/* WebSid envelope.cpp:60 —— decay/release 的指数延迟（resid 的分析） */
+static const uint8_t env_exp_delay[256] = {
+     1,30,30,30,30,30,30,16,16,16,16,16,16,16,16, 8,
+     8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 4, 4,
+     4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+     4, 4, 4, 4, 4, 4, 4, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+     2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+     2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1,
+     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+};
+
+#define SID_NOISE_RESET 0x7FFFFFu
+
+static void sid_voice_reset(sid_voice_t *v)
+{
+    memset(v, 0, sizeof(*v));
+    v->noise_lfsr = SID_NOISE_RESET;
+    v->noise_out  = 0xFFFF;
+    v->env_phase  = 3;        /* release */
+    v->zero_lock  = 1;
+}
+
+/* 噪声 LFSR 输出：WebSid wavegenerator.cpp:activateNoiseOutput() 的位序 */
+static uint16_t sid_noise_output(uint32_t lfsr)
+{
+    return (uint16_t)(((lfsr >>  5) & 0x8000) | ((lfsr >>  4) & 0x4000) |
+                      ((lfsr >>  1) & 0x2000) | ((lfsr <<  1) & 0x1000) |
+                      ((lfsr <<  2) & 0x0800) | ((lfsr <<  5) & 0x0400) |
+                      ((lfsr <<  7) & 0x0200) | ((lfsr <<  8) & 0x0100));
+}
+
+/* 三角波: WebSid createTriangleOutput()。counter 24 bit，取异或折返。 */
+static uint16_t sid_triangle(uint32_t counter)
+{
+    uint32_t tmp = counter;
+    uint32_t wfout = (tmp ^ (tmp & 0x800000 ? 0xFFFFFF : 0)) >> 7;
+    return (uint16_t)(wfout & 0xFFFF);
+}
+
+/* $D41B 的定义: 波形组合输出的高 8 位。WebSid getOsc() 明确要求这里
+ * 不能做 anti-aliasing（testcase: we_are_demo_tune_2），所以就是纯位运算。 */
+static uint8_t sid_voice_osc(const sid_voice_t *v)
+{
+    uint16_t out = 0xFFFF;
+    uint8_t bits = (uint8_t)(v->ctrl & 0xF0);
+    uint32_t pw12 = (uint32_t)v->pw << 12;
+
+    if (!bits) return (uint8_t)((v->ctrl & 0x08) ? 0 : 0);   /* test 位锁 0 */
+
+    if (bits & 0x10) out &= sid_triangle(v->counter);
+    if (bits & 0x20) out &= (uint16_t)(v->counter >> 8);
+    if (bits & 0x40) out &= (uint16_t)((v->counter < pw12) ? 0 : 0xFFFF);
+    if (bits & 0x80) out &= v->noise_out;
+    return (uint8_t)(out >> 8);
+}
+
+/* 每周期推进一个声部。相位累加器 + 噪声移位 + 包络 LFSR，都是逐周期的，
+ * 这样 $D41B/$D41C 在任何时刻被读都能得到和真机同量级的值。 */
+static void sid_voice_clock(sid_voice_t *v)
+{
+    const uint8_t bits = (uint8_t)(v->ctrl & 0xF0);
+
+    if (v->ctrl & 0x08) {
+        /* TEST 位: 振荡器锁在 0，噪声寄存器按 NOISE_RESET 复位（WebSid 同） */
+        v->counter = 0;
+        v->noise_lfsr = SID_NOISE_RESET;
+    } else {
+        uint32_t prev = v->counter;
+        v->counter = (v->counter + v->freq) & 0xFFFFFF;
+
+        if (bits & 0x80) {
+            /* 噪声在累加器 bit19 上升沿移位（WebSid CLOCK_NOISE_GENERATOR） */
+            if ((v->counter & 0x080000) > (prev & 0x080000)) {
+                uint32_t lfsr = v->noise_lfsr;
+                uint32_t feed = ((lfsr >> 22) ^ (lfsr >> 17)) & 1;
+                v->noise_lfsr = ((lfsr << 1) | feed) & 0x7FFFFF;
+                v->noise_out  = sid_noise_output(v->noise_lfsr);
+            }
+        }
+    }
+
+    /* ---- 包络 ---- */
+    if (++v->env_lfsr >= 0x8000) v->env_lfsr = 0;
+
+    const uint16_t attack_thr  = env_period[v->ad >> 4];
+    const uint16_t decay_thr   = env_period[v->ad & 0x0F];
+    const uint16_t release_thr = env_period[v->sr & 0x0F];
+    const uint8_t  sustain     = (uint8_t)((v->sr >> 4) * 0x11);
+
+    int inc_exp = 0;
+    switch (v->env_phase) {
+    case 0:   /* attack */
+        if (v->env_lfsr == attack_thr && !v->zero_lock) {
+            v->env_lfsr = 0;
+            v->env = (uint8_t)(v->env + 1);
+            v->exp_counter = 0;
+            if (v->env == 0xFF) v->env_phase = 1;
+        }
+        break;
+    case 1:   /* decay */
+        if (v->env_lfsr == decay_thr) {
+            v->env_lfsr = 0;
+            inc_exp = 1;
+        }
+        if (inc_exp && ++v->exp_counter >= env_exp_delay[v->env] && !v->zero_lock) {
+            v->exp_counter = 0;
+            if (v->env != sustain) v->env = (uint8_t)(v->env - 1);
+            else                   v->env_phase = 2;
+        }
+        break;
+    case 2:   /* sustain: 继续用 decay 阈值计数，但不改音量 */
+        if (v->env_lfsr == decay_thr) v->env_lfsr = 0;
+        if (v->env > sustain) v->env_phase = 1;
+        break;
+    default:  /* release */
+        if (v->env_lfsr == release_thr) {
+            v->env_lfsr = 0;
+            inc_exp = 1;
+        }
+        if (inc_exp && ++v->exp_counter >= env_exp_delay[v->env] && !v->zero_lock) {
+            v->exp_counter = 0;
+            v->env = (uint8_t)(v->env - 1);
+        }
+        break;
+    }
+    if (v->env == 0 && v->env_phase == 3) v->zero_lock = 1;
+}
+
+static void sid_reset_voices(void)
+{
+    for (int i = 0; i < 3; i++) sid_voice_reset(&sidv[i]);
+}
+
+/* 只有声部 3 需要逐周期推进：硬件只把 OSC3/ENV3 暴露成 $D41B/$D41C，
+ * 声部 1/2 的波形读数在芯片外部根本取不到。少算两个声部，抽取速度
+ * 大约省三分之二。 */
+static inline void sid_clock_voice3(void)
+{
+    sid_voice_t *v = &sidv[2];
+    /* 从没被编程过的声部不可能被读出一个非零值，直接跳过。 */
+    if (!v->ctrl && !v->freq) return;
+    sid_voice_clock(v);
+}
+
+/* 寄存器写入送进声部模型。顺序要注意: WebSid 在 $D404 上先让包络看到
+ * **旧的**控制字节（gate 的上升/下降沿），再更新控制字节本身。 */
+static void sid_poke(uint8_t reg, uint8_t val)
+{
+    if (reg >= 0x19) return;
+    int voice = (reg < 7) ? 0 : (reg <= 13) ? 1 : 2;
+    sid_voice_t *v = &sidv[voice];
+    uint8_t r = (uint8_t)(reg - voice * 7);
+
+    switch (r) {
+    case 0x00: v->freq = (uint16_t)((v->freq & 0xFF00) | val); break;
+    case 0x01: v->freq = (uint16_t)((v->freq & 0x00FF) | (val << 8)); break;
+    case 0x02: v->pw = (uint16_t)((v->pw & 0x0F00) | val); break;
+    case 0x03: v->pw = (uint16_t)((v->pw & 0x00FF) | ((val & 0x0F) << 8)); break;
+    case 0x04: {
+        /* gate 沿判定用的是旧 ctrl */
+        uint8_t old_gate = v->ctrl & 0x01;
+        uint8_t new_gate = val & 0x01;
+        if (!old_gate && new_gate) { v->env_phase = 0; v->zero_lock = 0; }
+        else if (old_gate && !new_gate) { v->env_phase = 3; }
+        v->ctrl = val;
+        break;
+    }
+    case 0x05: v->ad = val; break;
+    case 0x06: v->sr = val; break;
+    default: break;
+    }
+}
+
 /* VIC II 寄存器 (raster IRQ 用, RSID 必需).
  * 关键: $D011(bit7=raster hi), $D012(raster lo), $D019(IRQ状态/ack), $D01A(IRQ mask)
  * _y: 当前 raster 行 (PAL 0-311), 每周期 vicClock 推进. */
@@ -163,9 +410,41 @@ unsigned long sidr_dbg_nmi_taken = 0;
 unsigned long sidr_dbg_nmi_ticks = 0;
 unsigned long sidr_dbg_irq_taken = 0;
 
+/* Two extractor defects that used to be silent. Counted so a corpus sweep can
+ * tell "the tune never wrote $D438" from "it did and we threw the write away":
+ *   other_sid  - a write landing in a 2nd/3rd SID window from the header
+ *   ro_writes  - a write to $D419-$D41F, which the real chip does not accept */
+unsigned long sidr_dbg_other_sid = 0;
+unsigned long sidr_dbg_ro_writes = 0;
+
+/* How often the tune actually sampled the chip's own oscillator/envelope, and
+ * how many of those reads were non-zero. A digi that reads $D41C and always
+ * gets 0 produces a silent "sample"; these two counters say whether the model
+ * is feeding it anything. */
+unsigned long sidr_dbg_read_osc = 0, sidr_dbg_read_env = 0;
+unsigned long sidr_dbg_pad = 0;
+/* Illegal opcodes actually executed, by mnemonic group. Zero for the whole
+ * current corpus; a non-zero count means the tune really does depend on the
+ * NMOS quirks and the old "treat as NOP" path would have played it wrong. */
+unsigned long sidr_dbg_illegal = 0;
+/* Writes that land in the mirrored halves of the SID block ($D500-$D7FF).
+ * On a real C64 they are the same chip, and stsid writes every voice both to
+ * $D4xx and $D5xx, which is exactly the Aliens_Symphony pattern WebSid calls
+ * out. The counter says whether a tune relies on that mirroring. */
+unsigned long sidr_dbg_mirror_writes = 0, sidr_dbg_mirror_reads = 0;
+unsigned long sidr_dbg_read_env_nonzero = 0;
+
 static uint16_t s_dbg_nmi_vector = 0, s_dbg_irq_vector = 0;
 static uint16_t s_dbg_cia1_latchA = 0, s_dbg_cia2_latchA = 0;
 static uint8_t  s_dbg_cia1_ctrlA = 0, s_dbg_cia2_ctrlA = 0, s_dbg_cia2_started = 0;
+/* The SID map is wiped by reset_machine() before the CLI prints its report, so
+ * the counters behind the report have to be copied out while they are still
+ * live - same reason the vectors are snapshotted. */
+static uint8_t  s_dbg_extra_sids = 0;
+static unsigned long s_dbg_other_sid = 0, s_dbg_ro_writes = 0, s_dbg_jam = 0;
+static unsigned long s_dbg_read_osc = 0, s_dbg_read_env = 0, s_dbg_read_env_nz = 0;
+static unsigned long s_dbg_pad = 0, s_dbg_illegal = 0;
+static unsigned long s_dbg_mirror_w = 0, s_dbg_mirror_r = 0;
 
 /* 6526 counts `latch + 1` cycles before underflow, and a latch of 0 is the
  * longest setting (65536), not the shortest. A 0 latch treated as 1 cycle
@@ -234,13 +513,40 @@ static inline void cia_write(cia_t *c, uint8_t off, uint8_t v)
 }
 
 static inline uint8_t read6502(uint16_t address) {
-    /* 标准 SID 寄存器 (0-0x1c) 读 SID 数组 */
-    if (address >= 0xD400 && address < 0xD420) {
-        return SID[address - 0xD400];
+    /* SID 空间: $D400-$D7FF 整块 (含 $D5xx/$D6xx/$D7xx 镜像) */
+    if (address >= 0xD400 && address < 0xD800) {
+        uint16_t off = (uint16_t)(address - 0xD400);
+        uint8_t reg = (uint8_t)(address & 0x1F);
+
+        if (address >= 0xD500) sidr_dbg_mirror_reads++;
+
+        /* 另一颗 SID 的窗口: 本机只有一颗，读不到它的输出。
+         * 返回总线残余值，和 libresidfp 对未建模寄存器的处理一致。 */
+        if (s_sid_map[off]) return s_bus_write;
+
+        switch (reg) {
+        case 0x19: case 0x1A:   /* 电位器: 没接就没有输入 */
+            sidr_dbg_pad++; return s_bus_write;
+        case 0x1B:              /* 声部 3 的振荡器输出 (取高 8 位) */
+            sidr_dbg_read_osc++;
+            return sid_voice_osc(&sidv[2]);
+        case 0x1C:              /* 声部 3 的包络输出 */
+            sidr_dbg_read_env++;
+            if (sidv[2].env) sidr_dbg_read_env_nonzero++;
+            return sidv[2].env;
+        }
+        /* 只写寄存器 (0x00-0x18) 读回自己的影子值, 保持原有语义: 有些老曲子
+         * 靠"写进去再读出来"确认状态 (Deflektor / munster 就这样读 $D40B)。
+         * 0x19-0x1F 没有影子, 读回总线残余值, 和 WebSid / libresidfp 一致。 */
+        if (reg > 0x18) return s_bus_write;
+        return SID[reg];
     }
     /* VIC II 寄存器 */
-    if (address == 0xD011) return VIC_D011;
-    if (address == 0xD012) return VIC_D012;
+    if (address == 0xD011) {
+        /* bit7 读的是当前光栅行的第 8 位（写的是比较值 RC8），低位是写进去的值 */
+        return (uint8_t)((VIC_D011 & 0x7F) | ((VIC_y & 0x100) >> 1));
+    }
+    if (address == 0xD012) return (uint8_t)(VIC_y & 0xFF);
     if (address == 0xD019) return VIC_D019;
     if (address == 0xD01A) return VIC_D01A;
     /* CIA1 ($DC00) / CIA2 ($DD00) */
@@ -250,10 +556,25 @@ static inline uint8_t read6502(uint16_t address) {
 }
 
 static inline void write6502(uint16_t address, uint8_t value) {
-    /* 标准 SID 寄存器 + digi 地址 */
-    if (address >= 0xD400 && address < 0xD500) {
-        uint8_t reg = address - 0xD400;
-        if (reg <= 0x1c) SID[reg] = value;
+    /* SID 空间: $D400-$D7FF，芯片只译码低 5 位，所以 $D5xx/$D6xx/$D7xx
+     * 都是同一颗 SID 的镜像（Aliens_Symphony 这类曲子就写在 $D5xx 上，
+     * 见 WebSid sid.cpp:536-540）。 */
+    if (address >= 0xD400 && address < 0xD800) {
+        uint16_t off = (uint16_t)(address - 0xD400);
+        uint8_t  reg = (uint8_t)(address & 0x1F);
+
+        if (address >= 0xD500) sidr_dbg_mirror_writes++;
+        s_bus_write = value;
+
+        if (s_sid_map[off]) {          /* 第 2/3 颗 SID: 本机没有，丢弃并计数 */
+            sidr_dbg_other_sid++;
+            return;
+        }
+        /* 真机只有 0x00-0x18 可写；0x19-0x1F 是只读的 */
+        if (reg > 0x18) { sidr_dbg_ro_writes++; return; }
+
+        SID[reg] = value;
+        sid_poke(reg, value);
         if (sid_write_hook) sid_write_hook(reg, value);
         return;
     }
@@ -497,7 +818,8 @@ static inline void cia_clock(cia_t *c, int assert_irq, int assert_nmi)
     }
 }
 
-/* 每 CPU 周期调一次: VIC 每 VIC_cpr 个周期推进一行, 两个 CIA 各递减一次。 */
+/* 每 CPU 周期调一次: VIC 每 VIC_cpr 个周期推进一行, 两个 CIA 各递减一次,
+ * 声部 3 的振荡器/包络也在这里推进（它只服务于 $D41B/$D41C 的读数）。 */
 static uint8_t s_cyc_in_line = 0;
 static inline void check_hardware_irq(void) {
     if (++s_cyc_in_line >= VIC_cpr) {
@@ -506,6 +828,7 @@ static inline void check_hardware_irq(void) {
     }
     cia_clock(&cia1, 1, 0);   /* CIA1 -> /IRQ */
     cia_clock(&cia2, 0, 1);   /* CIA2 -> /NMI */
+    sid_clock_voice3();
 }
 static inline void bvc(void) {
     if ((cpustatus & FLAG_OVERFLOW) == 0) {
@@ -617,15 +940,167 @@ static inline void txa(void) { a = x; zerocalc(a); signcalc(a); }
 static inline void txs(void) { sp = x; }
 static inline void tya(void) { a = y; zerocalc(a); signcalc(a); }
 
-/* undocumented (当 nop, SID 不依赖) */
-#define lax nop
-#define sax nop
-#define dcp nop
-#define isb nop
-#define slo nop
-#define rla nop
-#define sre nop
-#define rra nop
+/* ---- undocumented opcodes (NMOS 6502) ------------------------------ *
+ * Semantics follow WebSid cpu_operations.inc, where each illegal op is
+ * spelled out as the pair of official operations it performs; the flags are
+ * whatever the second half sets. Cycle counts come from the same file's
+ * _opbase_frame_cycles[].
+ *
+ * None of these appear in the current corpus - the only illegal opcode hit
+ * is 0xEA, which is an official NOP. They exist so a tune that does use them
+ * gets the right cycles and flags instead of silently becoming a 2-cycle
+ * NOP. */
+
+/* Read for a read-modify-write op. Indexed RMW modes never pay the page-cross
+ * cycle (that penalty belongs to reads and stores only), so the flag the
+ * addressing mode just set has to be cleared again. */
+static inline uint16_t getvalue_rmw(void)
+{
+    uint16_t v = getvalue();
+    s_page_extra = 0;
+    return v;
+}
+
+#define ILLEGAL_HIT() do { sidr_dbg_illegal++; } while (0)
+
+static inline void slo(void) {          /* ASL + ORA */
+    ILLEGAL_HIT();
+    value = getvalue_rmw(); result = value << 1;
+    carrycalc(result);
+    putvalue(result);
+    a = (uint8_t)(a | (result & 0x00FF)); zerocalc(a); signcalc(a);
+}
+static inline void rla(void) {
+    ILLEGAL_HIT();          /* ROL + AND */
+    value = getvalue_rmw();
+    result = (value << 1) | (cpustatus & FLAG_CARRY);
+    carrycalc(result);
+    putvalue(result);
+    a = (uint8_t)(a & (result & 0x00FF)); zerocalc(a); signcalc(a);
+}
+static inline void sre(void) {
+    ILLEGAL_HIT();          /* LSR + EOR */
+    value = getvalue_rmw(); result = value >> 1;
+    if (value & 1) setcarry(); else clearcarry();
+    putvalue(result);
+    a = (uint8_t)(a ^ (result & 0x00FF)); zerocalc(a); signcalc(a);
+}
+static inline void rra(void) {
+    ILLEGAL_HIT();          /* ROR + ADC */
+    value = getvalue_rmw();
+    result = (value >> 1) | ((cpustatus & FLAG_CARRY) ? 0x80 : 0);
+    if (value & 1) setcarry(); else clearcarry();
+    putvalue(result);
+    value = (uint16_t)(result & 0x00FF);
+    result = a + value + (cpustatus & FLAG_CARRY);
+    carrycalc(result); zerocalc(result); overflowcalc(result, a, value); signcalc(result);
+    saveaccum(result);
+}
+static inline void sax(void) {
+    ILLEGAL_HIT();          /* store A & X, no flags */
+    write6502(ea, (uint8_t)(a & x));
+}
+static inline void lax(void) {
+    ILLEGAL_HIT();          /* LDA + LDX */
+    value = getvalue(); a = (uint8_t)(value & 0x00FF); x = a;
+    zerocalc(a); signcalc(a);
+}
+static inline void dcp(void) {
+    ILLEGAL_HIT();          /* DEC + CMP */
+    uint8_t dec = (uint8_t)((getvalue_rmw() - 1) & 0x00FF);
+    putvalue(dec);
+    result = (uint16_t)a - dec;
+    if (a >= dec) setcarry(); else clearcarry();
+    zerocalc(result); signcalc(result);
+}
+static inline void isb(void) {
+    ILLEGAL_HIT();          /* INC + SBC */
+    uint8_t inc = (uint8_t)((getvalue_rmw() + 1) & 0x00FF);
+    putvalue(inc);
+    value = (uint16_t)(inc ^ 0xFF);                    /* sbc operand */
+    result = a + value + (cpustatus & FLAG_CARRY);
+    carrycalc(result); zerocalc(result); overflowcalc(result, a, value); signcalc(result);
+    saveaccum(result);
+}
+static inline void anc(void) {
+    ILLEGAL_HIT();          /* AND + set C from bit7 */
+    value = getvalue(); a = (uint8_t)(a & (value & 0x00FF));
+    if (a & 0x80) setcarry(); else clearcarry();
+    zerocalc(a); signcalc(a);
+}
+static inline void alr(void) {
+    ILLEGAL_HIT();          /* AND + LSR */
+    value = getvalue(); a = (uint8_t)(a & (value & 0x00FF));
+    if (a & 1) setcarry(); else clearcarry();
+    a >>= 1;
+    zerocalc(a); signcalc(a);
+}
+static inline void arr(void) {
+    ILLEGAL_HIT();          /* AND + ROR */
+    value = getvalue(); a = (uint8_t)(a & (value & 0x00FF));
+    {
+        uint8_t bit7 = (uint8_t)((a & 0x80) ? 1 : 0);
+        uint8_t bit6 = (uint8_t)((a & 0x40) ? 1 : 0);
+        uint8_t oldc = (uint8_t)((cpustatus & FLAG_CARRY) ? 1 : 0);
+        if (bit7 ^ bit6) setoverflow(); else clearoverflow();
+        if (bit7) setcarry(); else clearcarry();
+        a = (uint8_t)((a >> 1) | (oldc ? 0x80 : 0));   /* carry-in is the OLD carry */
+    }
+    zerocalc(a); signcalc(a);
+}
+static inline void sbx(void) {
+    ILLEGAL_HIT();          /* (A & X) - imm, sets X */
+    value = getvalue();
+    result = (uint16_t)((uint8_t)(a & x)) - (uint16_t)(value & 0x00FF);
+    if ((uint8_t)(a & x) >= (value & 0x00FF)) setcarry(); else clearcarry();
+    x = (uint8_t)(result & 0x00FF);
+    zerocalc(result); signcalc(result);
+}
+static inline void ane(void) {
+    ILLEGAL_HIT();          /* XAA: result is CPU dependent */
+    value = getvalue();
+    a = (uint8_t)(a & x & (value & 0x00FF));   /* WebSid's const is 0x00 */
+    zerocalc(a); signcalc(a);
+}
+static inline void lxa(void) {
+    ILLEGAL_HIT();          /* LXA: A | 0xFF & imm, then X = A */
+    value = getvalue();
+    a = (uint8_t)((a | 0xFF) & (value & 0x00FF)); x = a;
+    zerocalc(a); signcalc(a);
+}
+static inline void lae(void) {
+    ILLEGAL_HIT();          /* LAS: A = X = SP = imm & SP */
+    value = getvalue();
+    sp = (uint8_t)((value & 0x00FF) & sp);
+    a = x = sp;
+    zerocalc(a); signcalc(a);
+}
+
+/* The four "unstable" stores. They write `source & (high byte of the effective
+ * address + 1)`; the AND with the address byte is what makes them unstable on
+ * real silicon. WebSid's getH1() computes the same value from the base address
+ * plus the index, which is exactly `ea` here. */
+static inline uint8_t unstable_h(void)
+{
+    return (uint8_t)(((ea >> 8) & 0xFF) + 1);
+}
+static inline void sha(void) {
+    ILLEGAL_HIT(); write6502(ea, (uint8_t)(a & x & unstable_h())); }
+static inline void shx(void) {
+    ILLEGAL_HIT(); write6502(ea, (uint8_t)(x & unstable_h())); }
+static inline void shy(void) {
+    ILLEGAL_HIT(); write6502(ea, (uint8_t)(y & unstable_h())); }
+static inline void shs(void) {
+    ILLEGAL_HIT();
+    sp = (uint8_t)(a & x);
+    write6502(ea, (uint8_t)(sp & unstable_h()));
+}
+
+/* JAM/KIL: the real CPU locks up until reset. Stopping the core is the closest
+ * thing this emulator has; run_machine() parks at IDLE_PC and the clocks keep
+ * running, which is harmless. Counted so a tune that hit one is visible. */
+unsigned long sidr_dbg_jam = 0;
+static inline void jam(void) { sidr_dbg_jam++; pc = 0; }
 
 /* Base cycle count for each opcode (NMOS 6502). Taken branches add one cycle,
  * a taken branch or an indexed read that crosses a page adds another; both are
@@ -799,6 +1274,7 @@ static int exec6502(void) {
     case 0xE6: zp(); inc(); break;
     case 0xE8: imp(); inx(); break;
     case 0xE9: imm(); sbc(); break;
+    case 0xEA: imp(); nop(); break;   /* official NOP: the one illegal-ish hit in the corpus */
     case 0xEB: imm(); sbc(); break;
     case 0xEC: abso(); cpx(); break;
     case 0xED: abso(); sbc(); break;
@@ -811,7 +1287,113 @@ static int exec6502(void) {
     case 0xF9: absy(); sbc(); break;
     case 0xFD: absx(); sbc(); break;
     case 0xFE: absx(); inc(); break;
-    default: break;   /* 未定义 opcode 当 nop */
+
+    /* ---- illegal opcodes (see the block above sid_voice_clock) ---- */
+    /* SLO */
+    case 0x03: indx(); slo(); break;
+    case 0x07: zp();   slo(); break;
+    case 0x0F: abso(); slo(); break;
+    case 0x13: indy(); slo(); break;
+    case 0x17: zpx();  slo(); break;
+    case 0x1B: absy(); slo(); break;
+    case 0x1F: absx(); slo(); break;
+    /* RLA */
+    case 0x23: indx(); rla(); break;
+    case 0x27: zp();   rla(); break;
+    case 0x2F: abso(); rla(); break;
+    case 0x33: indy(); rla(); break;
+    case 0x37: zpx();  rla(); break;
+    case 0x3B: absy(); rla(); break;
+    case 0x3F: absx(); rla(); break;
+    /* SRE */
+    case 0x43: indx(); sre(); break;
+    case 0x47: zp();   sre(); break;
+    case 0x4F: abso(); sre(); break;
+    case 0x53: indy(); sre(); break;
+    case 0x57: zpx();  sre(); break;
+    case 0x5B: absy(); sre(); break;
+    case 0x5F: absx(); sre(); break;
+    /* RRA */
+    case 0x63: indx(); rra(); break;
+    case 0x67: zp();   rra(); break;
+    case 0x6F: abso(); rra(); break;
+    case 0x73: indy(); rra(); break;
+    case 0x77: zpx();  rra(); break;
+    case 0x7B: absy(); rra(); break;
+    case 0x7F: absx(); rra(); break;
+    /* SAX */
+    case 0x83: indx(); sax(); break;
+    case 0x87: zp();   sax(); break;
+    case 0x8F: abso(); sax(); break;
+    case 0x97: zpx();  sax(); break;
+    /* LAX */
+    case 0xA3: indx(); lax(); break;
+    case 0xA7: zp();   lax(); break;
+    case 0xAF: abso(); lax(); break;
+    case 0xB3: indy(); lax(); break;
+    case 0xB7: zpx();  lax(); break;
+    case 0xBF: absy(); lax(); break;
+    /* DCP */
+    case 0xC3: indx(); dcp(); break;
+    case 0xC7: zp();   dcp(); break;
+    case 0xCF: abso(); dcp(); break;
+    case 0xD3: indy(); dcp(); break;
+    case 0xD7: zpx();  dcp(); break;
+    case 0xDB: absy(); dcp(); break;
+    case 0xDF: absx(); dcp(); break;
+    /* ISB / ISC */
+    case 0xE3: indx(); isb(); break;
+    case 0xE7: zp();   isb(); break;
+    case 0xEF: abso(); isb(); break;
+    case 0xF3: indy(); isb(); break;
+    case 0xF7: zpx();  isb(); break;
+    case 0xFB: absy(); isb(); break;
+    case 0xFF: absx(); isb(); break;
+    /* ANC / ALR / ARR / SBX / ANE / LXA (immediate only) */
+    case 0x0B: imm(); anc(); break;
+    case 0x2B: imm(); anc(); break;
+    case 0x4B: imm(); alr(); break;
+    case 0x6B: imm(); arr(); break;
+    case 0xCB: imm(); sbx(); break;
+    case 0x8B: imm(); ane(); break;
+    case 0xAB: imm(); lxa(); break;
+    /* LAE */
+    case 0xBB: absy(); lae(); break;
+    /* unstable stores */
+    case 0x9F: absy(); sha(); break;
+    case 0x93: indy(); sha(); break;
+    case 0x9E: absy(); shx(); break;
+    case 0x9C: absx(); shy(); break;
+    case 0x9B: absy(); shs(); break;
+    /* NOPs with operands: they exist only to consume cycles and bytes */
+    case 0x0C: abso(); nop(); break;
+    case 0x1C: absx(); nop(); break;
+    case 0x3C: absx(); nop(); break;
+    case 0x5C: absx(); nop(); break;
+    case 0x7C: absx(); nop(); break;
+    case 0xDC: absx(); nop(); break;
+    case 0xFC: absx(); nop(); break;
+    case 0x04: zp();   nop(); break;
+    case 0x44: zp();   nop(); break;
+    case 0x64: zp();   nop(); break;
+    case 0x14: zpx();  nop(); break;
+    case 0x34: zpx();  nop(); break;
+    case 0x54: zpx();  nop(); break;
+    case 0x74: zpx();  nop(); break;
+    case 0xD4: zpx();  nop(); break;
+    case 0xF4: zpx();  nop(); break;
+    case 0x80: imm();  nop(); break;
+    case 0x82: imm();  nop(); break;
+    case 0x89: imm();  nop(); break;
+    case 0xC2: imm();  nop(); break;
+    case 0xE2: imm();  nop(); break;
+    /* JAM / KIL: the CPU locks up. WebSid treats 0x02/0x12 as the "run IRQ/NMI"
+     * pseudo-ops its own loader needs; a real tune would never execute either,
+     * so they are treated as JAM here. */
+    case 0x02: case 0x12: case 0x22: case 0x32: case 0x42: case 0x52:
+    case 0x62: case 0x72: case 0x92: case 0xB2: case 0xD2: case 0xF2:
+        jam(); break;
+    default: break;   /* 唯一剩下的未定义 opcode 是 0xEA 之外的空洞 */
     }
     return op_cycles[opcode] + s_page_extra;
 }
@@ -830,6 +1412,10 @@ typedef struct {
     uint16_t start_song;     /* 1-based */
     uint32_t speed;          /* bit per song, 0=VSync */
     uint16_t flags;          /* v2+, bit2=PAL, bit3=NTSC */
+    /* v3+ $7A / v4+ $7B: the centre byte of a 2nd / 3rd SID's address block.
+     * 0 means "this file has no such SID". See sid_addr_from_header_byte(). */
+    uint8_t  sid_addr_2;
+    uint8_t  sid_addr_3;
     char     name[33];
     char     author[33];
     uint8_t *code;
@@ -865,6 +1451,9 @@ static int parse_psid(const char *path, PSID *si) {
     memcpy(si->name,   raw + 22, 32); si->name[32] = 0;
     memcpy(si->author, raw + 54, 32); si->author[32] = 0;
     si->flags = (si->version >= 2) ? rd_be16(raw + 0x76) : 0;
+    /* $7A and $7B only exist from v3 / v4 on; older files have other data there. */
+    si->sid_addr_2 = (si->version > 2 && sz > 0x7A) ? raw[0x7A] : 0;
+    si->sid_addr_3 = (si->version > 3 && sz > 0x7B) ? raw[0x7B] : 0;
 
     /* payload */
     uint8_t *payload = raw + si->header_len;
@@ -884,6 +1473,41 @@ static int parse_psid(const char *path, PSID *si) {
     if (si->init_addr == 0) si->init_addr = si->load_addr;
     free(raw);
     return 0;
+}
+
+/* ------------------------------------------------------------------ *
+ * 多 SID 窗口（header $7A/$7B）
+ *
+ * 每个字节是"芯片起始地址的中间字节"：$D420 就写 0x42。合法性判据照
+ * WebSid sid.cpp:152-160 的 getSidAddr()：0x42..0xFE、非 0x80..0xDF、
+ * 且为偶数。$7A 只有 v3+ 才有，$7B 只有 v4+ 才有。
+ * ------------------------------------------------------------------ */
+static uint16_t sid_addr_from_header_byte(uint8_t center)
+{
+    if (center < 0x42 || center > 0xFE) return 0;
+    if (center >= 0x80 && center <= 0xDF) return 0;
+    if (center & 0x01) return 0;
+    return (uint16_t)(0xD000 | ((uint16_t)center << 4));
+}
+
+static void sid_build_map(const PSID *si)
+{
+    memset(s_sid_map, 0, sizeof(s_sid_map));
+    s_sid_extra = 0;
+
+    uint8_t extra[2] = { 0, 0 };
+    if (si->version > 2) extra[0] = si->sid_addr_2;
+    if (si->version > 3) extra[1] = si->sid_addr_3;
+
+    for (int i = 0; i < SID_MAX_EXTRA; i++) {
+        uint16_t a = sid_addr_from_header_byte(extra[i]);
+        if (!a) continue;
+        uint16_t off = (uint16_t)(a - SID_MAP_BASE);
+        if (off >= SID_MAP_SIZE) continue;
+        if (off + 0x1F > SID_MAP_SIZE) continue;
+        memset(s_sid_map + off, (uint8_t)(i + 1), 0x1F);
+        s_sid_extra++;
+    }
 }
 
 /* ============================================================
@@ -1166,6 +1790,17 @@ void sidr_debug_report(void)
             (unsigned)s_dbg_cia2_latchA, s_dbg_cia2_ctrlA, (unsigned)s_dbg_cia2_started);
     fprintf(stderr, "  [dbg] nmi taken=%lu  irq taken=%lu\n",
             sidr_dbg_nmi_taken, sidr_dbg_irq_taken);
+    fprintf(stderr, "  [dbg] extra SIDs declared=%u  writes to them=%lu  "
+                    "writes to read-only regs=%lu  jam=%lu\n",
+            (unsigned)s_dbg_extra_sids, s_dbg_other_sid,
+            s_dbg_ro_writes, s_dbg_jam);
+    fprintf(stderr, "  [dbg] reads of $D41B=%lu  $D41C=%lu (non-zero %lu)  paddles=%lu\n",
+            s_dbg_read_osc, s_dbg_read_env, s_dbg_read_env_nz, s_dbg_pad);
+    if (s_dbg_mirror_w || s_dbg_mirror_r)
+        fprintf(stderr, "  [dbg] mirrored SID block: writes=%lu reads=%lu\n",
+                s_dbg_mirror_w, s_dbg_mirror_r);
+    if (s_dbg_illegal)
+        fprintf(stderr, "  [dbg] illegal opcodes executed=%lu\n", s_dbg_illegal);
 }
 
 /* Snapshot taken while the machine is still alive: reset_machine() wipes RAM at
@@ -1179,6 +1814,17 @@ static void debug_snapshot(void)
     s_dbg_cia2_latchA = cia2.latchA;
     s_dbg_cia2_ctrlA  = cia2.ctrlA;
     s_dbg_cia2_started = cia2.startedA;
+    s_dbg_extra_sids  = s_sid_extra;
+    s_dbg_other_sid   = sidr_dbg_other_sid;
+    s_dbg_ro_writes   = sidr_dbg_ro_writes;
+    s_dbg_jam         = sidr_dbg_jam;
+    s_dbg_read_osc    = sidr_dbg_read_osc;
+    s_dbg_read_env    = sidr_dbg_read_env;
+    s_dbg_read_env_nz = sidr_dbg_read_env_nonzero;
+    s_dbg_pad         = sidr_dbg_pad;
+    s_dbg_illegal     = sidr_dbg_illegal;
+    s_dbg_mirror_w    = sidr_dbg_mirror_writes;
+    s_dbg_mirror_r    = sidr_dbg_mirror_reads;
 }
 
 /* init 只跑一次, 而且它的写入全部钉在 t=0, 所以这里不需要走硬件时钟:
@@ -1288,6 +1934,24 @@ static void reset_machine(void)
     hw_irq_pending = 0;
     hw_nmi_pending = 0;
 
+    sidr_dbg_nmi_taken = 0;
+    sidr_dbg_irq_taken = 0;
+    sidr_dbg_other_sid = 0;
+    sidr_dbg_ro_writes = 0;
+    sidr_dbg_jam = 0;
+    sidr_dbg_read_osc = 0;
+    sidr_dbg_read_env = 0;
+    sidr_dbg_read_env_nonzero = 0;
+    sidr_dbg_pad = 0;
+    sidr_dbg_illegal = 0;
+    sidr_dbg_mirror_writes = 0;
+    sidr_dbg_mirror_reads = 0;
+
+    s_bus_write = 0;
+    memset(s_sid_map, 0, sizeof(s_sid_map));
+    s_sid_extra = 0;
+    sid_reset_voices();
+
     VIC_D011 = 0x1b; VIC_D012 = 0; VIC_D019 = 0; VIC_D01A = 0;
     VIC_y = 0;
     VIC_lines = 312; VIC_cpr = 63;
@@ -1372,6 +2036,7 @@ int sid_song_extract(const char *path, int subsong, double seconds,
     if (subsong < 0) subsong = si.start_song ? si.start_song - 1 : 0;
 
     reset_machine();
+    sid_build_map(&si);
 
     uint32_t clk = si.flags & 0x0C;
     double vsync_hz, cpu_hz;
@@ -1529,6 +2194,7 @@ int sid_stream_open(const char *path, int subsong, sid_song_info_t *info,
     if (subsong < 0) subsong = si.start_song ? si.start_song - 1 : 0;
 
     reset_machine();
+    sid_build_map(&si);
 
     uint32_t clk = si.flags & 0x0C;
     double vsync_hz, cpu_hz;

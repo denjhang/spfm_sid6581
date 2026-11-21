@@ -5,7 +5,10 @@
  * register writes made by the init/play routines. This module runs those
  * routines on an embedded 6502 (fake6502 core, with the VIC raster and the two
  * CIA timers that RSID files use for their interrupt clock), records every
- * write to $D400-$D41F, and hands back a timestamped register stream.
+ * write to $D400-$D7FF, and hands back a timestamped register stream. Only
+ * registers 0x00-0x18 of the first SID reach the stream; writes to a
+ * second/third SID declared in the header are dropped and counted, because the
+ * SPFM bus here has one chip.
  *
  * The stream is what the SPFM driver can actually replay: the SID has no
  * concept of notes, only registers, so "playing a .sid" means pushing these
