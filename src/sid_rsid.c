@@ -1574,121 +1574,18 @@ static int64_t g_frame_base_cycle = 0;  /* 当前帧 play 开始时的 clocktick
 static int32_t g_current_frame = -1;
 static int32_t g_cycles_per_frame = 19656;  /* PAL: 985248/50.125, NTSC 在 main 里设 */
 
-/* ---- loop detection ------------------------------------------------- *
- * A .sid has no loop point in its header, but it has one in practice: the
- * player's note data repeats, so the machine's RAM eventually returns to a
- * state it has been in before. Hashing the machine's memory at frame
- * boundaries and reporting the first repeat gives an honest answer, and it
- * works for tunes whose length nobody ever wrote down.
+/* ---- no loop-point detection ---------------------------------------- *
+ * A .sid header has no loop field at all, and neither WebSid nor
+ * libsidplayfp tries to guess one: libsidplayfp's `-ol` only restarts the
+ * track from the beginning once its song length has elapsed, and sidplayfp's
+ * default timer is 0 (forever). HVSC's Songlengths database is the single
+ * authoritative answer to "how long is this tune" - it is a human-eared
+ * recording that folds the loop point into a duration.
  *
- * One repeat is not enough to call it a loop. A player that keeps a 16-bit
- * counter in RAM, or walks a note pointer up and down, produces frames whose
- * state matches something seen a second ago without the *tune* looping - by
- * ear Golden Axe's 2-second "loop" is obviously wrong. So a loop is only
- * declared once the state has come round **three times** with a consistent
- * period: appearances at frames j < i < f where i-j == f-i. That is the
- * standard periodicity test, and it costs one extra backwards scan per
- * matching hash rather than per frame.
- *
- * A real 64-bit hash matters too: a running XOR would declare a loop the
- * first time a byte flipped back. FNV-1a over the state range is one pass
- * over <=64 KiB per frame, negligible next to the 6502 run.
- *
- * Only the *state* range is hashed - zero page, the stack and the tune's own
- * data. The CIA counters and the VIC raster change every frame by design and
- * would prevent any two frames from ever matching.
- *
- * LOOP_MIN_FRAMES skips the first two seconds: the player is still
- * initialising there and its state wanders.
+ * So the player does the same thing the reference implementations do: play
+ * for the database length when one is known, otherwise play until the user
+ * interrupts. Nothing is inferred from the machine's RAM here.
  */
-#define LOOP_MIN_FRAMES 100
-#define LOOP_MAX_FRAMES 30000        /* 600 s of PAL frames, then give up */
-
-static uint64_t *s_loop_hash = NULL;
-static int32_t  *s_loop_at   = NULL;   /* frame index of each hash */
-static int32_t   s_loop_n    = 0;
-static int32_t   s_loop_cap  = 0;
-static int32_t   s_loop_hit  = -1;     /* frame at which the loop was confirmed */
-static int32_t   s_loop_back = -1;     /* frame the loop starts at */
-static uint16_t  s_loop_lo = 0x0000, s_loop_hi = 0xFFFF;
-
-static uint64_t ram_hash(void)
-{
-    uint64_t h = 1469598103934665603ull;   /* FNV-1a 64 */
-    for (uint32_t a = s_loop_lo; a <= s_loop_hi; a++) {
-        h ^= RAM[a];
-        h *= 1099511628211ull;
-    }
-    return h;
-}
-
-/* Called once per play tick, after that tick has run. */
-static void loop_check(int32_t frame)
-{
-    if (s_loop_hit >= 0 || frame < LOOP_MIN_FRAMES) return;
-
-    if (s_loop_n == s_loop_cap) {
-        if (s_loop_cap >= LOOP_MAX_FRAMES) return;      /* give up quietly */
-        int32_t want = s_loop_cap ? s_loop_cap * 2 : 2048;
-        uint64_t *nh = (uint64_t *)realloc(s_loop_hash, (size_t)want * sizeof *nh);
-        if (!nh) return;
-        s_loop_hash = nh;
-        int32_t *na = (int32_t *)realloc(s_loop_at, (size_t)want * sizeof *na);
-        if (!na) return;
-        s_loop_at = na;
-        s_loop_cap = want;
-    }
-
-    uint64_t h = ram_hash();
-
-    /* Look for the same state twice before. Newest first, so the shortest
-     * consistent period wins. */
-    for (int32_t i = s_loop_n - 1; i >= 1 && s_loop_hit < 0; i--) {
-        if (s_loop_hash[i] != h) continue;
-        int32_t d = frame - s_loop_at[i];
-        for (int32_t j = i - 1; j >= 0; j--) {
-            if (s_loop_hash[j] != h) continue;
-            if (s_loop_at[i] - s_loop_at[j] != d) continue;
-            s_loop_hit  = frame;
-            s_loop_back = s_loop_at[j];
-            break;
-        }
-    }
-
-    s_loop_hash[s_loop_n] = h;
-    s_loop_at[s_loop_n]   = frame;
-    s_loop_n++;
-}
-
-/* Where the loop starts, in ms: the earliest frame in the repeating triad. */
-static long loop_ms_from(const sid_song_info_t *info)
-{
-    if (s_loop_hit < 0 || s_loop_back < 0 || !info) return 0;
-    double tick_ms = (info->play_cycles > 0 && info->play_hz > 0.0)
-                   ? (double)info->play_cycles / info->clock_hz * 1000.0
-                   : 19.96;
-    return (long)((double)s_loop_back * tick_ms + 0.5);
-}
-
-/* The state range to hash: zero page, the stack, and the tune's own data. */
-static void loop_set_range(const PSID *si)
-{
-    s_loop_lo = 0x0000;
-    s_loop_hi = 0xFFFF;
-    if (si && si->code_size && si->load_addr + si->code_size <= 0x10000) {
-        uint16_t hi = (uint16_t)(si->load_addr + si->code_size - 1);
-        if (hi >= 0x0200) s_loop_hi = hi;
-    }
-}
-
-static void loop_reset(void)
-{
-    s_loop_n = 0;
-    s_loop_hit = -1;
-    s_loop_back = -1;
-    s_loop_lo = 0x0000;
-    s_loop_hi = 0xFFFF;
-}
 
 /* ============================================================
  * 寄存器捕获缓冲 (动态数组)
@@ -2272,8 +2169,6 @@ int sid_song_extract(const char *path, int subsong, double seconds,
 
     reset_machine();
     sid_build_map(&si);
-    loop_reset();
-    loop_set_range(&si);
 
     uint32_t clk = si.flags & 0x0C;
     double vsync_hz, cpu_hz;
@@ -2321,7 +2216,6 @@ int sid_song_extract(const char *path, int subsong, double seconds,
             g_current_cycle = (int64_t)fr * (int64_t)g_cycles_per_frame;
             g_frame_base_cycle = clockticks6502;
             tick_psid(play_addr);
-            loop_check(fr);
         }
     } else {
         /* Now that init has run, the header's speed bit and the timer latch are
@@ -2348,16 +2242,15 @@ int sid_song_extract(const char *path, int subsong, double seconds,
             g_current_cycle = (int64_t)fr * (int64_t)play_cycles;
             g_frame_base_cycle = clockticks6502;
             call_play(play_addr, play_cycles);
-            loop_check(fr);
         }
     }
 
     sid_write_hook = NULL;
     debug_snapshot();
 
-    /* Loop point, if the memory state repeated itself. Reported in the same
-     * units as the timestamps, so a caller can clip playback there. */
-    info->loop_ms = loop_ms_from(info);
+    /* No loop point is reported: a .sid has none, and the references
+     * (libsidplayfp, WebSid) do not invent one either. Playback length comes
+     * from the song length database or from the caller. */
 
     /* Hand the buffer over, then convert cycle counts to milliseconds. */
     size_t n = cap_n;
@@ -2439,8 +2332,6 @@ int sid_stream_open(const char *path, int subsong, sid_song_info_t *info,
 
     reset_machine();
     sid_build_map(&si);
-    loop_reset();
-    loop_set_range(&si);
 
     uint32_t clk = si.flags & 0x0C;
     double vsync_hz, cpu_hz;

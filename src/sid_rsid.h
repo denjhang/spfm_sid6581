@@ -76,10 +76,6 @@ typedef struct {
     /* Length in ms as reported by a side database (Songlengths.md5 / SSL), or
      * 0 when nothing is known. Filled by the player, not by the emulator. */
     long     length_ms;
-    /* Loop point: the time at which the machine's memory state repeats itself
-     * for the first time, i.e. from here on the tune plays the same thing
-     * again. 0 means "no loop found within the render". */
-    long     loop_ms;
 } sid_song_info_t;
 
 /* ---- playback model ------------------------------------------------- *

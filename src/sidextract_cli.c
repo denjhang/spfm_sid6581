@@ -16,8 +16,9 @@
  * time; see sid_rsid.h.
  *
  * --db / --stil point at HVSC's Songlengths.md5 and STIL.txt. They are
- * optional: without them the extractor still reports the loop point it finds
- * in the machine state, which needs no external file at all.
+ * optional: without them there is simply no length or per-subsong name to
+ * report, which is the state every SID player is in - a .sid file carries
+ * neither a length nor a loop point of its own.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -139,9 +140,6 @@ int main(int argc, char **argv)
     if (info.n_sids > 1)
         printf("  multi-SID: %u chips (%lu writes to the extra ones)\n",
                info.n_sids, sidr_dbg_other_sid);
-    if (info.loop_ms > 0)
-        printf("  loop    : %ld.%03ld s (machine state repeats from here)\n",
-               info.loop_ms / 1000, info.loop_ms % 1000);
     if (!sid_get_rsid_mode())
         printf("  model   : PSID (play per frame, no interrupts) - use --rsid "
                "for digi/sample playback\n");

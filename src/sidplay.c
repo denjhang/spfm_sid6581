@@ -524,9 +524,9 @@ static int stream_play_sid(const char *path, int subsong, double speed,
 
         played_ms += frame_ms;
 
-        /* A track with a known length stops on its own - either the length the
-         * databases report (--length auto) or the loop point the emulator
-         * found (--length loop). */
+        /* A track with a known length stops on its own. That length comes from
+         * HVSC's Songlengths database (--length auto); without one there is
+         * nothing to stop at, because a .sid has no loop point of its own. */
         if (stop_ms > 0.0 && played_ms >= stop_ms) break;
 
         if (played_ms >= next_report) {
@@ -722,7 +722,7 @@ static int cmd_play(int argc, char **argv)
     int pace = 0;
     int slot2 = -1, slot3 = -1;    /* extra SID chips: -1 = single-chip tune */
     const char *db_path = NULL, *stil_path = NULL;
-    int    length_mode = 0;        /* 1 = loop point, 2 = database length */
+    int    length_mode = 0;        /* 1 = length from the song length database */
     double stop_ms = 0.0;
 
     /* PSID model unless asked otherwise: see sid_rsid.h. Digi tracks need
@@ -752,9 +752,16 @@ static int cmd_play(int argc, char **argv)
         else if (!strcmp(argv[i], "--stil") && i + 1 < argc)    stil_path = argv[++i];
         else if (!strcmp(argv[i], "--length") && i + 1 < argc) {
             const char *m = argv[++i];
-            if (!strcmp(m, "loop"))      length_mode = 1;
-            else if (!strcmp(m, "auto")) length_mode = 2;
-            else { fprintf(stderr, "--length takes 'loop' or 'auto'\n"); return 1; }
+            /* Only one answer exists: the HVSC song length database. A .sid
+             * carries no loop point, so there is nothing else to derive a
+             * stop time from - the same position libsidplayfp takes. */
+            if (!strcmp(m, "auto") || !strcmp(m, "db")) length_mode = 1;
+            else if (!strcmp(m, "loop")) {
+                fprintf(stderr, "--length loop: a .sid has no loop point; "
+                                "use --length auto with --db\n");
+                return 1;
+            }
+            else { fprintf(stderr, "--length takes 'auto' (or 'db')\n"); return 1; }
         }
         else if (!strcmp(argv[i], "--pace"))                    pace = 1;
         else if (argv[i][0] == '-') {
@@ -824,18 +831,22 @@ static int cmd_play(int argc, char **argv)
     if (subsong >= (int)probe.n_songs) subsong = probe.n_songs - 1;
 
     printf("song: %s / %s\n", probe.name, probe.author);
-    if (seconds > 0)
-        printf("playing %.0f s (from the start)\n", seconds);
-    else
-        printf("playing until interrupted: [n] next-track marker, [q] quit\n");
-    /* Resolve --length. The database length needs only the file; the loop
-     * point is discovered by the streaming run itself. */
-    if (length_mode == 2) {
+    /* Resolve --length. The only source is the song length database; when it has
+     * no entry the run keeps going until the user interrupts, which is what
+     * sidplayfp does with its default timer of 0 (forever). */
+    if (length_mode == 1) {
         long len = sidmeta_song_length_ms(path, (unsigned)(subsong + 1), db_path);
         if (len > 0) stop_ms = (double)len;
         else fprintf(stderr, "no length in the database for subsong %d\n",
                      subsong + 1);
     }
+    if (seconds > 0)
+        printf("playing %.0f s (from the start)\n", seconds);
+    else if (stop_ms > 0.0)
+        printf("playing %.1f s (song length from the database)\n",
+               stop_ms / 1000.0);
+    else
+        printf("playing until interrupted: [n] next-track marker, [q] quit\n");
 
     /* STIL names the subsong when HVSC has an entry for it. The header's title
      * is a file-level name, so an STIL hit is usually the better one. */

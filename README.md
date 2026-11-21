@@ -135,19 +135,22 @@ sidtest.exe sidlist sid/rsid --from 10            :: 从第 11 首开始
 | `--limit HZ` | 把 `$D418` 更新率钉在 HZ 以内（配合 `--rsid` 用） | 关 |
 | `--no-cache` | 不读也不写 `.sidreg` 缓存 | 关 |
 | `--cache-dir DIR` | 缓存目录 | `sid_cache` |
-| `--length loop\|auto` | 播到循环点（仿真自己找）或数据库长度自动停 | 关 |
+| `--length auto` | 播到 HVSC 数据库给的长度自动停 | 关 |
 | `--db FILE` | HVSC 的 `Songlengths.md5` | 无 |
 | `--stil FILE` | HVSC 的 `STIL.txt`（子曲名/作者） | 无 |
 | `--slot2 N` `--slot3 N` | 把多 SID 曲的第 2/3 颗放到 SPFM 槽 N | 关（不播）
 
-**长什么样、多长、从哪循环、子曲叫什么**，这四件事 PSID 头里都没有。
-`sidmeta.c` 补了三个来源：
+**标题、多长、子曲叫什么**，PSID 头里都没有（头里也没有循环点）。`sidmeta.c`
+补了两个外部来源，做法和参考播放器一致：
 
 - **长度**：`SONGLENGTHS/Name.ssl`（同目录，2 字节 BCD/子曲）优先，退到
   `Songlengths.md5`（`<整个文件的MD5>=mm:ss ...`，HVSC #71 起的唯一格式）。
 - **子曲名**：`STIL.txt` 的 `TITLE:`/`ARTIST:`，按 `(#N)` 分块。
-- **循环点**：不用任何外部文件——仿真器每帧对 RAM 算 64 位哈希，同状态
-  出现**三次且周期一致**才认定循环，报出帧号。
+
+没有数据库时不做任何推测：`--seconds` 给了就播那么多，没给就一直播到你按键——
+libsidplayfp 的默认定时器同样写死 `0 = FOREVER`。**我们不做循环点检测**：SID
+头没有这个字段，WebSid 和 libsidplayfp 也都不做，HVSC 的“长度”本身就是人工
+试听把循环点折成的一个秒数。
 
 ```cmd
 build\sidextract.exe sid/Robots.sid --info --db Songlengths.md5 --stil STIL.txt
@@ -161,9 +164,8 @@ sidtest.exe sidplay sid/rsid/Anthrox_2SID.sid --slot2 1
 :: 2SID 曲子：第一颗在槽 3，第二颗放槽 1
 ```
 
-实测：`Golden_Axe` 循环点 1.995 s，把 `[0,L)` 和 `[L,2L)` 的寄存器流逐条
-比对 2306 条全同。`Robots`/`R-Type`/`atmos` 60 秒内状态不复现，就不报——
-宁可不说也不给假值。
+实测：`Golden_Axe` 在 Songlengths 里是 4:15（子曲 1）/ 0:27（子曲 2），`R-Type`
+是 2:11 / 0:36 / 0:26；`--length auto` 播到这些秒数自动停。
 
 写协议是唯一需要按硬件调的参数：这套接线下 SID 是异步写器件，`1step` 实测兼容性
 更好（`2step` 会放坏一部分曲子）；换回旧的四芯片接线时用 `--proto 2step`。

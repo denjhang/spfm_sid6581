@@ -2,8 +2,7 @@
  * sidmeta.h - everything a .sid file does not carry itself.
  *
  * The PSID header has a title, an author and a subsong count. It does NOT have
- * a song length, a per-subsong name, or a loop point - those live in HVSC's
- * side databases:
+ * a song length or a per-subsong name - those live in HVSC's side databases:
  *
  *   Songlengths.md5  INI file, `[Database]` then `md5=mm:ss mm:ss ...`
  *                    one entry per subsong, in order

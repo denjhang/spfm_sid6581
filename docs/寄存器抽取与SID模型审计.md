@@ -479,7 +479,9 @@ noise: env=136 distinct OSC changes in 20k cycles=254 last=0xB3
 
 ---
 
-## 7. 第二轮：多 SID、长度/循环/子目，以及 §6.4 里那三件事
+## 7. 第二轮：多 SID、长度/子目，以及 §6.4 里那三件事
+
+（原 §7.3 的循环点检测在后续一轮里整块删除了，理由见本节 7.3。）
 
 ### 7.1 多 SID 从"丢弃"变成"分颗捕获 + 分槽播放"
 
@@ -527,29 +529,52 @@ R-Type.sid      md5 492a9640…  →  subsong 1 = 2:11, 2 = 0:36, 3 = 0:26
 `sidextract --info --db Songlengths.md5` 直接打印；`sidplay --length auto --db …`
 播放到该长度自动停。
 
-### 7.3 循环点：不靠数据库，靠机器状态自己重复
+### 7.3 循环点：不做，按参考播放器的口径处理
 
-数据库只覆盖 HVSC 收录过的曲子。循环点则可以在仿真里直接看出来：**曲子的
-RAM 最终会回到某个到过的状态**，那时起听到的就是同一段。
+第一版这里做过一个 RAM 指纹检测（每帧对状态区算 FNV-1a 64，同状态出现三次且
+周期一致才认定），Golden_Axe 报 1.995 s、`[0,L)` 与 `[L,2L)` 的 2306 条寄存器
+事件全同，看起来是对的。**这一版把它整块删掉了**，原因是查了参考实现之后发现
+这个能力在任何一方都不存在，自己造一个会带来三类假值风险（详见下面的证据）。
 
-实现（`sid_rsid.c` 的 `loop_check()`）：每帧结束后对"状态区"（零页 + 栈 +
-本曲加载范围）算 FNV-1a 64 位哈希，存进历史数组，找**同一状态出现三次、
-且周期一致**的帧。三点确认是必要的：双点会把"玩家在 RAM 里走一个来回
-计数器"误判成循环——实测 Golden Axe 在双点规则下报 2 秒循环，按耳朵
-明显不对；三点规则下仍报同样的值，但这次是**真循环**：
+**证据一：文件里没有循环点字段。** libsidplayfp 的 `psidHeader`
+（`src/sidtune/PSID.cpp:53-70`）字段是封闭的：id/version/data/load/init/play/
+songs/start/speed/name/author/released/flags/relocStartPage/relocPages/
+sidChipBase2/sidChipBase3；HVSC #83 的 `SID_file_format.txt` 逐字段列到 +7B，
+version 只有 1/2/3/4。+7A/+7B 是第 2/3 颗 SID 的地址，不是循环。WebSid 的
+v4E 多 SID 扩展（`docs/SID_file_format+.txt`）也只加了 nSidFlags 和声道。
+
+**证据二：Songlengths 只有时长。** `md5=mm:ss[.SSS] ...`，子目一节。旧格式的
+`(G)(M)(Z)(B)` 是终止条件（gate 全关 / 主音量归零 / 三声部静音 / 内存乱写估的
+时间戳），不是循环点（`Songlengths.faq:134-141`）。SSL 更简单，2 字节 BCD。
+
+**证据三：两个引擎都不做检测。**
+- libsidplayfp：`src/` 全树 `loop` 只命中滤波器 biquad 注释和 exSID 的延迟常量。
+  `SidTuneInfo.h` 的公开接口没有任何 loop 项；`SidDatabase` 只有 `length()` /
+  `lengthMs()`。CLI 的 `-ol` 是**歌单重复**（`args.cpp:255-270` 设
+  `m_track.loop`，`player.cpp:1189-1206` 在 `m_timer.stop` 到点时
+  `playerRestart` 从曲子开头重播），默认 `m_timer.length = 0; // FOREVER`。
+- WebSid：`src/*.c` 里只剩 `_skip_silence_loop`（`Adapter.cpp:108/217`），那是
+  每 chunk 最多跳 10 帧等 `SID::isAudible()`，躲开 100 秒才出声的曲子，与循环
+  无关。前端 `timeout` 是 URL 参数 `file.sid;track;timeout` 交给
+  `ScriptNodePlayer.setPlaybackTimeout` 的墙钟闹钟。
+- 仅有的“循环点”出现在转换器里：`sid2vgm` 的 `VGMConverter.cpp:189-192`
+  `// Set loop point at 2 seconds (after intro)`，固定 2 秒占位。
+
+**证据四：HVSC 的时长本身就是循环点的人肉近似。** `STIL.faq` 定义 TIMESTAMP
+时写的是 `(X:XX)` 表示“到下一个 TIMESTAMP，**或到曲子结尾（即开始循环时）**”
+——作者手里也没有那个时间戳，只能靠听。
+
+**现在的行为**（与 libsidplayfp 对齐）：`--length auto` + `--db` 时播到数据库
+长度自动停；没有数据库条目、或没给 `--length` 时一直播到按键。`--length loop`
+改为直接报错：
 
 ```
-Golden_Axe       loop = 1.995 s
-  → 把 [0, L) 和 [L, 2L) 的寄存器流逐条对比：2306 条全同
-Giana_PSID       loop = 1.995 s（971 条全同）
-Robots / R-Type / atmos / Robo3 / Yie_A   60 秒内没找到 → 不报
+--length loop: a .sid has no loop point; use --length auto with --db
 ```
 
-`sidextract` 会打印 `loop : 1.995 s (machine state repeats from here)`。
-
-**为什么不是每条曲目都能找到**：不是所有曲子的状态都会精确复现（有的玩家
-在 RAM 里存了单调递增的计数器，或者用了 RTC/随机数）。找不到就不报，
-不会给出假的循环点。
+`sid_song_info_t` 里 `loop_ms` 字段、`loop_check()` / `loop_ms_from()` /
+`loop_set_range()` / `loop_reset()` 以及每帧一次的调用全部删除，
+`sidextract` 不再打印 `loop :` 行。
 
 ### 7.4 子目名称：STIL
 
@@ -634,5 +659,6 @@ RSID 差异分三类：
 2. **`Echoes` 那类 digi 仍然无声**：需要曲子自己把声部 3 的包络跑起来，
    我们只保证读到的是真实值（0 就是 0）。要进一步，得实现"声部 3 的
    ADSR 由 SID 自己驱动而不是靠 $D412 的 gate"——那是仿真器的另一层。
-3. **循环点只对状态可复现的曲子有效**；带单调计数器的曲子不报。
+3. **循环点不做**（见 §7.3）：文件里没有，参考播放器也不检测。播多久只由
+   Songlengths 数据库或用户按键决定。
 4. **STIL 只取 TITLE/ARTIST**，`COMMENT` / `NAME` / `AUTHOR` 没解析。
