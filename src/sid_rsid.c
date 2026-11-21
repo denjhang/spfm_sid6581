@@ -90,7 +90,7 @@ static uint8_t  s_branch_ticks = 0;
 /* SID 寄存器写入捕获 */
 static uint8_t SID[32];
 /* 捕获回调 (由 main 设置): 写 $D400-$D41F 时调用 */
-static void (*sid_write_hook)(uint8_t reg, uint8_t val) = NULL;
+static void (*sid_write_hook)(uint8_t chip, uint8_t reg, uint8_t val) = NULL;
 
 /* ------------------------------------------------------------------ *
  * SID 地址空间
@@ -149,6 +149,13 @@ typedef struct {
     /* 噪声: 23 bit LFSR，和 WebSid 同一位置位/反馈方案 */
     uint32_t noise_lfsr;
     uint16_t noise_out;     /* 当前噪声波形输出（16 bit） */
+
+    /* 波形选择位从非零变成零时，输出并不立刻归零，而是"悬空"在上一个
+     * 值上一段时间（硅片上的浮动节点）。WebSid 用 nullOutput0() 建模，
+     * 时长 3000000 周期。Echoes / Echofied_6581 这类先写 $D412=0 再读
+     * $D41B 的曲子，读到 0 还是读到浮动值，差别就在这里。 */
+    uint16_t float_out;
+    int64_t  float_until;
 } sid_voice_t;
 
 static sid_voice_t sidv[3];
@@ -182,6 +189,7 @@ static const uint8_t env_exp_delay[256] = {
 static void sid_voice_reset(sid_voice_t *v)
 {
     memset(v, 0, sizeof(*v));
+    v->float_until = -1;
     v->noise_lfsr = SID_NOISE_RESET;
     v->noise_out  = 0xFFFF;
     v->env_phase  = 3;        /* release */
@@ -213,7 +221,11 @@ static uint8_t sid_voice_osc(const sid_voice_t *v)
     uint8_t bits = (uint8_t)(v->ctrl & 0xF0);
     uint32_t pw12 = (uint32_t)v->pw << 12;
 
-    if (!bits) return (uint8_t)((v->ctrl & 0x08) ? 0 : 0);   /* test 位锁 0 */
+    /* 波形选择为 0: TEST 位锁 0，否则输出悬空在最后的值上。 */
+    if (!bits) {
+        if (v->ctrl & 0x08) return 0;
+        return (uint8_t)(v->float_out >> 8);
+    }
 
     if (bits & 0x10) out &= sid_triangle(v->counter);
     if (bits & 0x20) out &= (uint16_t)(v->counter >> 8);
@@ -305,8 +317,9 @@ static void sid_reset_voices(void)
 static inline void sid_clock_voice3(void)
 {
     sid_voice_t *v = &sidv[2];
-    /* 从没被编程过的声部不可能被读出一个非零值，直接跳过。 */
-    if (!v->ctrl && !v->freq) return;
+    /* 从没被编程过的声部，且悬空窗口早已过去，不可能被读出非零值，直接跳过。
+     * 悬空窗口必须参与判断，否则 "写过 ctrl=0 之后读 $D41B" 这条路径就没了。 */
+    if (!v->ctrl && !v->freq && v->float_until < (int64_t)clockticks6502) return;
     sid_voice_clock(v);
 }
 
@@ -330,6 +343,14 @@ static void sid_poke(uint8_t reg, uint8_t val)
         uint8_t new_gate = val & 0x01;
         if (!old_gate && new_gate) { v->env_phase = 0; v->zero_lock = 0; }
         else if (old_gate && !new_gate) { v->env_phase = 3; }
+
+        /* 波形位由非零落到零: 锁存当前输出，悬空 3M 周期（WebSid） */
+        uint8_t old_bits = v->ctrl & 0xF0;
+        uint8_t new_bits = val & 0xF0;
+        if (old_bits && !new_bits) {
+            v->float_out   = (uint16_t)(sid_voice_osc(v) << 8);
+            v->float_until = (int64_t)clockticks6502 + 3000000;
+        }
         v->ctrl = val;
         break;
     }
@@ -423,6 +444,7 @@ unsigned long sidr_dbg_ro_writes = 0;
  * is feeding it anything. */
 unsigned long sidr_dbg_read_osc = 0, sidr_dbg_read_env = 0;
 unsigned long sidr_dbg_pad = 0;
+unsigned long sidr_dbg_read_osc_nonzero = 0;
 /* Illegal opcodes actually executed, by mnemonic group. Zero for the whole
  * current corpus; a non-zero count means the tune really does depend on the
  * NMOS quirks and the old "treat as NOP" path would have played it wrong. */
@@ -445,6 +467,7 @@ static unsigned long s_dbg_other_sid = 0, s_dbg_ro_writes = 0, s_dbg_jam = 0;
 static unsigned long s_dbg_read_osc = 0, s_dbg_read_env = 0, s_dbg_read_env_nz = 0;
 static unsigned long s_dbg_pad = 0, s_dbg_illegal = 0;
 static unsigned long s_dbg_mirror_w = 0, s_dbg_mirror_r = 0;
+static unsigned long s_dbg_read_osc_nz = 0;
 
 /* 6526 counts `latch + 1` cycles before underflow, and a latch of 0 is the
  * longest setting (65536), not the shortest. A 0 latch treated as 1 cycle
@@ -529,7 +552,11 @@ static inline uint8_t read6502(uint16_t address) {
             sidr_dbg_pad++; return s_bus_write;
         case 0x1B:              /* 声部 3 的振荡器输出 (取高 8 位) */
             sidr_dbg_read_osc++;
-            return sid_voice_osc(&sidv[2]);
+            {
+                uint8_t o = sid_voice_osc(&sidv[2]);
+                if (o) sidr_dbg_read_osc_nonzero++;
+                return o;
+            }
         case 0x1C:              /* 声部 3 的包络输出 */
             sidr_dbg_read_env++;
             if (sidv[2].env) sidr_dbg_read_env_nonzero++;
@@ -566,16 +593,21 @@ static inline void write6502(uint16_t address, uint8_t value) {
         if (address >= 0xD500) sidr_dbg_mirror_writes++;
         s_bus_write = value;
 
-        if (s_sid_map[off]) {          /* 第 2/3 颗 SID: 本机没有，丢弃并计数 */
-            sidr_dbg_other_sid++;
-            return;
-        }
-        /* 真机只有 0x00-0x18 可写；0x19-0x1F 是只读的 */
+        /* 0x19-0x1F 是只读的，真机不收这几位 */
         if (reg > 0x18) { sidr_dbg_ro_writes++; return; }
 
-        SID[reg] = value;
-        sid_poke(reg, value);
-        if (sid_write_hook) sid_write_hook(reg, value);
+        /* s_sid_map[off] 非 0 表示这颗写在 header 声明的第 2/3 颗 SID 上。
+         * 仍然捕获出来（打上芯片号），由播放器决定发到哪个槽——
+         * 单颗硬件上这些事件会被忽略，双颗硬件上它们才是完整的一首。 */
+        uint8_t chip = s_sid_map[off];
+        if (chip) sidr_dbg_other_sid++;
+        if (chip > SID_MAX_EXTRA) chip = SID_MAX_EXTRA;
+
+        if (chip == 0) {
+            SID[reg] = value;
+            sid_poke(reg, value);
+        }
+        if (sid_write_hook) sid_write_hook(chip, reg, value);
         return;
     }
     /* VIC II 寄存器 */
@@ -770,9 +802,32 @@ static inline void nmi_jump(void) {
 
 /* VIC II raster 时钟: 每行推进 _y, 命中 raster_latch 时触发 IRQ.
  * 对齐 WebSid vic.c CHECK_IRQ (L131-147). PAL: 312 行/帧. */
+/* Badlines: on the lines where the VIC fetches character pointers it pulls AEC
+ * low and the CPU loses 40 of that line's 63 cycles. A PAL frame has 25 of
+ * them, i.e. ~5% of the CPU - not a rounding error for a digi tune whose NMI
+ * handler has a fixed cycle budget.
+ *
+ * The condition is the one the hardware uses: the raster line is in the
+ * display window ($30..$F7) and its low three bits match the low three bits of
+ * $D011. The VIC keeps AEC low from the start of the line, so the model is a
+ * counter the CPU loop drains before it may execute again.
+ */
+#define VIC_BADLINE_STEAL 40
+
+static uint8_t s_vic_stall = 0;
+
+static inline int vic_badline(uint16_t line, uint8_t d011)
+{
+    if (line < 0x30 || line > 0xF7) return 0;
+    return ((line & 0x07) == ((d011 >> 3) & 0x07));
+}
+
 static inline void vicClock(void) {
     VIC_y++;
     if (VIC_y >= VIC_lines) VIC_y = 0;
+
+    if (vic_badline(VIC_y, VIC_D011)) s_vic_stall = VIC_BADLINE_STEAL;
+
     /* raster_latch = D011 bit7 (raster bit8) << 8 | D012 */
     uint16_t raster_latch = ((VIC_D011 & 0x80) << 1) | VIC_D012;
     if (VIC_y == raster_latch) {
@@ -1510,18 +1565,135 @@ static void sid_build_map(const PSID *si)
     }
 }
 
-/* ============================================================
- * 寄存器捕获缓冲 (动态数组)
- * ============================================================ */
-/* 当前时间戳: 用 CPU 周期数 (亚帧精度, 支持 RSID PCM 帧内多次写入).
- * PAL CPU=985248Hz, 每帧~19656周期. PCM 在帧内密集写 $D418, 需周期级时序.
- * g_current_cycle = frame × cycles_per_frame + 帧内 clockticks6502 偏移 */
+/* --- frame-accurate timestamps -------------------------------------- *
+ * Every captured write is stamped in CPU cycles, so a digi tune that writes
+ * $D418 several times inside one frame keeps its intra-frame order.
+ * g_current_cycle = frame index * cycles-per-frame + offset within the frame. */
 static int64_t g_current_cycle = 0;     /* 当前周期 (init=-1 哨兵, play>=0) */
 static int64_t g_frame_base_cycle = 0;  /* 当前帧 play 开始时的 clockticks6502 */
 static int32_t g_current_frame = -1;
 static int32_t g_cycles_per_frame = 19656;  /* PAL: 985248/50.125, NTSC 在 main 里设 */
 
-typedef struct { int64_t cycle; uint8_t reg, val; } CapEvent;
+/* ---- loop detection ------------------------------------------------- *
+ * A .sid has no loop point in its header, but it has one in practice: the
+ * player's note data repeats, so the machine's RAM eventually returns to a
+ * state it has been in before. Hashing the machine's memory at frame
+ * boundaries and reporting the first repeat gives an honest answer, and it
+ * works for tunes whose length nobody ever wrote down.
+ *
+ * One repeat is not enough to call it a loop. A player that keeps a 16-bit
+ * counter in RAM, or walks a note pointer up and down, produces frames whose
+ * state matches something seen a second ago without the *tune* looping - by
+ * ear Golden Axe's 2-second "loop" is obviously wrong. So a loop is only
+ * declared once the state has come round **three times** with a consistent
+ * period: appearances at frames j < i < f where i-j == f-i. That is the
+ * standard periodicity test, and it costs one extra backwards scan per
+ * matching hash rather than per frame.
+ *
+ * A real 64-bit hash matters too: a running XOR would declare a loop the
+ * first time a byte flipped back. FNV-1a over the state range is one pass
+ * over <=64 KiB per frame, negligible next to the 6502 run.
+ *
+ * Only the *state* range is hashed - zero page, the stack and the tune's own
+ * data. The CIA counters and the VIC raster change every frame by design and
+ * would prevent any two frames from ever matching.
+ *
+ * LOOP_MIN_FRAMES skips the first two seconds: the player is still
+ * initialising there and its state wanders.
+ */
+#define LOOP_MIN_FRAMES 100
+#define LOOP_MAX_FRAMES 30000        /* 600 s of PAL frames, then give up */
+
+static uint64_t *s_loop_hash = NULL;
+static int32_t  *s_loop_at   = NULL;   /* frame index of each hash */
+static int32_t   s_loop_n    = 0;
+static int32_t   s_loop_cap  = 0;
+static int32_t   s_loop_hit  = -1;     /* frame at which the loop was confirmed */
+static int32_t   s_loop_back = -1;     /* frame the loop starts at */
+static uint16_t  s_loop_lo = 0x0000, s_loop_hi = 0xFFFF;
+
+static uint64_t ram_hash(void)
+{
+    uint64_t h = 1469598103934665603ull;   /* FNV-1a 64 */
+    for (uint32_t a = s_loop_lo; a <= s_loop_hi; a++) {
+        h ^= RAM[a];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+/* Called once per play tick, after that tick has run. */
+static void loop_check(int32_t frame)
+{
+    if (s_loop_hit >= 0 || frame < LOOP_MIN_FRAMES) return;
+
+    if (s_loop_n == s_loop_cap) {
+        if (s_loop_cap >= LOOP_MAX_FRAMES) return;      /* give up quietly */
+        int32_t want = s_loop_cap ? s_loop_cap * 2 : 2048;
+        uint64_t *nh = (uint64_t *)realloc(s_loop_hash, (size_t)want * sizeof *nh);
+        if (!nh) return;
+        s_loop_hash = nh;
+        int32_t *na = (int32_t *)realloc(s_loop_at, (size_t)want * sizeof *na);
+        if (!na) return;
+        s_loop_at = na;
+        s_loop_cap = want;
+    }
+
+    uint64_t h = ram_hash();
+
+    /* Look for the same state twice before. Newest first, so the shortest
+     * consistent period wins. */
+    for (int32_t i = s_loop_n - 1; i >= 1 && s_loop_hit < 0; i--) {
+        if (s_loop_hash[i] != h) continue;
+        int32_t d = frame - s_loop_at[i];
+        for (int32_t j = i - 1; j >= 0; j--) {
+            if (s_loop_hash[j] != h) continue;
+            if (s_loop_at[i] - s_loop_at[j] != d) continue;
+            s_loop_hit  = frame;
+            s_loop_back = s_loop_at[j];
+            break;
+        }
+    }
+
+    s_loop_hash[s_loop_n] = h;
+    s_loop_at[s_loop_n]   = frame;
+    s_loop_n++;
+}
+
+/* Where the loop starts, in ms: the earliest frame in the repeating triad. */
+static long loop_ms_from(const sid_song_info_t *info)
+{
+    if (s_loop_hit < 0 || s_loop_back < 0 || !info) return 0;
+    double tick_ms = (info->play_cycles > 0 && info->play_hz > 0.0)
+                   ? (double)info->play_cycles / info->clock_hz * 1000.0
+                   : 19.96;
+    return (long)((double)s_loop_back * tick_ms + 0.5);
+}
+
+/* The state range to hash: zero page, the stack, and the tune's own data. */
+static void loop_set_range(const PSID *si)
+{
+    s_loop_lo = 0x0000;
+    s_loop_hi = 0xFFFF;
+    if (si && si->code_size && si->load_addr + si->code_size <= 0x10000) {
+        uint16_t hi = (uint16_t)(si->load_addr + si->code_size - 1);
+        if (hi >= 0x0200) s_loop_hi = hi;
+    }
+}
+
+static void loop_reset(void)
+{
+    s_loop_n = 0;
+    s_loop_hit = -1;
+    s_loop_back = -1;
+    s_loop_lo = 0x0000;
+    s_loop_hi = 0xFFFF;
+}
+
+/* ============================================================
+ * 寄存器捕获缓冲 (动态数组)
+ * ============================================================ */
+typedef struct { int64_t cycle; uint8_t chip, reg, val; } CapEvent;
 static CapEvent *cap_buf = NULL;
 static size_t cap_n = 0, cap_cap = 0;
 
@@ -1545,10 +1717,13 @@ static double        s_vol_limit_hz  = 0.0;
 static double        s_vol_cpu_hz    = 985248.0;
 static unsigned long s_vol_written   = 0;
 static unsigned long s_vol_kept      = 0;
-static int64_t       s_vol_last_slot = -1;
-static size_t        s_vol_last_idx  = (size_t)-1;
-static int           s_vol_hold_valid = 0;
-static uint8_t       s_vol_hold_val   = 0;
+/* Per chip: a 2SID tune has an independent DAC behind each volume register, so
+ * the hold/slot state cannot be shared or one chip's writes would delete the
+ * other's samples. */
+static int64_t       s_vol_last_slot[3]  = { -1, -1, -1 };
+static size_t        s_vol_last_idx[3]   = { (size_t)-1, (size_t)-1, (size_t)-1 };
+static int           s_vol_hold_valid[3] = { 0, 0, 0 };
+static uint8_t       s_vol_hold_val[3]   = { 0, 0, 0 };
 /* Highest cycle the capture buffer has emitted. Quantising onto the slot grid
  * can land a sample before the previous frame's last event when a slot
  * straddles the boundary, so every timestamp is clamped up to this. */
@@ -1574,34 +1749,39 @@ void sid_get_limit_stats(unsigned long *written, unsigned long *kept)
  * point into the previous frame's data. */
 static void limit_reset_window(void)
 {
-    s_vol_last_idx = (size_t)-1;
+    for (int i = 0; i < 3; i++) s_vol_last_idx[i] = (size_t)-1;
 }
 
 static void limit_reset_all(void)
 {
     s_vol_written = 0;
     s_vol_kept = 0;
-    s_vol_last_slot = -1;
-    s_vol_hold_valid = 0;
-    s_vol_hold_val = 0;
+    for (int i = 0; i < 3; i++) {
+        s_vol_last_slot[i]  = -1;
+        s_vol_hold_valid[i] = 0;
+        s_vol_hold_val[i]   = 0;
+    }
     s_vol_floor_cycle = 0;
     limit_reset_window();
 }
 
-static void cap_append(int64_t cycle, uint8_t reg, uint8_t val)
+static void cap_append(int64_t cycle, uint8_t chip, uint8_t reg, uint8_t val)
 {
     if (cap_n >= cap_cap) {
         cap_cap = cap_cap ? cap_cap * 2 : 65536;
         cap_buf = (CapEvent*)realloc(cap_buf, cap_cap * sizeof(CapEvent));
     }
     cap_buf[cap_n].cycle = cycle;
+    cap_buf[cap_n].chip  = chip;
     cap_buf[cap_n].reg   = reg;
     cap_buf[cap_n].val   = val;
     cap_n++;
 }
 
-static void on_sid_write(uint8_t reg, uint8_t val)
+static void on_sid_write(uint8_t chip, uint8_t reg, uint8_t val)
 {
+    if (chip > 2) chip = 2;
+
     /* Init writes all land at t=0. Without this they would carry the CPU
      * cycles the init routine burned (R-Type spends ~9 ms in init), which
      * sorts them *after* the first play frame even though they ran first. */
@@ -1611,7 +1791,7 @@ static void on_sid_write(uint8_t reg, uint8_t val)
     if (cycle < 0) cycle = 0;
 
     if (s_vol_limit_hz <= 0.0 || reg != 0x18) {
-        cap_append(cycle, reg, val);
+        cap_append(cycle, chip, reg, val);
         return;
     }
 
@@ -1623,13 +1803,13 @@ static void on_sid_write(uint8_t reg, uint8_t val)
     /* Same window as the sample we just placed: the newer value is the one the
      * DAC would be holding when the window closes, so it replaces in place
      * instead of costing another write. */
-    if (slot == s_vol_last_slot && s_vol_last_idx < cap_n) {
-        cap_buf[s_vol_last_idx].val = val;
+    if (slot == s_vol_last_slot[chip] && s_vol_last_idx[chip] < cap_n) {
+        cap_buf[s_vol_last_idx[chip]].val = val;
         return;
     }
 
     /* Already holding this value: the chip needs no write to stay there. */
-    if (s_vol_hold_valid && val == s_vol_hold_val)
+    if (s_vol_hold_valid[chip] && val == s_vol_hold_val[chip])
         return;
 
     /* Quantise the timestamp onto the fixed grid, but never let it run
@@ -1643,12 +1823,13 @@ static void on_sid_write(uint8_t reg, uint8_t val)
     s_vol_floor_cycle = q;
 
     s_vol_kept++;
-    s_vol_last_slot  = slot;
-    s_vol_hold_valid = 1;
-    s_vol_hold_val   = val;
-    cap_append(q, reg, val);
-    s_vol_last_idx = cap_n - 1;
+    s_vol_last_slot[chip]  = slot;
+    s_vol_hold_valid[chip] = 1;
+    s_vol_hold_val[chip]   = val;
+    cap_append(q, chip, reg, val);
+    s_vol_last_idx[chip] = cap_n - 1;
 }
+
 
 /* ============================================================
  * 调 init / play (用 BRK stub 停止, 对齐 sid_dump.py)
@@ -1674,11 +1855,34 @@ static inline uint16_t irq_vector(void) {
     return 0;
 }
 
+/* Interrupt entry. On a real C64 the hardware vector $FFFE points at a short
+ * ROM routine which pushes A/X/Y before jumping through $0314 - that is why
+ * every PSID player's IRQ handler starts with "PHA; TXA; PHA; TYA; PHA" and
+ * why the vectors it installs are the address *after* those pushes.
+ *
+ * WebSid and libsidplayfp reproduce that with a relocated stub. We do the same
+ * thing in the cheapest possible way: when the vector we are about to use is
+ * the software vector at $0314, the pushes are performed here instead. A tune
+ * that installed a handler directly on $FFFE is untouched, because there the
+ * pushes never happened on real hardware either.
+ *
+ * Without this, a handler that was written for the KERNAL path starts by
+ * saving registers that were never pushed, and the RTS/RTI balance shifts by
+ * three bytes every interrupt.
+ */
 static inline void irq_jump(void) {
+    uint16_t hw = (uint16_t)(RAM[0xFFFE] | (RAM[0xFFFF] << 8));
+    uint16_t vec = irq_vector();
+
     push16(pc);
     push8(cpustatus & ~FLAG_BREAK);
     setinterrupt();
-    pc = irq_vector();
+
+    /* KERNAL-style dispatch: save A/X/Y before handing over to $0314. */
+    if (hw < 0x0100 && vec >= 0x0100) {
+        push8(a); push8(x); push8(y);
+    }
+    pc = vec;
     hw_irq_pending = 0;
 }
 
@@ -1769,6 +1973,17 @@ static void run_machine(uint16_t entry_pc, uint32_t cycles)
         /* Play routines are allowed to RTS; from then on we are idling. */
         if (pc < 2) pc = IDLE_PC;
 
+        /* A badline stalls the CPU before the next instruction can start. The
+         * cycles still pass - the VIC is using them - so they count against
+         * the tick, they just cannot be spent on 6502 work. */
+        while (s_vic_stall > 0 && spent < cycles) {
+            s_vic_stall--;
+            check_hardware_irq();
+            clockticks6502++;
+            spent++;
+        }
+        if (spent >= cycles) break;
+
         int n = service_interrupt();
         if (n == 0 && pc != IDLE_PC) n = exec6502();
         else if (n == 0) n = 1;               /* idle: one cycle at a time */
@@ -1796,6 +2011,7 @@ void sidr_debug_report(void)
             s_dbg_ro_writes, s_dbg_jam);
     fprintf(stderr, "  [dbg] reads of $D41B=%lu  $D41C=%lu (non-zero %lu)  paddles=%lu\n",
             s_dbg_read_osc, s_dbg_read_env, s_dbg_read_env_nz, s_dbg_pad);
+    fprintf(stderr, "  [dbg] $D41B non-zero=%lu\n", s_dbg_read_osc_nz);
     if (s_dbg_mirror_w || s_dbg_mirror_r)
         fprintf(stderr, "  [dbg] mirrored SID block: writes=%lu reads=%lu\n",
                 s_dbg_mirror_w, s_dbg_mirror_r);
@@ -1825,6 +2041,7 @@ static void debug_snapshot(void)
     s_dbg_illegal     = sidr_dbg_illegal;
     s_dbg_mirror_w    = sidr_dbg_mirror_writes;
     s_dbg_mirror_r    = sidr_dbg_mirror_reads;
+    s_dbg_read_osc_nz = sidr_dbg_read_osc_nonzero;
 }
 
 /* init 只跑一次, 而且它的写入全部钉在 t=0, 所以这里不需要走硬件时钟:
@@ -1943,6 +2160,7 @@ static void reset_machine(void)
     sidr_dbg_read_env = 0;
     sidr_dbg_read_env_nonzero = 0;
     sidr_dbg_pad = 0;
+    sidr_dbg_read_osc_nonzero = 0;
     sidr_dbg_illegal = 0;
     sidr_dbg_mirror_writes = 0;
     sidr_dbg_mirror_reads = 0;
@@ -1956,6 +2174,7 @@ static void reset_machine(void)
     VIC_y = 0;
     VIC_lines = 312; VIC_cpr = 63;
     s_cyc_in_line = 0;
+    s_vic_stall = 0;
 
     memset(&cia1, 0, sizeof(cia1));
     memset(&cia2, 0, sizeof(cia2));
@@ -2004,6 +2223,22 @@ int sid_song_probe(const char *path, sid_song_info_t *info)
         info->pal = (clk != 0x0C); info->vsync_hz = 50.125; info->clock_hz = 985248.0;
     }
 
+    /* Multi-SID: the header names the centre byte of each extra chip's 32-byte
+     * block. A header that declares one but whose byte is illegal means the
+     * file is malformed, so it is ignored rather than half-honoured. */
+    info->sid_addr[0] = 0xD400;
+    info->sid_addr[1] = 0;
+    info->sid_addr[2] = 0;
+    info->n_sids = 1;
+    if (si.version > 2) {
+        uint16_t a = sid_addr_from_header_byte(si.sid_addr_2);
+        if (a) { info->sid_addr[1] = a; info->n_sids = 2; }
+    }
+    if (si.version > 3 && info->n_sids == 2) {
+        uint16_t a = sid_addr_from_header_byte(si.sid_addr_3);
+        if (a && a != info->sid_addr[1]) { info->sid_addr[2] = a; info->n_sids = 3; }
+    }
+
     free(si.code);
     return 0;
 }
@@ -2037,6 +2272,8 @@ int sid_song_extract(const char *path, int subsong, double seconds,
 
     reset_machine();
     sid_build_map(&si);
+    loop_reset();
+    loop_set_range(&si);
 
     uint32_t clk = si.flags & 0x0C;
     double vsync_hz, cpu_hz;
@@ -2084,6 +2321,7 @@ int sid_song_extract(const char *path, int subsong, double seconds,
             g_current_cycle = (int64_t)fr * (int64_t)g_cycles_per_frame;
             g_frame_base_cycle = clockticks6502;
             tick_psid(play_addr);
+            loop_check(fr);
         }
     } else {
         /* Now that init has run, the header's speed bit and the timer latch are
@@ -2110,11 +2348,16 @@ int sid_song_extract(const char *path, int subsong, double seconds,
             g_current_cycle = (int64_t)fr * (int64_t)play_cycles;
             g_frame_base_cycle = clockticks6502;
             call_play(play_addr, play_cycles);
+            loop_check(fr);
         }
     }
 
     sid_write_hook = NULL;
     debug_snapshot();
+
+    /* Loop point, if the memory state repeated itself. Reported in the same
+     * units as the timestamps, so a caller can clip playback there. */
+    info->loop_ms = loop_ms_from(info);
 
     /* Hand the buffer over, then convert cycle counts to milliseconds. */
     size_t n = cap_n;
@@ -2132,6 +2375,7 @@ int sid_song_extract(const char *path, int subsong, double seconds,
             out[i].t_ms = (c < 0) ? 0.0 : (double)c / cpu_hz * 1000.0;
             out[i].reg  = cap_buf[i].reg;
             out[i].val  = cap_buf[i].val;
+            out[i].sid  = cap_buf[i].chip;
         }
     }
 
@@ -2195,6 +2439,8 @@ int sid_stream_open(const char *path, int subsong, sid_song_info_t *info,
 
     reset_machine();
     sid_build_map(&si);
+    loop_reset();
+    loop_set_range(&si);
 
     uint32_t clk = si.flags & 0x0C;
     double vsync_hz, cpu_hz;
@@ -2285,6 +2531,7 @@ int sid_stream_next_frame(const sid_event_t **events, size_t *count)
                             : (double)c / s_stream_cpu_hz * 1000.0;
         s_frame_ev[i].reg = cap_buf[i].reg;
         s_frame_ev[i].val = cap_buf[i].val;
+        s_frame_ev[i].sid = cap_buf[i].chip;
     }
     cap_n = 0;
     /* A slot that straddles the frame boundary has already been handed to the
@@ -2326,9 +2573,17 @@ int sid_sidreg_write(const char *path, const sid_event_t *events, size_t count)
 {
     FILE *f = fopen(path, "w");
     if (!f) return -1;
-    for (size_t i = 0; i < count; i++)
-        fprintf(f, "%.4f %02x %02x\n", events[i].t_ms,
-                events[i].reg, events[i].val);
+    /* The chip index is only written when it is non-zero, so streams made
+     * before 2SID support - and every single-chip tune - keep the exact old
+     * three-field format. Existing caches stay valid and comparable. */
+    for (size_t i = 0; i < count; i++) {
+        if (events[i].sid)
+            fprintf(f, "%.4f %02x %02x %u\n", events[i].t_ms,
+                    events[i].reg, events[i].val, events[i].sid);
+        else
+            fprintf(f, "%.4f %02x %02x\n", events[i].t_ms,
+                    events[i].reg, events[i].val);
+    }
     if (fclose(f) != 0) return -1;
     return 0;
 }
@@ -2351,8 +2606,11 @@ int sid_sidreg_read(const char *path, sid_event_t **events, size_t *count)
         if (*p == '#' || *p == '\n' || *p == '\r' || *p == 0) continue;
 
         double t;
-        unsigned reg, val;
-        if (sscanf(p, "%lf %x %x", &t, &reg, &val) == 3) {
+        unsigned reg, val, chip = 0;
+        /* The 4th field is the chip index and is only present for 2SID
+         * streams; three fields is the original format and means chip 0. */
+        int got = sscanf(p, "%lf %x %x %u", &t, &reg, &val, &chip);
+        if (got >= 3) {
             if (n == s_read_cap) {
                 size_t want = s_read_cap ? s_read_cap * 2 : 4096;
                 sid_event_t *np = (sid_event_t *)realloc(s_read_buf,
@@ -2364,6 +2622,7 @@ int sid_sidreg_read(const char *path, sid_event_t **events, size_t *count)
             s_read_buf[n].t_ms = t;
             s_read_buf[n].reg  = (uint8_t)reg;
             s_read_buf[n].val  = (uint8_t)val;
+            s_read_buf[n].sid  = (uint8_t)(chip > 2 ? 0 : chip);
             n++;
         }
     }

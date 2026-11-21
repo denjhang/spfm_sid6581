@@ -30,11 +30,18 @@ extern "C" {
 #endif
 
 /* One captured register write. t_ms is measured from the start of playback,
- * where 0 is the moment the init routine's writes are done. */
+ * where 0 is the moment the init routine's writes are done.
+ *
+ * `sid` says which SID chip in the file the write belongs to: 0 is the one at
+ * $D400, 1 and 2 are the ones declared in header bytes $7A / $7B ($D420,
+ * $D440 usually). Most files only ever produce sid == 0 and every consumer
+ * may ignore the field; the player uses it to put chip 1 on a second SPFM
+ * slot so a 2SID tune plays with both chips. */
 typedef struct {
     double  t_ms;
     uint8_t reg;        /* 0x00 .. 0x1F */
     uint8_t val;
+    uint8_t sid;        /* 0, 1 or 2 */
 } sid_event_t;
 
 typedef struct {
@@ -52,6 +59,11 @@ typedef struct {
     uint16_t start_song;        /* 1-based */
     uint32_t speed;
     uint16_t flags;
+    /* Multi-SID: how many chips the header declares (1..3) and where they sit.
+     * sid_addr[0] is always $D400; [1]/[2] come from header bytes $7A/$7B and
+     * are 0 when the file does not declare them. */
+    uint8_t  n_sids;
+    uint16_t sid_addr[3];
     /* Filled by sid_song_extract / sid_stream_open (a probe cannot know these,
      * they only exist after the init routine has run):
      *   cia_timed   - 1 if the speed word says this subsong is driven by CIA
@@ -61,6 +73,13 @@ typedef struct {
     int      cia_timed;
     uint32_t play_cycles;
     double   play_hz;
+    /* Length in ms as reported by a side database (Songlengths.md5 / SSL), or
+     * 0 when nothing is known. Filled by the player, not by the emulator. */
+    long     length_ms;
+    /* Loop point: the time at which the machine's memory state repeats itself
+     * for the first time, i.e. from here on the tune plays the same thing
+     * again. 0 means "no loop found within the render". */
+    long     loop_ms;
 } sid_song_info_t;
 
 /* ---- playback model ------------------------------------------------- *
@@ -123,6 +142,12 @@ void sid_song_free(sid_event_t *events);
  * and what vectors the tune installed. Printed by sidextract when the
  * SIDR_DEBUG environment variable is set; cheap enough to keep always on. */
 void sidr_debug_report(void);
+
+/* Register writes that landed on the 2nd/3rd SID declared in the file's
+ * header. They are still captured (each event carries its chip index); this
+ * counter exists so a caller can tell "single chip tune" from "2SID tune being
+ * played with one chip". */
+extern unsigned long sidr_dbg_other_sid;
 
 /* ---- live streaming ------------------------------------------------- *
  * A .sid header has no length field. A C64 tune plays for as long as the play

@@ -21,6 +21,7 @@
  * bunched - so a slow USB transfer degrades timing rather than dropping notes.
  */
 #include "sid_rsid.h"
+#include "sidmeta.h"
 #include "sidplay.h"
 #include "sid6581.h"
 #include "spfm_transport.h"
@@ -76,6 +77,23 @@ static size_t   s_drain_low = 64;        /* bytes allowed to remain queued */
 static size_t   s_peak_pending = 0;
 static int      s_starved = 0;           /* times a deadline expired with a backlog */
 
+/* ---- two chips ----------------------------------------------------- *
+ * A 2SID/3SID tune addresses a second (third) chip at $D420/$D440 and the
+ * extractor now tags each write with which chip it belongs to. Playing it
+ * properly means putting that chip on its own SPFM slot.
+ *
+ * s_slot_for[0] is the main slot (-s / SID_DEFAULT_SLOT). Entries 1 and 2 are
+ * -1 (disabled) unless --slot2 / --slot3 name a slot, in which case writes
+ * tagged with that chip go there. A disabled chip's writes are dropped: with
+ * one chip on the bus there is nowhere to put them, and folding them back onto
+ * the main chip is the corruption this whole change removes. */
+static int s_slot_for[3] = { -1, -1, -1 };
+
+static int slot_for_chip(uint8_t chip)
+{
+    return (chip < 3) ? s_slot_for[chip] : -1;
+}
+
 /* ------------------------------------------------------------------ */
 /* hardware                                                            */
 /* ------------------------------------------------------------------ */
@@ -130,9 +148,13 @@ static void flush_paced(int64_t deadline_us)
  * change does not carry the previous tune's tail into the next one. */
 static void hw_mute(void)
 {
-    for (uint8_t v = 0; v < 3; v++)
-        sid_write(s_opt.slot, (uint8_t)(v * 7 + SID_REG_CONTROL), 0x00);
-    sid_write(s_opt.slot, SID_REG_MODE_VOL, 0x00);
+    for (int c = 0; c < 3; c++) {
+        int slot = s_slot_for[c];
+        if (slot < 0) continue;
+        for (uint8_t v = 0; v < 3; v++)
+            sid_write((uint8_t)slot, (uint8_t)(v * 7 + SID_REG_CONTROL), 0x00);
+        sid_write((uint8_t)slot, SID_REG_MODE_VOL, 0x00);
+    }
     sid_flush();
 }
 
@@ -395,6 +417,9 @@ static int load_stream(const char *path, int subsong, double seconds,
  * break the gate/reset sequences that produce percussion and digi samples. */
 static void emit(const sid_event_t *e)
 {
+    int slot = slot_for_chip(e->sid);
+    if (slot < 0) return;          /* chip has no slot: nothing to write to */
+
     if (s_keep_filter) {
         /* Optional: drop the song's filter programming so the raw voices stay
          * bright. Register 0x18 is a special case - it carries the master
@@ -406,11 +431,11 @@ static void emit(const sid_event_t *e)
             e->reg == SID_REG_FC_HI)
             return;
         if (e->reg == SID_REG_MODE_VOL) {
-            sid_write(s_opt.slot, e->reg, (uint8_t)(e->val & SID_VOLUME_MASK));
+            sid_write((uint8_t)slot, e->reg, (uint8_t)(e->val & SID_VOLUME_MASK));
             return;
         }
     }
-    sid_write(s_opt.slot, e->reg, e->val);
+    sid_write((uint8_t)slot, e->reg, e->val);
 }
 
 /* Play a .sid forever, running the 6502 live.
@@ -428,7 +453,7 @@ static void emit(const sid_event_t *e)
  *
  * Returns 0 if the user asked for the next track, -1 if they asked to quit. */
 static int stream_play_sid(const char *path, int subsong, double speed,
-                           sid_song_info_t *out_info)
+                           sid_song_info_t *out_info, double stop_ms)
 {
     char err[128];
     sid_song_info_t info;
@@ -498,6 +523,11 @@ static int stream_play_sid(const char *path, int subsong, double speed,
         }
 
         played_ms += frame_ms;
+
+        /* A track with a known length stops on its own - either the length the
+         * databases report (--length auto) or the loop point the emulator
+         * found (--length loop). */
+        if (stop_ms > 0.0 && played_ms >= stop_ms) break;
 
         if (played_ms >= next_report) {
             next_report = (int64_t)(played_ms / 5000 + 1) * 5000;
@@ -690,6 +720,10 @@ static int cmd_play(int argc, char **argv)
     int subsong = -1;
     int use_cache = 1;
     int pace = 0;
+    int slot2 = -1, slot3 = -1;    /* extra SID chips: -1 = single-chip tune */
+    const char *db_path = NULL, *stil_path = NULL;
+    int    length_mode = 0;        /* 1 = loop point, 2 = database length */
+    double stop_ms = 0.0;
 
     /* PSID model unless asked otherwise: see sid_rsid.h. Digi tracks need
      * --rsid, and their write rate is beyond what the SPFM link can carry. */
@@ -712,6 +746,16 @@ static int cmd_play(int argc, char **argv)
                 return 1;
             }
         }
+        else if (!strcmp(argv[i], "--slot2") && i + 1 < argc)   slot2 = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--slot3") && i + 1 < argc)   slot3 = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--db") && i + 1 < argc)      db_path = argv[++i];
+        else if (!strcmp(argv[i], "--stil") && i + 1 < argc)    stil_path = argv[++i];
+        else if (!strcmp(argv[i], "--length") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "loop"))      length_mode = 1;
+            else if (!strcmp(m, "auto")) length_mode = 2;
+            else { fprintf(stderr, "--length takes 'loop' or 'auto'\n"); return 1; }
+        }
         else if (!strcmp(argv[i], "--pace"))                    pace = 1;
         else if (argv[i][0] == '-') {
             fprintf(stderr, "unknown option '%s'\n", argv[i]);
@@ -731,6 +775,11 @@ static int cmd_play(int argc, char **argv)
     }
     if (speed <= 0) speed = 1.0;
     s_drain = sid_get_volume_limit() > 0.0;
+
+    /* Chip 0 always follows the main slot; extra chips are opt-in. */
+    s_slot_for[0] = s_opt.slot;
+    s_slot_for[1] = slot2 >= 0 ? slot2 : -1;
+    s_slot_for[2] = slot3 >= 0 ? slot3 : -1;
 
     sid_song_info_t info;
     memset(&info, 0, sizeof info);
@@ -755,7 +804,8 @@ static int cmd_play(int argc, char **argv)
                (unsigned long)st.count, st.events[st.count - 1].t_ms / 1000.0);
         fflush(stdout);
         if (hw_connect() != 0) { stream_free(&st); return 1; }
-        sid_clear_all_regs(s_opt.slot);
+        for (int c = 0; c < 3; c++)
+            if (s_slot_for[c] >= 0) sid_clear_all_regs((uint8_t)s_slot_for[c]);
         sid_flush();
         kb_start();
         int rc = replay(st.events, st.count, speed, pace);
@@ -778,9 +828,31 @@ static int cmd_play(int argc, char **argv)
         printf("playing %.0f s (from the start)\n", seconds);
     else
         printf("playing until interrupted: [n] next-track marker, [q] quit\n");
+    /* Resolve --length. The database length needs only the file; the loop
+     * point is discovered by the streaming run itself. */
+    if (length_mode == 2) {
+        long len = sidmeta_song_length_ms(path, (unsigned)(subsong + 1), db_path);
+        if (len > 0) stop_ms = (double)len;
+        else fprintf(stderr, "no length in the database for subsong %d\n",
+                     subsong + 1);
+    }
+
+    /* STIL names the subsong when HVSC has an entry for it. The header's title
+     * is a file-level name, so an STIL hit is usually the better one. */
+    {
+        char t[128], a[128];
+        if (sidmeta_stil(stil_path, path, (unsigned)(subsong + 1),
+                         t, sizeof t, a, sizeof a) == 0)
+            printf("STIL: %s%s%s\n", t, a[0] ? " / " : "", a);
+    }
+
     printf("subsong %d of %u, speed %.2fx, %s writes, %s model\n",
            subsong, probe.n_songs, speed, sidplay_proto_name(),
            sid_get_rsid_mode() ? "RSID" : "PSID");
+    if (probe.n_sids > 1)
+        printf("%u SIDs in the file: chip 0 on slot %d, chip 1 on slot %d%s\n",
+               probe.n_sids, s_slot_for[0], s_slot_for[1],
+               s_slot_for[1] >= 0 ? "" : " (not played - use --slot2)");
     if (sid_get_volume_limit() > 0.0)
         printf("$D418 limited to %.0f Hz on a fixed timebase (link drain-aware)\n",
                sid_get_volume_limit());
@@ -790,7 +862,8 @@ static int cmd_play(int argc, char **argv)
 
     /* Start from a known state: clear every register, then let the song's own
      * init writes define the chip. */
-    sid_clear_all_regs(s_opt.slot);
+    for (int c = 0; c < 3; c++)
+        if (s_slot_for[c] >= 0) sid_clear_all_regs((uint8_t)s_slot_for[c]);
     sid_flush();
     kb_start();
 
@@ -808,7 +881,7 @@ static int cmd_play(int argc, char **argv)
         rc = replay(st.events, st.count, speed, pace);
         stream_free(&st);
     } else {
-        rc = stream_play_sid(path, subsong, speed, &info);
+        rc = stream_play_sid(path, subsong, speed, &info, stop_ms);
     }
 
     hw_mute();
@@ -883,6 +956,7 @@ static int cmd_playlist(int argc, char **argv)
     double speed = 1.0;
     int start_idx = 0;
     int subsong = 0;
+    int slot2 = -1, slot3 = -1;    /* extra SID chips: -1 = single-chip tune */
 
     sid_set_rsid_mode(0);
     sid_set_volume_limit(0.0);
@@ -894,6 +968,8 @@ static int cmd_playlist(int argc, char **argv)
         else if (!strcmp(argv[i], "--rsid"))                    sid_set_rsid_mode(1);
         else if (!strcmp(argv[i], "--limit") && i + 1 < argc)   sid_set_volume_limit(atof(argv[++i]));
         else if (!strcmp(argv[i], "--from") && i + 1 < argc)    start_idx = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--slot2") && i + 1 < argc)   slot2 = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--slot3") && i + 1 < argc)   slot3 = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cache-dir") && i + 1 < argc)
             sidplay_set_cache_dir(argv[++i]);
         else if (!strcmp(argv[i], "--raw-filter"))              s_keep_filter = 1;
@@ -918,6 +994,11 @@ static int cmd_playlist(int argc, char **argv)
     }
 
     s_drain = sid_get_volume_limit() > 0.0;
+
+    /* Chip 0 always follows the main slot; extra chips are opt-in. */
+    s_slot_for[0] = s_opt.slot;
+    s_slot_for[1] = slot2 >= 0 ? slot2 : -1;
+    s_slot_for[2] = slot3 >= 0 ? slot3 : -1;
 
     if (hw_connect() != 0) { free(files); return 1; }
 
@@ -956,7 +1037,8 @@ static int cmd_playlist(int argc, char **argv)
         s_action = 0;
         s_interrupt = 0;
 
-        sid_clear_all_regs(s_opt.slot);
+        for (int c = 0; c < 3; c++)
+            if (s_slot_for[c] >= 0) sid_clear_all_regs((uint8_t)s_slot_for[c]);
         sid_flush();
 
         int rc;
@@ -973,7 +1055,7 @@ static int cmd_playlist(int argc, char **argv)
             stream_free(&st);
         } else {
             /* Normal mode: run live, forever, until a key arrives. */
-            rc = stream_play_sid(path, subsong, speed, NULL);
+            rc = stream_play_sid(path, subsong, speed, NULL, 0.0);
         }
 
         hw_mute();

@@ -14,18 +14,23 @@
  * digi sample players fire). It is off by default because those streams carry
  * thousands of writes per second, which the SPFM link cannot carry in real
  * time; see sid_rsid.h.
+ *
+ * --db / --stil point at HVSC's Songlengths.md5 and STIL.txt. They are
+ * optional: without them the extractor still reports the loop point it finds
+ * in the machine state, which needs no external file at all.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "sid_rsid.h"
+#include "sidmeta.h"
 
 static void usage(const char *argv0)
 {
     fprintf(stderr,
             "usage: %s <file.sid> [<out.sidreg>] [--seconds N] [--subsong N] [--rsid]\n"
-            "          [--limit HZ]\n"
+            "          [--limit HZ] [--db SONGLENGTHS.md5] [--stil STIL.txt]\n"
             "       %s <file.sid> --info\n",
             argv0, argv0);
 }
@@ -37,6 +42,8 @@ int main(int argc, char **argv)
     double seconds = 60.0;
     int subsong = -1;
     int info_only = 0;
+    const char *db_path = NULL;
+    const char *stil_path = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--seconds") && i + 1 < argc) {
@@ -47,6 +54,10 @@ int main(int argc, char **argv)
             sid_set_rsid_mode(1);
         } else if (!strcmp(argv[i], "--limit") && i + 1 < argc) {
             sid_set_volume_limit(atof(argv[++i]));
+        } else if (!strcmp(argv[i], "--db") && i + 1 < argc) {
+            db_path = argv[++i];
+        } else if (!strcmp(argv[i], "--stil") && i + 1 < argc) {
+            stil_path = argv[++i];
         } else if (!strcmp(argv[i], "--info") || !strcmp(argv[i], "-i")) {
             info_only = 1;
         } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
@@ -84,6 +95,31 @@ int main(int argc, char **argv)
            info.load_addr, info.init_addr, info.play_addr,
            (unsigned long)info.speed);
 
+    if (info.n_sids > 1) {
+        printf("  SIDs    : %u", info.n_sids);
+        for (int i = 0; i < info.n_sids; i++)
+            printf("  #%d at $%04X", i, info.sid_addr[i]);
+        printf("\n");
+    }
+
+    /* Side databases: length from Songlengths.md5 / SSL, names from STIL.
+     * Both are optional and both fail quietly - a tune that is not in HVSC
+     * simply has no length to report. */
+    {
+        unsigned song = (unsigned)(subsong >= 0 ? subsong + 1
+                                  : (info.start_song ? info.start_song : 1));
+        long len = sidmeta_song_length_ms(in_path, song, db_path);
+        if (len >= 0)
+            printf("  length  : %ld:%02ld.%03ld  (subsong %u)\n",
+                   len / 60000, (len / 1000) % 60, len % 1000, song);
+
+        char title[128], artist[128];
+        if (sidmeta_stil(stil_path, in_path, song,
+                         title, sizeof title, artist, sizeof artist) == 0)
+            printf("  STIL    : %s%s%s\n", title,
+                   artist[0] ? " / " : "", artist);
+    }
+
     if (info_only) return 0;
 
     printf("  running 6502 for %.1f s...\n", seconds);
@@ -100,6 +136,12 @@ int main(int argc, char **argv)
     printf("  play rate: %.2f Hz (%s, %lu cycles)\n", info.play_hz,
            info.cia_timed ? "CIA timer A" : "video frame",
            (unsigned long)info.play_cycles);
+    if (info.n_sids > 1)
+        printf("  multi-SID: %u chips (%lu writes to the extra ones)\n",
+               info.n_sids, sidr_dbg_other_sid);
+    if (info.loop_ms > 0)
+        printf("  loop    : %ld.%03ld s (machine state repeats from here)\n",
+               info.loop_ms / 1000, info.loop_ms % 1000);
     if (!sid_get_rsid_mode())
         printf("  model   : PSID (play per frame, no interrupts) - use --rsid "
                "for digi/sample playback\n");

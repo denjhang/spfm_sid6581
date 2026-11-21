@@ -135,6 +135,35 @@ sidtest.exe sidlist sid/rsid --from 10            :: 从第 11 首开始
 | `--limit HZ` | 把 `$D418` 更新率钉在 HZ 以内（配合 `--rsid` 用） | 关 |
 | `--no-cache` | 不读也不写 `.sidreg` 缓存 | 关 |
 | `--cache-dir DIR` | 缓存目录 | `sid_cache` |
+| `--length loop\|auto` | 播到循环点（仿真自己找）或数据库长度自动停 | 关 |
+| `--db FILE` | HVSC 的 `Songlengths.md5` | 无 |
+| `--stil FILE` | HVSC 的 `STIL.txt`（子曲名/作者） | 无 |
+| `--slot2 N` `--slot3 N` | 把多 SID 曲的第 2/3 颗放到 SPFM 槽 N | 关（不播）
+
+**长什么样、多长、从哪循环、子曲叫什么**，这四件事 PSID 头里都没有。
+`sidmeta.c` 补了三个来源：
+
+- **长度**：`SONGLENGTHS/Name.ssl`（同目录，2 字节 BCD/子曲）优先，退到
+  `Songlengths.md5`（`<整个文件的MD5>=mm:ss ...`，HVSC #71 起的唯一格式）。
+- **子曲名**：`STIL.txt` 的 `TITLE:`/`ARTIST:`，按 `(#N)` 分块。
+- **循环点**：不用任何外部文件——仿真器每帧对 RAM 算 64 位哈希，同状态
+  出现**三次且周期一致**才认定循环，报出帧号。
+
+```cmd
+build\sidextract.exe sid/Robots.sid --info --db Songlengths.md5 --stil STIL.txt
+::   length  : 0:52.403  (subsong 1)
+::   STIL    : The Robots [from The Man-Machine] / Kraftwerk
+
+sidtest.exe sidplay sid/Golden_Axe.sid --length auto --db Songlengths.md5
+:: 播到数据库给的 4:15 自动停
+
+sidtest.exe sidplay sid/rsid/Anthrox_2SID.sid --slot2 1
+:: 2SID 曲子：第一颗在槽 3，第二颗放槽 1
+```
+
+实测：`Golden_Axe` 循环点 1.995 s，把 `[0,L)` 和 `[L,2L)` 的寄存器流逐条
+比对 2306 条全同。`Robots`/`R-Type`/`atmos` 60 秒内状态不复现，就不报——
+宁可不说也不给假值。
 
 写协议是唯一需要按硬件调的参数：这套接线下 SID 是异步写器件，`1step` 实测兼容性
 更好（`2step` 会放坏一部分曲子）；换回旧的四芯片接线时用 `--proto 2step`。
