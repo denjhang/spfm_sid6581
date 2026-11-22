@@ -22,6 +22,7 @@
  */
 #include "sid_rsid.h"
 #include "sidmeta.h"
+#include "sidvgm.h"
 #include "sidplay.h"
 #include "sid6581.h"
 #include "spfm_transport.h"
@@ -292,10 +293,13 @@ static int has_suffix(const char *s, const char *suf)
     return 1;
 }
 
-/* Whether the file needs the 6502 emulator, or is already a rendered stream. */
-static int is_sidreg(const char *path)
+/* Whether the file needs the 6502 emulator, or is already a rendered stream.
+ * Both containers are accepted; the magic is what decides, so a mis-named file
+ * still plays. */
+static int is_rendered(const char *path)
 {
-    return has_suffix(path, ".sidreg");
+    return has_suffix(path, ".sidreg") || has_suffix(path, ".sidvgm") ||
+           sidvgm_is_file(path);
 }
 
 static const char *g_cache_dir_override = NULL;
@@ -353,14 +357,18 @@ static int load_stream(const char *path, int subsong, double seconds,
 
     /* A pre-rendered stream needs no emulation at all - useful when iterating
      * on playback timing without paying the 6502 run every time. */
-    if (is_sidreg(path)) {
-        if (sid_sidreg_read(path, &st->events, &st->count) != 0) {
+    if (is_rendered(path)) {
+        int rc = sidvgm_is_file(path)
+               ? sidvgm_read(path, &st->events, &st->count, &st->info)
+               : sid_sidreg_read(path, &st->events, &st->count);
+        if (rc != 0) {
             snprintf(err, errlen, "cannot read %s", path);
             return -1;
         }
         st->borrowed = 1;
-        /* info.name is shown as the song title, so give it the file's stem
-         * rather than the full path (which would also get cut at 32 chars). */
+        if (sidvgm_is_file(path)) return 0;   /* GD3 gave us title/clock */
+        /* A .sidreg carries no metadata: name it after the file and assume the
+         * PAL clock the renderer used. */
         const char *base = path;
         for (const char *p = path; *p; p++)
             if (*p == '/' || *p == '\\') base = p + 1;
@@ -791,10 +799,10 @@ static int cmd_play(int argc, char **argv)
     sid_song_info_t info;
     memset(&info, 0, sizeof info);
 
-    /* A pre-rendered .sidreg has a fixed length by construction - it is a
-     * dump, not a song - so that path still replays the buffer once. A real
-     * .sid runs live and forever. */
-    if (is_sidreg(path)) {
+    /* A pre-rendered stream (.sidreg or .sidvgm) has a fixed length by
+     * construction - it is a dump, not a song - so that path still replays the
+     * buffer once. A real .sid runs live and forever. */
+    if (is_rendered(path)) {
         stream_t st;
         char err[128];
         if (load_stream(path, subsong, seconds > 0 ? seconds : 1e9,

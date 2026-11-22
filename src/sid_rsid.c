@@ -1473,6 +1473,7 @@ typedef struct {
     uint8_t  sid_addr_3;
     char     name[33];
     char     author[33];
+    char     released[33];   /* header +86; "1988 Activision" and the like */
     uint8_t *code;
     uint32_t code_size;
 } PSID;
@@ -1505,6 +1506,7 @@ static int parse_psid(const char *path, PSID *si) {
     si->speed      = rd_be32(raw + 18);
     memcpy(si->name,   raw + 22, 32); si->name[32] = 0;
     memcpy(si->author, raw + 54, 32); si->author[32] = 0;
+    memcpy(si->released, raw + 86, 32); si->released[32] = 0;
     si->flags = (si->version >= 2) ? rd_be16(raw + 0x76) : 0;
     /* $7A and $7B only exist from v3 / v4 on; older files have other data there. */
     si->sid_addr_2 = (si->version > 2 && sz > 0x7A) ? raw[0x7A] : 0;
@@ -2104,6 +2106,7 @@ int sid_song_probe(const char *path, sid_song_info_t *info)
     memset(info, 0, sizeof(*info));
     copy_meta(info->name, (const uint8_t *)si.name, sizeof(info->name));
     copy_meta(info->author, (const uint8_t *)si.author, sizeof(info->author));
+    copy_meta(info->released, (const uint8_t *)si.released, sizeof(info->released));
     info->is_rsid    = (memcmp(si.magic, "RSID", 4) == 0);
     info->load_addr  = si.load_addr;
     info->init_addr  = si.init_addr;
@@ -2278,6 +2281,10 @@ int sid_song_extract(const char *path, int subsong, double seconds,
 
     free(si.code);
     reset_machine();
+    /* reset_machine() clears the live counters, but the caller still wants to
+     * know how many writes went to the 2nd/3rd SID. debug_snapshot() above
+     * preserved them; put the count back so sidextract does not report 0. */
+    sidr_dbg_other_sid = s_dbg_other_sid;
     return 0;
 }
 

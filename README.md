@@ -167,6 +167,34 @@ sidtest.exe sidplay sid/rsid/Anthrox_2SID.sid --slot2 1
 实测：`Golden_Axe` 在 Songlengths 里是 4:15（子曲 1）/ 0:27（子曲 2），`R-Type`
 是 2:11 / 0:36 / 0:26；`--length auto` 播到这些秒数自动停。
 
+### 渲染流容器：`.sidreg` 与 `.sidvgm`
+
+提取出来的寄存器流有两种存法，同一份数据，用途不同：
+
+| | `.sidreg` | `.sidvgm` |
+|---|---|---|
+| 形态 | 文本，`<ms> <reg> <val> [sid]` | 二进制，VGM 式头 + 命令流 + GD3 |
+| 时间基 | 浮点毫秒 | 整数 tick = 一个 PHI2 周期 |
+| 元数据 | 无 | 标题/作者/年份/格式/子曲/芯片型号 |
+| 循环点 | 无 | 头部可表达（现在恒为 0） |
+| 体积 | 2330 条 = 38 KB | 同一条数 = 9.6 KB |
+
+规范在 [docs/sidvgm文件规范.md](docs/sidvgm文件规范.md)：头字段位置、相对偏移、
+额外头的芯片时钟表、`0x69/0x6A/0x6B` 写命令、`0x61` 等待、`0x66` 结束、GD3
+UTF-16 标签全部照 libvgm 的读法，只有"写 SID 寄存器"这三个操作码是本格式新定的
+（libvgm 里没有 SID 设备，`DEVID_*` 到 0x29 为止）。
+
+```cmd
+build\sidextract.exe sid/Golden_Axe.sid out.sidvgm --seconds 120
+build\sidextract.exe out.sidvgm --dump --cmds 20     :: 看头和前 20 条
+build\sidextract.exe out.sidvgm back.sidreg          :: 转回文本
+sidtest.exe sidplay out.sidvgm                       :: 直接播（不用再跑 6502）
+```
+
+`sidplay` / `sidlist` 认 `.sidvgm` 也认 `.sidreg`，按魔数而不是扩展名判断。
+缓存默认仍写 `.sidreg`（老缓存继续可用），给 `sidextract` 的**输出名**带
+`.sidvgm` 才产出新格式。
+
 写协议是唯一需要按硬件调的参数：这套接线下 SID 是异步写器件，`1step` 实测兼容性
 更好（`2step` 会放坏一部分曲子）；换回旧的四芯片接线时用 `--proto 2step`。
 

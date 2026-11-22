@@ -26,14 +26,24 @@
 
 #include "sid_rsid.h"
 #include "sidmeta.h"
+#include "sidvgm.h"
+
+/* The container follows the extension; a name the caller invented with
+ neither suffix gets the old text format so existing scripts keep working. */
+static int out_is_vgm(const char *path)
+{
+    size_t L = strlen(path);
+    return L >= 7 && _stricmp(path + L - 7, ".sidvgm") == 0;
+}
 
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "usage: %s <file.sid> [<out.sidreg>] [--seconds N] [--subsong N] [--rsid]\n"
-            "          [--limit HZ] [--db SONGLENGTHS.md5] [--stil STIL.txt]\n"
-            "       %s <file.sid> --info\n",
-            argv0, argv0);
+            "usage: %s <file.sid> [<out.sidreg|out.sidvgm>] [--seconds N] [--subsong N]\n"
+            "          [--rsid] [--limit HZ] [--db SONGLENGTHS.md5] [--stil STIL.txt]\n"
+            "       %s <file.sid> --info\n"
+            "       %s <file.sidvgm> --dump [--cmds N]\n",
+            argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv)
@@ -43,6 +53,8 @@ int main(int argc, char **argv)
     double seconds = 60.0;
     int subsong = -1;
     int info_only = 0;
+    int dump = 0;
+    unsigned dump_cmds = 24;
     const char *db_path = NULL;
     const char *stil_path = NULL;
 
@@ -61,6 +73,10 @@ int main(int argc, char **argv)
             stil_path = argv[++i];
         } else if (!strcmp(argv[i], "--info") || !strcmp(argv[i], "-i")) {
             info_only = 1;
+        } else if (!strcmp(argv[i], "--dump")) {
+            dump = 1;
+        } else if (!strcmp(argv[i], "--cmds") && i + 1 < argc) {
+            dump_cmds = (unsigned)atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             usage(argv[0]);
             return 0;
@@ -79,6 +95,41 @@ int main(int argc, char **argv)
     }
 
     if (!in_path) { usage(argv[0]); return 1; }
+
+    /* A sidvgm needs no emulation: parse it and either dump it, convert it, or
+     * report it. It is a container, so the .sid header fields the format cannot
+     * carry (load/init/play) simply print as zero. */
+    if (dump || sidvgm_is_file(in_path)) {
+        if (dump) return sidvgm_dump(stdout, in_path, dump_cmds) == 0 ? 0 : 1;
+
+        sid_event_t *ev = NULL;
+        size_t n = 0;
+        sid_song_info_t vi;
+        if (sidvgm_read(in_path, &ev, &n, &vi) != 0) {
+            fprintf(stderr, "cannot read %s as sidvgm\n", in_path);
+            return 1;
+        }
+        if (!out_path) {
+            printf("%s  (sidvgm)\n", in_path);
+            printf("  title   : %s\n", vi.name[0] ? vi.name : "(none)");
+            printf("  author  : %s\n", vi.author[0] ? vi.author : "(none)");
+            printf("  clock   : %s, %.3f Hz\n", vi.pal ? "PAL" : "NTSC", vi.clock_hz);
+            printf("  writes  : %lu over %.3f s\n", (unsigned long)n,
+                   n ? ev[n - 1].t_ms / 1000.0 : 0.0);
+            free(ev);
+            return 0;
+        }
+        int rc = out_is_vgm(out_path)
+               ? sidvgm_write(out_path, ev, n, &vi, "converted by sidextract")
+               : sid_sidreg_write(out_path, ev, n);
+        free(ev);
+        if (rc != 0) {
+            fprintf(stderr, "cannot write %s\n", out_path);
+            return 1;
+        }
+        printf("  -> %s\n", out_path);
+        return 0;
+    }
 
     sid_song_info_t info;
     if (sid_song_probe(in_path, &info) != 0) {
@@ -161,12 +212,23 @@ int main(int argc, char **argv)
     if (getenv("SIDR_DEBUG")) sidr_debug_report();
 
     if (out_path) {
-        if (sid_sidreg_write(out_path, ev, n) != 0) {
+        char comment[160];
+        snprintf(comment, sizeof comment,
+                 "format=%s; clock=%s; subsong=%u/%u; play_hz=%.3f; source=%s",
+                 info.is_rsid ? "RSID" : "PSID", info.pal ? "PAL" : "NTSC",
+                 (unsigned)(subsong >= 0 ? subsong + 1 : info.start_song),
+                 info.n_songs, info.play_hz, in_path);
+
+        int is_vgm = out_is_vgm(out_path);
+        int rc = is_vgm
+               ? sidvgm_write(out_path, ev, n, &info, comment)
+               : sid_sidreg_write(out_path, ev, n);
+        if (rc != 0) {
             fprintf(stderr, "cannot write %s\n", out_path);
             sid_song_free(ev);
             return 1;
         }
-        printf("  -> %s\n", out_path);
+        printf("  -> %s (%s)\n", out_path, is_vgm ? "sidvgm" : "sidreg");
     }
 
     sid_song_free(ev);

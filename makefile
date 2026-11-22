@@ -13,12 +13,13 @@ CFLAGS  := -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter \
 LDFLAGS := -L$(FTDI) -lftd2xx -lws2_32 -lwinmm -static
 
 SRCS := src/spfm_transport.c src/sid6581.c src/sid_freq_table.c \
-        src/sid_rsid.c src/sidmeta.c src/sidplay.c src/sidtest.c
+        src/sid_rsid.c src/sidmeta.c src/sidvgm.c src/sidplay.c src/sidtest.c
 OBJS := $(patsubst src/%.c,$(BUILD)/%.o,$(SRCS))
 TARGET := $(BUILD)/sidtest.exe
 
 # The emulator alone, without the driver or FTDI: turns a .sid into a .sidreg
-# on a machine with no hardware attached. Replaces the STC32G tools/sid_extract.
+# or .sidvgm on a machine with no hardware attached. Replaces the STC32G
+# tools/sid_extract.
 EXTRACT := $(BUILD)/sidextract.exe
 
 all: $(TARGET) $(EXTRACT)
@@ -27,7 +28,8 @@ $(TARGET): $(OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 	cp $(FTDI)/ftd2xx64.dll $(BUILD)/ 2>/dev/null || true
 
-$(EXTRACT): src/sidextract_cli.c $(BUILD)/sid_rsid.o $(BUILD)/sidmeta.o
+$(EXTRACT): src/sidextract_cli.c $(BUILD)/sid_rsid.o $(BUILD)/sidmeta.o \
+            $(BUILD)/sidvgm.o
 	$(CC) -o $@ $^ -static
 
 $(BUILD)/%.o: src/%.c | $(BUILD)
