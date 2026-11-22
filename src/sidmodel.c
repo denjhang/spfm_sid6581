@@ -245,16 +245,21 @@ static void voice_clock(sid_model_t *m, int idx, unsigned prev_acc)
 
 static void filter_update(sid_model_t *m)
 {
+    /* 11-bit cutoff. The two chips do not share a scale: the 6581's cutoff
+     * register is strongly non-linear and its bottom end is around 220 Hz, not
+     * near-DC, while the 8580 is close to linear up to ~12 kHz. A linear
+     * 6581 mapping makes any tune that parks the cutoff at 0 sound silent,
+     * which is how this was noticed (turboutrun writes $D416=$B0 with
+     * $D417=$07). Geometric interpolation between the two measured ends. */
     unsigned fc = (unsigned)m->fc_lo | ((unsigned)(m->fc_hi & 0x07) << 3);
     double hz;
     if (m->model8580)
-        hz = 30.0 + (double)fc * 6.6;      /* 8580: wider top end */
+        hz = 30.0 + (double)fc * 5.8;
     else
-        hz = 30.0 + (double)fc * 5.8;      /* 6581: ~30 Hz .. 12 kHz */
+        hz = 220.0 * pow(12000.0 / 220.0, (double)fc / 2047.0);
 
     double nyq = m->clock_hz * 0.5;
     if (hz > nyq * 0.45) hz = nyq * 0.45;
-    if (hz < 10.0) hz = 10.0;
 
     /* Chamberlin SVF coefficient. */
     m->f = 2.0 * sin(M_PI * hz / m->clock_hz);

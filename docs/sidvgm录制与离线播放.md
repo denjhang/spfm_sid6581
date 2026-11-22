@@ -75,14 +75,64 @@ dump 会打印：版本、EOF/GD3/data/额外头偏移、地区标记、tick 率
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--wav FILE` | — | 渲染成 16-bit 单声道 44.1 kHz WAV |
-| `--seconds N` | 整条流 | 播放时长；超过流长时会继续渲染，让最后一个音自然衰减 |
+| `--wav FILE` | — | 渲染成 16-bit 单声道 44.1 kHz WAV；多输入时自动加 `_1`、`_2` 后缀 |
+| `--seconds N` | 整条流 | 每首时长；超过流长时会继续渲染，让最后一个音自然衰减 |
 | `--start N` | 0 | 起始秒数；会把起点之前的写入全部快进应用一遍 |
+| `--subsong N` | 头部默认 | `.sid` 转换时的子曲序号，0 起 |
+| `--no-cache` | 关 | 不读也不写 `sid_cache\` |
 | `--8580` | 6581 | 换 8580 的滤波器曲线 |
 | `--no-filter` | 关 | 旁路滤波器，听原始波形 |
-| `--info` | — | 只打印头部 |
+| `--info` | — | 只打印头部，不播放 |
 
 `.sidreg` 也能直接喂给它，时钟按 PAL / 985248 Hz 处理。
+
+### 直接喂 `.sid`：自动转换
+
+```powershell
+.\build\sidvgmplay.exe sid\Golden_Axe.sid
+```
+
+`.sid` 会先跑一遍 6502 录成流，再交给同一个模型播放。默认录 180 秒
+（`.sid` 没有长度字段，总得挑一个），录完自动存到
+`sid_cache\<名字>_s<子曲>_d<秒>.sidvgm`，下次同一个文件直接读缓存：
+
+```
+[1/1] sid/Golden_Axe.sid
+  cached: sid_cache/Golden_Axe_s0_d180.sidvgm
+  title  : Golden Axe
+```
+
+换长度就改 `--seconds`，缓存文件名跟着变，互不覆盖；`--no-cache` 关掉
+读写缓存；子曲用 `--subsong N`（0 起）。
+
+### 列表播放
+
+给多个文件、或者给一个目录，就按顺序连播：
+
+```powershell
+# 两首
+.\build\sidvgmplay.exe ga.sidvgm rtype.sidvgm
+
+# 整个目录（.sid / .sidvgm / .sidreg 混在一起也行，按文件名排序）
+.\build\sidvgmplay.exe sid
+
+# 目录 + 每首 60 秒
+.\build\sidvgmplay.exe sid --seconds 60
+
+# 批量出 WAV，自动编号：pl_1.wav、pl_2.wav ...
+.\build\sidvgmplay.exe sid --wav pl.wav --seconds 60
+```
+
+播放中：
+
+| 键 | 作用 |
+|---|---|
+| `n` | 下一首（当前曲目立即切断） |
+| `b` | 上一首 |
+| `q` / `Esc` | 退出 |
+
+目录里混着 `.sid` 时，每首播放前先转换（仅首次），之后都走缓存。
+`--info` 只打印每首头部，不播放。
 
 > 这个模型是**听播放内容对不对**用的，不是芯片复刻：振荡器、ADSR（用 WebSid
 > 的 LFSR 阈值 + 指数延迟表）、脉冲宽度、噪声、环调、硬同步、状态变量滤波器
