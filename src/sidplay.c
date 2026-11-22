@@ -60,6 +60,20 @@ static sidplay_opts_t s_opt;
  * whatever cutoff a 6581-specific init wrote. Off by default - see --no-touch. */
 static int s_keep_filter = 0;
 
+/* Flush granularity, ported from Denjhang_Music_Player v16 (AY8910 window
+ * "Flush Mode"): 1 = register level (one USB transfer per register write),
+ * 2 = command level (buffer every write, ship the batch at each wait). The
+ * default is command level: a C64 play routine writes its whole frame in a
+ * burst, so one transfer per frame lands in the silence before the next frame.
+ * Register level is the tighter, more expensive setting for comparing timbre. */
+static int s_flush_mode = 2;
+
+/* Minimum wait (in sample ticks of the 735-sample PAL frame, reference units)
+ * before the batch is shipped mid-frame. Ported as-is; 1 = flush at every
+ * wait. It only matters for digi streams that interleave writes with short
+ * waits. */
+static int s_flush_threshold = 4;
+
 /* ------------------------------------------------------------------ */
 /* hardware                                                            */
 /* ------------------------------------------------------------------ */
@@ -333,6 +347,14 @@ static int load_stream(const char *path, int subsong, double seconds,
 /* the replay loop                                                     */
 /* ------------------------------------------------------------------ */
 
+/* Ship everything buffered. In register mode deferred flush is off, so each
+ * sid_write() has already pushed its own transfer; this is the frame-boundary
+ * flush for command mode and a no-op-by-then flush for register mode. */
+static void ship(void)
+{
+    sid_flush();
+}
+
 /* Emit one event. Every register is written straight through: the stream is
  * already in the order the original code produced it, and any reordering would
  * break the gate/reset sequences that produce percussion and digi samples. */
@@ -350,10 +372,12 @@ static void emit(const sid_event_t *e)
             return;
         if (e->reg == SID_REG_MODE_VOL) {
             sid_write(s_opt.slot, e->reg, (uint8_t)(e->val & SID_VOLUME_MASK));
+            if (s_flush_mode == 1) sid_flush();
             return;
         }
     }
     sid_write(s_opt.slot, e->reg, e->val);
+    if (s_flush_mode == 1) sid_flush();
 }
 
 /* Play a .sid forever, running the 6502 live.
@@ -393,8 +417,9 @@ static int stream_play_sid(const char *path, int subsong, double speed,
         sid_stream_close();
         return -1;
     }
-    sid_set_deferred_flush(true);
+    sid_set_deferred_flush(s_flush_mode == 2);
     for (size_t i = 0; i < n; i++) emit(&ev[i]);
+    ship();
 
     int64_t worst_lag_us = 0;
     double played_ms = 0.0;
@@ -409,7 +434,11 @@ static int stream_play_sid(const char *path, int subsong, double speed,
         for (size_t i = 0; i < n; i++) {
             int64_t due = start + (int64_t)(ev[i].t_ms * us_per_ms);
             if (due > spfm_now_us()) {
-                sid_flush();
+                /* Command mode: only ship the batch when the upcoming wait is
+                 * longer than the threshold, so a burst of writes stays in one
+                 * transfer; the frame boundary below always flushes. */
+                if (spfm_now_us() + (int64_t)s_flush_threshold * 1000000 / 44100 <= due)
+                    ship();
                 while (due > spfm_now_us()) {
                     int k = kb_take();
                     if (k) {
@@ -428,6 +457,7 @@ static int stream_play_sid(const char *path, int subsong, double speed,
             }
             emit(&ev[i]);
         }
+        sid_flush();          /* frame boundary: always ship */
 
         /* Interrupt check between frames as well: a sparse song may have no
          * event to wait on for hundreds of milliseconds. */
@@ -484,7 +514,7 @@ static int replay(const sid_event_t *ev, size_t n, double speed, int pace)
      * below lands in that silence and the bytes still reach the SID before the
      * next frame is due. Doing it per write instead would put 50 latency-timer
      * expiries inside one frame and the music would fall apart. */
-    sid_set_deferred_flush(true);
+    sid_set_deferred_flush(s_flush_mode == 2);
 
     for (size_t i = 0; i < n; i++) {
         int64_t due = start + (int64_t)(ev[i].t_ms * us_per_ms);
@@ -493,7 +523,8 @@ static int replay(const sid_event_t *ev, size_t n, double speed, int pace)
          * is emitted immediately so a stall turns into a bunch rather than a
          * permanent offset. */
         if (due > spfm_now_us()) {
-            sid_flush();      /* ship everything due so far, then block */
+            if (spfm_now_us() + (int64_t)s_flush_threshold * 1000000 / 44100 <= due)
+                ship();       /* ship what is due so far, then block */
             /* Interruptible wait: never sleep longer than a few ms, so a key
              * press takes effect straight away instead of at the next note. */
             while (due > spfm_now_us()) {
@@ -643,6 +674,18 @@ static int cmd_play(int argc, char **argv)
                 return 1;
             }
         }
+        else if (!strcmp(argv[i], "--timer") && i + 1 < argc) {
+            if (spfm_timer_set(argv[++i]) != 0) {
+                fprintf(stderr, "--timer must be hprec|hybrid|mmtimer|vgmplay\n");
+                return 1;
+            }
+        }
+        else if (!strcmp(argv[i], "--flush") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "register"))     s_flush_mode = 1;
+            else if (!strcmp(m, "command"))  s_flush_mode = 2;
+            else { fprintf(stderr, "--flush must be register|command\n"); return 1; }
+        }
         else if (!strcmp(argv[i], "--pace"))                    pace = 1;
         else if (argv[i][0] == '-') {
             fprintf(stderr, "unknown option '%s'\n", argv[i]);
@@ -652,7 +695,9 @@ static int cmd_play(int argc, char **argv)
 
     if (!path) {
         fprintf(stderr, "usage: sidplay <file.sid|file.sidreg> [options]\n"
-                        "  --proto 1step|2step   write protocol (default 2step)\n"
+                        "  --timer hprec|hybrid|mmtimer|vgmplay  wait primitive\n"
+                        "  --flush register|command   USB flush granularity\n"
+                        "  --proto 1step|2step   write protocol\n"
                         "  --seconds N  --subsong N  --speed X  --no-cache\n");
         return 1;
     }
@@ -683,8 +728,10 @@ static int cmd_play(int argc, char **argv)
         if (hw_connect() != 0) { stream_free(&st); return 1; }
         sid_clear_all_regs(s_opt.slot);
         sid_flush();
+        spfm_thread_boost_begin();
         kb_start();
         int rc = replay(st.events, st.count, speed, pace);
+        spfm_thread_boost_end();
         hw_mute();
         hw_disconnect();
         stream_free(&st);
@@ -714,6 +761,7 @@ static int cmd_play(int argc, char **argv)
      * init writes define the chip. */
     sid_clear_all_regs(s_opt.slot);
     sid_flush();
+    spfm_thread_boost_begin();
     kb_start();
 
     int rc;
@@ -733,6 +781,7 @@ static int cmd_play(int argc, char **argv)
         rc = stream_play_sid(path, subsong, speed, &info);
     }
 
+    spfm_thread_boost_end();
     hw_mute();
     hw_disconnect();
     return (rc < 0) ? 1 : 0;
@@ -820,6 +869,18 @@ static int cmd_playlist(int argc, char **argv)
                 return 1;
             }
         }
+        else if (!strcmp(argv[i], "--timer") && i + 1 < argc) {
+            if (spfm_timer_set(argv[++i]) != 0) {
+                fprintf(stderr, "--timer must be hprec|hybrid|mmtimer|vgmplay\n");
+                return 1;
+            }
+        }
+        else if (!strcmp(argv[i], "--flush") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "register"))     s_flush_mode = 1;
+            else if (!strcmp(m, "command"))  s_flush_mode = 2;
+            else { fprintf(stderr, "--flush must be register|command\n"); return 1; }
+        }
         else if (argv[i][0] == '-') {
             fprintf(stderr, "unknown option '%s'\n", argv[i]);
             return 1;
@@ -836,12 +897,15 @@ static int cmd_playlist(int argc, char **argv)
 
     if (hw_connect() != 0) { free(files); return 1; }
 
+    spfm_thread_boost_begin();
     kb_start();
 
     printf("\n%d files in %s\n", nfiles, dir);
     printf("each track plays until you press a key.  "
            "[n] next   [b] back   [,] prev subsong   [.] next subsong   [q] quit\n");
-    printf("write protocol: %s\n\n", sidplay_proto_name());
+    printf("write protocol: %s   timer: %s   flush: %s\n\n",
+           sidplay_proto_name(), spfm_timer_name(),
+           s_flush_mode == 1 ? "register" : "command");
 
     int idx = start_idx < 0 ? 0 : (start_idx >= nfiles ? nfiles - 1 : start_idx);
 
@@ -905,6 +969,7 @@ static int cmd_playlist(int argc, char **argv)
     }
 
     printf("\nplaylist end\n");
+    spfm_thread_boost_end();
     hw_disconnect();
     free(files);
     return 0;

@@ -98,6 +98,34 @@ void spfm_write_phased(uint8_t slot, uint8_t addr, uint8_t data, uint32_t gap);
 /* Append n NOP bytes (0x80), each costs one firmware loop tick. */
 void spfm_nop(uint32_t n);
 
+/* ---- wait timer modes ------------------------------------------------ *
+ * Ported from Denjhang_Music_Player v16 (windows/ym2608/ym2608_window.cpp
+ * timer_sleep_1ms / sleep_hybrid_us / sleep_mm_timer_us and
+ * windows/gigatron/winmm.c thread priority):
+ *
+ *   0  hprec  waitable timer + spin (default)
+ *   1  hybrid Sleep() for the bulk, busy-wait the last millisecond
+ *   2  mmtimer timeSetEvent(1 ms, TIME_PERIODIC) event
+ *   3  vgmplay 1 ms periodic timer, no spin (reference "VGMPlay" mode)
+ *
+ * hprec/hybrid/mmtimer also describe the sleep used between events; vgmplay
+ * only changes the wait primitive so it can be told apart. */
+#define SPFM_TIMER_HPREC   0
+#define SPFM_TIMER_HYBRID  1
+#define SPFM_TIMER_MMTIMER 2
+#define SPFM_TIMER_VGMPLAY 3
+
+/* Returns 0 if the name was recognised. */
+int         spfm_timer_set(const char *name);
+const char *spfm_timer_name(void);
+int         spfm_timer_mode(void);
+
+/* Thread priority boost for the thread that calls this (playback thread).
+ * THREAD_PRIORITY_HIGHEST, plus opt-out of Windows power throttling where the
+ * OS supports it, so a foreground window cannot starve the USB pacing. */
+void spfm_thread_boost_begin(void);
+void spfm_thread_boost_end(void);
+
 /* Push everything buffered to USB. Returns false on write error. */
 bool spfm_flush(void);
 

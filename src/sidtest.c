@@ -1997,6 +1997,9 @@ static int strip_common_opts(char **argv, int argc)
             if (sidplay_set_proto(argv[r + 1]) != 0)
                 fprintf(stderr, "--proto must be 1step or 2step\n");
             consumed = 2;
+        } else if (!strcmp(argv[r], "--timer") && r + 1 < argc) {
+            /* Leave an invalid value in place so the subcommand reports it. */
+            if (spfm_timer_set(argv[r + 1]) == 0) consumed = 2;
         } else if (!strcmp(argv[r], "--single")) {
             sid_set_write_repeat(1);
             consumed = 1;
@@ -2025,6 +2028,8 @@ static void usage(void)
         "path-a-soft | split\n"
         "  --proto P       1step | 2step: the write protocol used for playback\n"
         "                  (2step = two Path B commands, 1step = one Path A)\n"
+        "  --timer T       hprec | hybrid | mmtimer | vgmplay: wait primitive\n"
+        "  --flush G       register | command: USB flush granularity\n"
         "  --delay US      per-write host sleep (default 0)\n"
         "  --repeat N      send each write N times (default 1)\n"
         "  --gap N         NOP ticks between phases (default 0)\n"
@@ -2125,6 +2130,12 @@ int main(int argc, char **argv)
                 fprintf(stderr, "--proto must be 1step or 2step\n");
                 return 1;
             }
+        } else if (!strcmp(argv[i], "--timer") && i + 1 < argc) {
+            if (spfm_timer_set(argv[i + 1]) != 0) {
+                fprintf(stderr, "--timer must be hprec|hybrid|mmtimer|vgmplay\n");
+                return 1;
+            }
+            i++;
         } else if (!strcmp(argv[i], "--verbose")) {
             g_verbose = 1;
             sid_set_write_hook(hook_print, NULL);

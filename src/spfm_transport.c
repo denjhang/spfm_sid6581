@@ -32,6 +32,20 @@ static size_t    s_cap_cap = 0;
 
 #ifdef _WIN32
 static bool      s_timer_res_raised = false;
+static bool      s_boosted = false;
+
+/* Wait primitive selection, ported from Denjhang_Music_Player v16
+ * (windows/ym2608/ym2608_window.cpp timer_sleep_1ms and
+ * windows/gigatron/winmm.c audio-thread boost). Default is H-Prec: a
+ * persistent high-resolution waitable timer, which is the one mode the
+ * reference gets wrong (it recreates a default-resolution timer per call). */
+static int       s_timer_mode = SPFM_TIMER_HPREC;
+static HANDLE    s_hires_timer = NULL;   /* persistent, high-resolution */
+static HANDLE    s_mm_event = NULL;      /* vgmplay: periodic 1 ms timer event */
+static MMRESULT  s_mm_timer = 0;
+
+static void     disable_power_throttling(void);
+static HANDLE   hires_timer_create(void);
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -126,6 +140,13 @@ int spfm_open(int dev_index)
 #ifdef _WIN32
     timeBeginPeriod(1);
     s_timer_res_raised = true;
+
+    /* Keep the process out of EcoQoS and give the wait primitive a
+     * high-resolution timer. Without the first, Windows demotes the playback
+     * thread the moment the window goes to the background, which is precisely
+     * the "switch window and SPFM stutters" report. */
+    disable_power_throttling();
+    if (!s_hires_timer) s_hires_timer = hires_timer_create();
 #endif
 
     /* Same DTR/RTS dance the reference driver does before the first byte. */
@@ -158,6 +179,9 @@ void spfm_close(void)
         timeEndPeriod(1);
         s_timer_res_raised = false;
     }
+    if (s_mm_timer) { timeKillEvent(s_mm_timer); s_mm_timer = 0; }
+    if (s_mm_event) { CloseHandle(s_mm_event); s_mm_event = NULL; }
+    if (s_hires_timer) { CloseHandle(s_hires_timer); s_hires_timer = NULL; }
 #endif
 }
 
@@ -307,6 +331,174 @@ bool spfm_flush(void)
 /* ------------------------------------------------------------------ */
 /* delays                                                              */
 /* ------------------------------------------------------------------ */
+
+#ifdef _WIN32
+/* CreateWaitableTimerExW is not in the MinGW import headers unless a newer
+ * _WIN32_WINNT is set, and the high-resolution flag has no constant, so both
+ * are resolved at runtime. */
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+typedef HANDLE (WINAPI *create_waitable_timer_ex_w_t)(
+    LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
+
+static HANDLE hires_timer_create(void)
+{
+    HANDLE h = NULL;
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    if (k32) {
+        create_waitable_timer_ex_w_t fn = (create_waitable_timer_ex_w_t)
+            (void *)GetProcAddress(k32, "CreateWaitableTimerExW");
+        if (fn)
+            h = fn(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                   TIMER_ALL_ACCESS);
+    }
+    if (!h) h = CreateWaitableTimerW(NULL, FALSE, NULL);
+    return h;
+}
+
+/* Reference: sleep_hybrid_us() in ym2608_window.cpp - Sleep() for the bulk,
+ * busy-wait the last millisecond. */
+static void sleep_hybrid_us(uint32_t us)
+{
+    LARGE_INTEGER freq, start, now;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&start);
+    LONGLONG target = start.QuadPart + (freq.QuadPart * (LONGLONG)us) / 1000000;
+    if (us > 1000) Sleep((us - 1000) / 1000);
+    do { QueryPerformanceCounter(&now); } while (now.QuadPart < target);
+}
+
+/* Reference: sleep_mm_timer_us() in ym2608_window.cpp - timeSetEvent one-shot
+ * with TIME_CALLBACK_EVENT_SET, wait on the event. */
+static void sleep_mm_timer_us(uint32_t us)
+{
+    unsigned ms = us / 1000;
+    if (ms < 1) ms = 1;
+    HANDLE ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!ev) { Sleep(ms); return; }
+    MMRESULT tid = timeSetEvent(ms, 1, (LPTIMECALLBACK)ev, 0,
+                                TIME_ONESHOT | TIME_CALLBACK_EVENT_SET);
+    if (tid) {
+        WaitForSingleObject(ev, us / 1000 + 20);
+        timeKillEvent(tid);
+    } else {
+        Sleep(ms);
+    }
+    CloseHandle(ev);
+}
+
+/* H-Prec: persistent high-resolution waitable timer. The reference recreates a
+ * default-resolution timer on every call (CreateWaitableTimer + SetWaitableTimer
+ * inside sleep_precise_us), which costs a kernel object per sleep and inherits
+ * the 15.6 ms tick; a single high-resolution timer created once does the same
+ * job for the whole session. */
+static void sleep_hprec_us(uint32_t us)
+{
+    if (!s_hires_timer) { Sleep(us / 1000); return; }
+    LARGE_INTEGER due;
+    due.QuadPart = -((LONGLONG)us * 10);          /* 100 ns units, relative */
+    if (!SetWaitableTimer(s_hires_timer, &due, 0, NULL, NULL, FALSE)) {
+        Sleep(us / 1000);
+        return;
+    }
+    WaitForSingleObject(s_hires_timer, us / 1000 + 20);
+}
+
+/* VGMPlay: 1 ms periodic multimedia timer driving an auto-reset event. */
+static void sleep_vgmplay_us(uint32_t us)
+{
+    if (!s_mm_event) {
+        s_mm_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+        if (s_mm_event)
+            s_mm_timer = timeSetEvent(1, 1, (LPTIMECALLBACK)s_mm_event, 0,
+                                      TIME_PERIODIC | TIME_CALLBACK_EVENT_SET);
+    }
+    if (!s_mm_timer) { Sleep((us + 999) / 1000); return; }
+    DWORD ms = (us + 999) / 1000;
+    WaitForSingleObject(s_mm_event, ms ? ms : 1);
+}
+#endif /* _WIN32 */
+
+int spfm_timer_set(const char *name)
+{
+    if (!name) return -1;
+    if (!strcmp(name, "hprec") || !strcmp(name, "h-prec") || !strcmp(name, "0"))
+        s_timer_mode = SPFM_TIMER_HPREC;
+    else if (!strcmp(name, "hybrid") || !strcmp(name, "1"))
+        s_timer_mode = SPFM_TIMER_HYBRID;
+    else if (!strcmp(name, "mmtimer") || !strcmp(name, "mm-timer") || !strcmp(name, "2"))
+        s_timer_mode = SPFM_TIMER_MMTIMER;
+    else if (!strcmp(name, "vgmplay") || !strcmp(name, "3"))
+        s_timer_mode = SPFM_TIMER_VGMPLAY;
+    else
+        return -1;
+    return 0;
+}
+
+const char *spfm_timer_name(void)
+{
+    switch (s_timer_mode) {
+    case SPFM_TIMER_HYBRID:  return "hybrid";
+    case SPFM_TIMER_MMTIMER: return "mmtimer";
+    case SPFM_TIMER_VGMPLAY: return "vgmplay";
+    default:                 return "hprec";
+    }
+}
+
+int spfm_timer_mode(void) { return s_timer_mode; }
+
+void spfm_thread_boost_begin(void)
+{
+#ifdef _WIN32
+    /* MMCSS "Pro Audio" is what keeps a playback thread scheduled while a
+     * foreground window owns the CPU; fall back to the highest priority. */
+    typedef HANDLE (WINAPI *av_set_mm_thread_t)(LPCWSTR, LPDWORD, LPDWORD);
+    HMODULE avrt = LoadLibraryW(L"avrt.dll");
+    if (avrt) {
+        av_set_mm_thread_t fn = (av_set_mm_thread_t)
+            (void *)GetProcAddress(avrt, "AvSetMmThreadCharacteristicsW");
+        DWORD idx = 0;
+        if (fn && fn(L"Pro Audio", &idx, &idx)) { s_boosted = true; return; }
+        FreeLibrary(avrt);
+    }
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    s_boosted = true;
+#endif
+}
+
+void spfm_thread_boost_end(void)
+{
+#ifdef _WIN32
+    if (s_boosted) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+    s_boosted = false;
+#endif
+}
+
+/* Exclude this process from Windows power throttling (EcoQoS), which otherwise
+ * drops the playback thread's scheduling class as soon as the window is in the
+ * background - exactly the "switch window and the SPFM stutters" symptom.
+ * SetProcessInformation is resolved at runtime: MinGW only imports it when
+ * _WIN32_WINNT >= 0x0602, and this build targets plain Win32. */
+static void disable_power_throttling(void)
+{
+#ifdef _WIN32
+    typedef BOOL (WINAPI *set_process_information_t)(
+        HANDLE, int, void *, DWORD);
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    if (!k32) return;
+    set_process_information_t fn = (set_process_information_t)
+        (void *)GetProcAddress(k32, "SetProcessInformation");
+    if (!fn) return;
+    PROCESS_POWER_THROTTLING_STATE st;
+    st.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    st.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED |
+                     PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+    st.StateMask = 0;
+    fn(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, &st, sizeof st);
+#endif
+}
+
 void spfm_delay_ms(uint32_t ms)
 {
     if (s_dry_run) return;
@@ -321,16 +513,12 @@ void spfm_delay_us(uint32_t us)
 {
     if (s_dry_run) return;
 #ifdef _WIN32
-    if (us >= 1000) {
-        Sleep(us / 1000);
-        return;
+    switch (s_timer_mode) {
+    case SPFM_TIMER_HYBRID:  sleep_hybrid_us(us); break;
+    case SPFM_TIMER_MMTIMER: sleep_mm_timer_us(us); break;
+    case SPFM_TIMER_VGMPLAY: sleep_vgmplay_us(us); break;
+    default:                 sleep_hprec_us(us); break;
     }
-    LARGE_INTEGER freq, start, now;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&start);
-    double ticks = (double)us * (double)freq.QuadPart / 1e6;
-    do { QueryPerformanceCounter(&now); }
-    while ((double)(now.QuadPart - start.QuadPart) < ticks);
 #else
     usleep(us);
 #endif
@@ -357,16 +545,18 @@ void spfm_wait_until_us(int64_t deadline_us)
 {
     if (s_dry_run) return;
 
-    /* Hybrid wait, the same shape as sleep_hybrid_us() in the reference
-     * player (Denjhang_Music_Player, ym2608_window.cpp): Sleep() for the bulk,
-     * busy-wait the last millisecond.
+    /* Absolute-deadline wait. The shape mirrors libvgm's playback model: the
+     * clock is read every pass and the stream is emitted up to "now", so a
+     * late wake-up bunches the writes instead of shifting the whole song.
      *
-     * Sleep() alone cannot pace a 20 ms frame: Windows rounds it up to the
-     * scheduler tick, 15.6 ms by default, so "sleep 8 ms" can block for 15.
-     * spfm_open() raises the timer resolution to 1 ms with timeBeginPeriod,
-     * which makes the bulk sleep land within about a millisecond; the spin then
-     * removes the remainder. The loop re-reads the clock each pass, so the wait
-     * always targets an absolute deadline rather than accumulating drift. */
+     * The last hop uses the selected timer primitive (spfm_delay_us), which is
+     * H-Prec by default: a persistent high-resolution waitable timer. Sleep()
+     * alone would round a 4 ms wait up to the 15.6 ms default tick; the 1 ms
+     * timeBeginPeriod in spfm_open() plus a high-resolution timer removes that.
+     *
+     * vgmplay mode deliberately does not spin - it waits on the 1 ms periodic
+     * timer event, which is what the reference "VGMPlay" mode does and keeps
+     * the CPU idle at the cost of ~1 ms jitter. */
     for (;;) {
         int64_t left = deadline_us - spfm_now_us();
         if (left <= 0) return;
