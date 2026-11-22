@@ -17,6 +17,8 @@ SID 6581 / 8580 挂到 SPFM 并行总线的驱动 + 控制台冒烟测试。
 | [docs/交接文档.md](docs/交接文档.md) | 项目状态、寄存器速查、风险清单 |
 | [docs/驱动说明.md](docs/驱动说明.md) | 驱动 API、写模式、字节流验证方法 |
 | [docs/播放器使用说明.md](docs/播放器使用说明.md) | **PowerShell 用法**：`sidplay`/`sidlist`/`sidextract`、定时器与发送粒度、排错 |
+| [docs/sidvgm文件规范.md](docs/sidvgm文件规范.md) | **格式规范**：VGM 式容器、相对偏移、0x65/66/67 芯片 ID、0x41/42/43 写命令、GD3 |
+| [docs/sidvgm录制与离线播放.md](docs/sidvgm录制与离线播放.md) | **录制 + 软件 SID 模型播放**：`sidextract` 出 sidvgm、`sidvgmplay` 出 WAV/出声 |
 
 ## 当前状态
 
