@@ -174,15 +174,23 @@ sidtest.exe sidplay sid/rsid/Anthrox_2SID.sid --slot2 1
 | | `.sidreg` | `.sidvgm` |
 |---|---|---|
 | 形态 | 文本，`<ms> <reg> <val> [sid]` | 二进制，VGM 式头 + 命令流 + GD3 |
-| 时间基 | 浮点毫秒 | 整数 tick = 一个 PHI2 周期 |
-| 元数据 | 无 | 标题/作者/年份/格式/子曲/芯片型号 |
-| 循环点 | 无 | 头部可表达（现在恒为 0） |
-| 体积 | 2330 条 = 38 KB | 同一条数 = 9.6 KB |
+| 时间基 | 浮点毫秒 | 整数 tick（1/44100 s，与 VGM 一致） |
+| 元数据 | 无 | 标题/作者/年份/格式/子曲 |
+| 循环点 | 无 | 头部 `0x1C`/`0x20` 结构就位（录制阶段填 0） |
+| 体积 | 2330 条 = 38 KB | 同一条数 = 8.4 KB |
 
-规范在 [docs/sidvgm文件规范.md](docs/sidvgm文件规范.md)：头字段位置、相对偏移、
-额外头的芯片时钟表、`0x69/0x6A/0x6B` 写命令、`0x61` 等待、`0x66` 结束、GD3
-UTF-16 标签全部照 libvgm 的读法，只有"写 SID 寄存器"这三个操作码是本格式新定的
-（libvgm 里没有 SID 设备，`DEVID_*` 到 0x29 为止）。
+规范在 [docs/sidvgm文件规范.md](docs/sidvgm文件规范.md)。结构完全按 VGM：相对
+偏移、`0x61` 等待、`0x66` 结束跳循环、额外头的芯片时钟表、GD3 UTF-16 标签都
+照 libvgm 的读法。
+
+SID 芯片用 **0x65 / 0x66 / 0x67** 三个独立类型号（libvgm 的 `DEVID_*` 只到
+0x29，正好空着），写命令用 **0x41 / 0x42 / 0x43**——VGM 命令表里这一段本来就
+是"未知、长度 3"，形状恰好是 opcode+reg+data。标准 VGM 播放器会按长度安静跳过，
+认识 SID 的分支播放器按寄存器写处理。**不追求现有 vgmplay 直接播放**：SID 是
+新芯片类型，由分支播放器和分支工具解析。
+
+时间基是 VGM 硬编码的 **44100 tick/秒**；主头 `0x24` 只是地区标记（PAL 50 /
+NTSC 60），不是采样率——把它填成 SID 的 PHI2 频率会让播放速度快 22 倍。
 
 ```cmd
 build\sidextract.exe sid/Golden_Axe.sid out.sidvgm --seconds 120

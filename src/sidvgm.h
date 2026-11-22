@@ -31,22 +31,31 @@ extern "C" {
  * the extra header or command data. */
 #define SIDVGM_MAIN_HDR 0xC0
 
-/* Chip type codes used in the extra header's clock table. They occupy the gap
- * between libvgm's last device (0x29 MIKEY) and 0xFF, so a VGM reader that
- * ever grew SID support would not collide with an existing ID. */
-#define SIDVGM_CHIP_6581 0x50
-#define SIDVGM_CHIP_8580 0x51
-#define SIDVGM_CHIP_ANY  0x52
+/* Chip type codes for the three SID sockets. libvgm's DEVID_* space runs
+ * 0x00..0x29 with _CHIP_COUNT = 0x2A, so anything above that is free and is
+ * resolved by the branch player that understands SID. One code per socket so
+ * the extra header's per-type clock lookup stays unambiguous. */
+#define SIDVGM_CHIP_SID0 0x65
+#define SIDVGM_CHIP_SID1 0x66
+#define SIDVGM_CHIP_SID2 0x67
 
-/* Command opcodes. Deliberately not VGM's 0x50-0x5F block: those are taken by
- * SN76489/YM writes, and a file that looks half-playable on a VGM player is a
- * worse outcome than one that is obviously a different format. */
-#define SIDVGM_CMD_WRITE0 0x69
-#define SIDVGM_CMD_WRITE1 0x6A
-#define SIDVGM_CMD_WRITE2 0x6B
+/* Command opcodes. VGM's 0x41..0x4E are "unknown, length 3" slots - exactly
+ * the shape a SID write needs (opcode, reg, data) - so the three writes take
+ * the first three of them. A stock libvgm player skips them by their declared
+ * length instead of aborting, which is the least-surprising behaviour for a
+ * format it does not know. */
+#define SIDVGM_CMD_WRITE0 0x41
+#define SIDVGM_CMD_WRITE1 0x42
+#define SIDVGM_CMD_WRITE2 0x43
 #define SIDVGM_CMD_WAIT   0x61
 #define SIDVGM_CMD_DATA   0x67
 #define SIDVGM_CMD_END    0x66
+
+/* VGM's tick base. Not the recording sample rate: every wait count in the
+ * file is in units of 1/44100 s, and 0x24 is only a region tag (50 PAL,
+ * 60 NTSC, 0 = no rate scaling). libvgm hardcodes this: vgmplayer.cpp's
+ * RefreshTSRates sets _tsDiv = 44100 unconditionally. */
+#define SIDVGM_TICK_HZ 44100
 
 /* Write a stream. `info` may be NULL, in which case the header carries no
  * chip model, no subsong count and a single 6581 chip. `comment` may be NULL.

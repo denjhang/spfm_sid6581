@@ -89,9 +89,12 @@ static int buf_u8(buf_t *b, unsigned v)
     return buf_put(b, &c, 1);
 }
 
-static unsigned long tick_for(const sid_event_t *e, double rate)
+/* Milliseconds -> VGM ticks. Ticks are 1/44100 s regardless of the SID clock;
+ * t_ms is absolute from song start, so a per-event conversion to a whole tick
+ * is exact and cannot drift. */
+static unsigned long tick_for(const sid_event_t *e)
 {
-    double t = e->t_ms * rate / 1000.0;
+    double t = e->t_ms * (SIDVGM_TICK_HZ / 1000.0);
     if (t <= 0.0) return 0;
     return (unsigned long)(t + 0.5);
 }
@@ -112,12 +115,15 @@ int sidvgm_write(const char *path, const sid_event_t *ev, size_t n,
 {
     if (!path || (!ev && n)) return -1;
 
-    double rate = 985248.0;
-    int chip_model = SIDVGM_CHIP_ANY;
+    /* The SID's own clock still decides the chip config and the GD3 comment;
+     * it is NOT the file's tick rate. Ticks are 1/44100 s, full stop. */
+    double sid_clock = 985248.0;
+    int pal = 1;
     unsigned n_chips = 1;
 
     if (info) {
-        if (info->clock_hz > 0.0) rate = info->clock_hz;
+        if (info->clock_hz > 0.0) sid_clock = info->clock_hz;
+        pal = info->pal;
         if (info->n_sids > n_chips) n_chips = info->n_sids;
     }
     /* Whatever the header claims, never declare fewer chips than the stream
@@ -127,14 +133,13 @@ int sidvgm_write(const char *path, const sid_event_t *ev, size_t n,
         if ((unsigned)ev[i].sid + 1 > n_chips) n_chips = (unsigned)ev[i].sid + 1;
     if (n_chips > 3) n_chips = 3;
 
-    if (info && (info->flags & 0x30) == 0x10) chip_model = SIDVGM_CHIP_6581;
-    else if (info && (info->flags & 0x30) == 0x20) chip_model = SIDVGM_CHIP_8580;
-
-    /* ---- command stream ---- */
+    /* ---- command stream ----
+     * t_ms is absolute from song start, so mapping straight to whole ticks
+     * cannot accumulate drift the way a per-frame accumulator would. */
     buf_t cmd = { 0 };
     unsigned long tick = 0;
     for (size_t i = 0; i < n; i++) {
-        unsigned long t = tick_for(&ev[i], rate);
+        unsigned long t = tick_for(&ev[i]);
         if (t < tick) t = tick;            /* defensive: never run backwards */
         unsigned long delta = t - tick;
         while (delta > 0) {
@@ -216,7 +221,8 @@ int sidvgm_write(const char *path, const sid_event_t *ev, size_t n,
     put_u32(out.p + 0x18, tick);                 /* total ticks */
     put_u32(out.p + 0x1C, 0);                    /* no loop point in a .sid */
     put_u32(out.p + 0x20, 0);
-    put_u32(out.p + 0x24, (unsigned long)rate);
+    put_u32(out.p + 0x24, pal ? 50 : 60);        /* recordHz: region tag, */
+                                                 /* not a sample rate (see .h) */
     put_u32(out.p + 0x34, data_pos - 0x34);
     out.p[0x7C] = 0;                             /* no volume modifier */
     out.p[0x7E] = 0;                             /* loop base 0 */
@@ -233,12 +239,14 @@ int sidvgm_write(const char *path, const sid_event_t *ev, size_t n,
         if (buf_put(&out, x, 12) != 0) goto fail_out;
     }
 
-    /* clock table */
+    /* clock table: one entry per SID socket, each its own chip type, so a reader
+     * that resolves types by lookup never has to disambiguate two chips of the
+     * same type. libvgm's GetChipClock() walks this table by type. */
     if (buf_u8(&out, n_chips) != 0) goto fail_out;
     for (unsigned i = 0; i < n_chips; i++) {
         unsigned char e[5];
-        e[0] = (unsigned char)chip_model;
-        put_u32(e + 1, (unsigned long)rate);
+        e[0] = (unsigned char)(SIDVGM_CHIP_SID0 + i);
+        put_u32(e + 1, (unsigned long)sid_clock);
         if (buf_put(&out, e, 5) != 0) goto fail_out;
     }
 
@@ -331,21 +339,40 @@ int sidvgm_read(const char *path, sid_event_t **ev_out, size_t *n_out,
     unsigned long data_pos = rel_ofs(0x34, get_u32(d + 0x34));
     if (data_pos < SIDVGM_MAIN_HDR || data_pos >= eof_pos) { free(d); return -1; }
 
-    unsigned long rate = get_u32(d + 0x24);
-    if (!rate) { free(d); return -1; }
+    /* 0x24 is the region tag (50 PAL / 60 NTSC / 0 = no scaling), not a rate.
+     * libvgm hardcodes ticks at 44100 (RefreshTSRates: _tsDiv = 44100). */
+    unsigned long region = get_u32(d + 0x24);
 
     if (info) {
         memset(info, 0, sizeof *info);
-        info->clock_hz = (double)rate;
-        /* PHI2: PAL is 985248 Hz, NTSC 1022730 Hz. Anything under 1 MHz is PAL
-         * (the SID's own 1.0 MHz nominal clock differs by region). */
-        info->pal = (rate < 1000000ul) ? 1 : 0;
+        info->pal = (region == 0 || region == 50) ? 1 : 0;
         info->vsync_hz = info->pal ? 50.125 : 60.0;
+        info->clock_hz = info->pal ? 985248.0 : 1022730.0;
         info->n_songs = 1;
         info->start_song = 1;
-        info->n_sids = 1;
+        info->n_sids = 0;
         info->sid_addr[0] = 0xD400;
         info->is_rsid = 0;
+
+        /* The clock table names the chips; count how many SID sockets exist and
+         * take the clock from the first entry. */
+        unsigned long extra_pos = rel_ofs(0xBC, get_u32(d + 0xBC));
+        if (extra_pos && extra_pos + 0x0C <= filelen) {
+            unsigned long clk = rel_ofs(extra_pos + 0x04, get_u32(d + extra_pos + 0x04));
+            if (clk + 1 <= filelen) {
+                unsigned cnt = d[clk];
+                for (unsigned i = 0; i < cnt && clk + 1 + 5 * i + 5 <= filelen; i++) {
+                    unsigned type = d[clk + 1 + 5 * i];
+                    if (type >= SIDVGM_CHIP_SID0 &&
+                        type <= SIDVGM_CHIP_SID2 && info->n_sids < 3) {
+                        if (!info->n_sids)
+                            info->clock_hz = (double)get_u32(d + clk + 1 + 5 * i + 1);
+                        info->n_sids++;
+                    }
+                }
+            }
+        }
+        if (!info->n_sids) info->n_sids = 1;
 
         char tmp[64];
         size_t glen = gd3_pos ? (size_t)(eof_pos - gd3_pos) : 0;
@@ -364,7 +391,7 @@ int sidvgm_read(const char *path, sid_event_t **ev_out, size_t *n_out,
 
     unsigned long p = data_pos;
     unsigned long tick = 0;
-    double ms_per_tick = 1000.0 / (double)rate;
+    double ms_per_tick = 1000.0 / (double)SIDVGM_TICK_HZ;
     int done = 0;
 
     while (p < eof_pos && !done) {
@@ -462,7 +489,10 @@ int sidvgm_dump(FILE *out, const char *path, unsigned max_cmds)
     fprintf(out, "  gd3       : +0x%lX\n", gd3_pos);
     fprintf(out, "  data      : +0x%lX\n", data_pos);
     fprintf(out, "  extra     : +0x%lX\n", extra_pos);
-    fprintf(out, "  rate      : %lu Hz (PHI2)\n", get_u32(d + 0x24));
+    fprintf(out, "  region    : %lu (%s)\n",
+            get_u32(d + 0x24), get_u32(d + 0x24) == 50 ? "PAL" :
+                               get_u32(d + 0x24) == 60 ? "NTSC" : "none");
+    fprintf(out, "  tick rate : %d Hz (VGM fixed)\n", SIDVGM_TICK_HZ);
     fprintf(out, "  ticks     : %lu\n", get_u32(d + 0x18));
     fprintf(out, "  loop      : ofs %lu, ticks %lu\n",
             get_u32(d + 0x1C), get_u32(d + 0x20));
@@ -478,9 +508,8 @@ int sidvgm_dump(FILE *out, const char *path, unsigned max_cmds)
             for (unsigned i = 0; i < cnt && clk + 1 + 5 * i + 5 <= filelen; i++) {
                 unsigned type = d[clk + 1 + 5 * i];
                 unsigned long hz = get_u32(d + clk + 1 + 5 * i + 1);
-                const char *nm = type == SIDVGM_CHIP_6581 ? "6581" :
-                                 type == SIDVGM_CHIP_8580 ? "8580" : "SID";
-                fprintf(out, "    #%u %s @ %lu Hz\n", i, nm, hz);
+                fprintf(out, "    SID%u  type 0x%02X @ %lu Hz\n",
+                        type - SIDVGM_CHIP_SID0, type, hz);
             }
         }
     }
