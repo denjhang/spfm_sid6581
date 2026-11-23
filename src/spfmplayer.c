@@ -763,9 +763,9 @@ static void usage(void)
     printf("  --device N      FTDI device index (default 0)\n");
     printf("  --engine E      .sid recorder: lsfp (default) | native\n");
     printf("                  lsfp   = libsidplayfp: digi drums and the real\n");
-    printf("                           CIA/VIC interrupt cadence\n");
-    printf("                  native = built-in 6502: one play() per frame, so\n");
-    printf("                           in-frame $D418 writes are lost\n");
+    printf("                           CIA/VIC cadence; needed for digi + RSID\n");
+    printf("                  native = built-in 6502 (pure C). No in-frame\n");
+    printf("                           $D418, but plain PSID sounds better\n");
     printf("  --proto P       write protocol: 1step (default) | 2step\n");
     printf("  --flush M       USB flush granularity: command (default) | register\n");
     printf("  --loop N        repeat a buffered stream N times (0 = once, -1 = forever)\n");
