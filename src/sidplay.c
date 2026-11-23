@@ -75,6 +75,53 @@ static int s_flush_mode = 2;
  * waits. */
 static int s_flush_threshold = 4;
 
+/* Override for the above, in microseconds; -1 keeps the tick default.
+ *
+ * This is the knob that decides how many USB transfers a digi tune costs. A
+ * C64 digi writes $D418 every ~136 us, which is longer than the 91 us default,
+ * so nearly every sample triggers a transfer: Giana subsong 1 ends up at 6217
+ * FT_Write/s averaging 4.6 bytes. FT232R cannot do that - one bulk transaction
+ * per 1 ms USB frame puts the practical ceiling near 1000/s - so the driver
+ * queues, USB frame-granular clumps come out, and the drum loses its
+ * sub-millisecond structure.
+ *
+ * 0 is an alias for "one transfer per C64 frame" (20 ms). Anything else is the
+ * shortest stretch of stream time worth one USB transfer. */
+static int s_flush_gap_us = -1;
+
+/* True when the batch sitting in the buffer should go out now.
+ *
+ * With no --flush-gap this is the original rule: ship only when the next event
+ * is far enough away that a transfer's cost is paid back. That is what every
+ * PSID path has always done and it must not change.
+ *
+ * With --flush-gap MS it becomes "never let a byte sit for more than MS": the
+ * batch also goes out once it has spanned that much of stream time. Dense digi
+ * passages need that - their events are 136 us apart, so the old rule fires on
+ * nearly every one of them and asks for 6000+ transfers/s, which is 6x what
+ * FT232R can schedule (one bulk transaction per 1 ms USB frame). The bytes then
+ * queue inside the driver and come out in 1-2 ms clumps, which is exactly the
+ * "muffled, sounds resampled" report.
+ *
+ * `now_us` is passed in rather than read from the clock so the fast dry-run
+ * path - which never sleeps - can drive the same decision from the stream's
+ * own timestamps. `batch_first_us` is the due time of the oldest write still
+ * buffered, or -1 when the buffer is empty. */
+static int ship_midframe(int64_t now_us, int64_t next_due_us,
+                         int64_t batch_first_us)
+{
+    if (s_flush_gap_us < 0) {
+        int64_t gap = (int64_t)s_flush_threshold * 1000000 / 44100;
+        return now_us + gap <= next_due_us;
+    }
+
+    /* 0 is a convenience alias for "one transfer per C64 frame", which is the
+     * coarsest setting that still keeps a tune in time. */
+    const int64_t gap = s_flush_gap_us ? (int64_t)s_flush_gap_us : 20000;
+    if (batch_first_us >= 0 && next_due_us - batch_first_us >= gap) return 1;
+    return now_us + gap <= next_due_us;
+}
+
 /* ------------------------------------------------------------------ */
 /* hardware                                                            */
 /* ------------------------------------------------------------------ */
@@ -385,6 +432,8 @@ static int load_stream(const char *path, int subsong, double seconds,
 /* the replay loop                                                     */
 /* ------------------------------------------------------------------ */
 
+static void report_link_stats(size_t nevents, double secs);
+
 /* Ship everything buffered. In register mode deferred flush is off, so each
  * sid_write() has already pushed its own transfer; this is the frame-boundary
  * flush for command mode and a no-op-by-then flush for register mode. */
@@ -456,6 +505,7 @@ static int stream_play_sid(const char *path, int subsong, double speed,
         return -1;
     }
     sid_set_deferred_flush(s_flush_mode == 2);
+    spfm_flush_stats_reset();
     for (size_t i = 0; i < n; i++) emit(&ev[i]);
     ship();
 
@@ -469,14 +519,20 @@ static int stream_play_sid(const char *path, int subsong, double speed,
         /* Emit this frame's writes, waiting for each one's due time. The
          * frame's timestamps are absolute from the song start, so they stay
          * correct no matter how many frames have gone by. */
+        int64_t batch_first = -1;
         for (size_t i = 0; i < n; i++) {
             int64_t due = start + (int64_t)(ev[i].t_ms * us_per_ms);
             if (due > spfm_now_us()) {
                 /* Command mode: only ship the batch when the upcoming wait is
-                 * longer than the threshold, so a burst of writes stays in one
-                 * transfer; the frame boundary below always flushes. */
-                if (spfm_now_us() + (int64_t)s_flush_threshold * 1000000 / 44100 <= due)
+                 * long enough to pay for a USB transfer, so a burst of writes
+                 * stays in one transfer; the frame boundary below always
+                 * flushes. With --flush-gap the batch also goes out once it has
+                 * spanned that much stream time, which is what keeps a digi
+                 * tune under the USB transfer ceiling. */
+                if (ship_midframe(spfm_now_us(), due, batch_first)) {
                     ship();
+                    batch_first = -1;
+                }
                 while (due > spfm_now_us()) {
                     int k = kb_take();
                     if (k) {
@@ -493,6 +549,7 @@ static int stream_play_sid(const char *path, int subsong, double speed,
                 int64_t lag = spfm_now_us() - due;
                 if (lag > worst_lag_us) worst_lag_us = lag;
             }
+            if (batch_first < 0) batch_first = due;
             emit(&ev[i]);
         }
         sid_flush();          /* frame boundary: always ship */
@@ -521,11 +578,31 @@ static int stream_play_sid(const char *path, int subsong, double speed,
     sid_flush();
     sid_set_deferred_flush(false);
     sid_stream_close();
+    report_link_stats(0, played_ms / 1000.0);
     return 0;
 }
 
 /* Replay a pre-rendered `.sidreg` buffer. Returns 0 at the end of the buffer,
  * -1 if the user interrupted. */
+
+/* A stream can be byte-exact and still break: FT232R schedules one bulk
+ * transaction per 1 ms USB frame, so what has to fit is the number of
+ * transfers, not their total size. Printed by both replay paths so a
+ * --flush-gap change can be judged without guessing. */
+static void report_link_stats(size_t nevents, double secs)
+{
+    unsigned long wr = 0, bytes = 0;
+    size_t maxw = 0;
+    spfm_flush_stats(&wr, &bytes, &maxw);
+    printf("  link: %lu transfers", wr);
+    if (secs > 0.5) printf(" (%.0f/s)", wr / secs);
+    printf(", %lu bytes", bytes);
+    if (wr) printf(", avg %.1f B, largest %lu B",
+                   (double)bytes / (double)wr, (unsigned long)maxw);
+    printf("\n");
+    (void)nevents;
+}
+
 static int replay(const sid_event_t *ev, size_t n, double speed, int pace)
 {
     if (n == 0) return 0;
@@ -534,10 +611,27 @@ static int replay(const sid_event_t *ev, size_t n, double speed, int pace)
      * Pacing would only prove that Sleep() works, and waiting 60 s to check
      * that the bytes came out right is not a useful test. */
     if (s_opt.dry_run && !pace) {
-        for (size_t i = 0; i < n; i++) emit(&ev[i]);
+        spfm_flush_stats_reset();
+        sid_set_deferred_flush(s_flush_mode == 2);
+        int64_t batch_first = -1;
+        for (size_t i = 0; i < n; i++) {
+            /* Drive the real mid-frame decision from the stream's own clock so
+             * this path reports the transfer pattern the board would see. */
+            const int64_t now = (int64_t)(ev[i].t_ms * 1000.0);
+            const int64_t next = (i + 1 < n) ? (int64_t)(ev[i + 1].t_ms * 1000.0)
+                                             : now;
+            if (ship_midframe(now, next, batch_first)) {
+                sid_flush();
+                batch_first = -1;
+            }
+            if (batch_first < 0) batch_first = now;
+            emit(&ev[i]);
+        }
         sid_flush();
+        sid_set_deferred_flush(false);
         printf("  dry-run: %lu events -> %lu bytes\n",
                (unsigned long)n, (unsigned long)spfm_capture_size());
+        report_link_stats(n, ev[n - 1].t_ms / 1000.0);
         return 0;
     }
 
@@ -553,7 +647,9 @@ static int replay(const sid_event_t *ev, size_t n, double speed, int pace)
      * next frame is due. Doing it per write instead would put 50 latency-timer
      * expiries inside one frame and the music would fall apart. */
     sid_set_deferred_flush(s_flush_mode == 2);
+    spfm_flush_stats_reset();
 
+    int64_t batch_first = -1;
     for (size_t i = 0; i < n; i++) {
         int64_t due = start + (int64_t)(ev[i].t_ms * us_per_ms);
 
@@ -561,8 +657,10 @@ static int replay(const sid_event_t *ev, size_t n, double speed, int pace)
          * is emitted immediately so a stall turns into a bunch rather than a
          * permanent offset. */
         if (due > spfm_now_us()) {
-            if (spfm_now_us() + (int64_t)s_flush_threshold * 1000000 / 44100 <= due)
+            if (ship_midframe(spfm_now_us(), due, batch_first)) {
                 ship();       /* ship what is due so far, then block */
+                batch_first = -1;
+            }
             /* Interruptible wait: never sleep longer than a few ms, so a key
              * press takes effect straight away instead of at the next note. */
             while (due > spfm_now_us()) {
@@ -581,6 +679,7 @@ static int replay(const sid_event_t *ev, size_t n, double speed, int pace)
             if (lag > worst_lag_us) worst_lag_us = lag;
         }
 
+        if (batch_first < 0) batch_first = due;
         emit(&ev[i]);
 
         /* Dense passages have no gap long enough to land in, so check here as
@@ -611,6 +710,7 @@ static int replay(const sid_event_t *ev, size_t n, double speed, int pace)
     printf("\r  %5.1f s  %lu events  worst lag %ld ms        \n",
            ev[n - 1].t_ms / 1000.0, (unsigned long)n,
            (long)(worst_lag_us / 1000));
+    report_link_stats(n, ev[n - 1].t_ms / 1000.0);
     return 0;
 }
 
@@ -724,6 +824,13 @@ static int cmd_play(int argc, char **argv)
             else if (!strcmp(m, "command"))  s_flush_mode = 2;
             else { fprintf(stderr, "--flush must be register|command\n"); return 1; }
         }
+        else if (!strcmp(argv[i], "--flush-gap") && i + 1 < argc) {
+            s_flush_gap_us = (int)(atof(argv[++i]) * 1000.0 + 0.5);
+            if (s_flush_gap_us < 0) {
+                fprintf(stderr, "--flush-gap must be >= 0 ms\n");
+                return 1;
+            }
+        }
         else if (!strcmp(argv[i], "--pace"))                    pace = 1;
         else if (argv[i][0] == '-') {
             fprintf(stderr, "unknown option '%s'\n", argv[i]);
@@ -735,6 +842,8 @@ static int cmd_play(int argc, char **argv)
         fprintf(stderr, "usage: sidplay <file.sid|file.sidvgm|file.sidreg> [options]\n"
                         "  --timer hprec|hybrid|mmtimer|vgmplay  wait primitive\n"
                         "  --flush register|command   USB flush granularity\n"
+                        "  --flush-gap MS   shortest gap worth a separate USB transfer\n"
+                        "                   (default: old rule, 0.09 ms; 0 = per frame)\n"
                         "  --proto 1step|2step   write protocol\n"
                         "  --seconds N  --subsong N  --speed X  --no-cache\n"
                         "  .sidvgm/.sidreg replay a recording; .sid is emulated live\n");
@@ -1008,6 +1117,13 @@ static int cmd_playlist(int argc, char **argv)
             if (!strcmp(m, "register"))     s_flush_mode = 1;
             else if (!strcmp(m, "command"))  s_flush_mode = 2;
             else { fprintf(stderr, "--flush must be register|command\n"); return 1; }
+        }
+        else if (!strcmp(argv[i], "--flush-gap") && i + 1 < argc) {
+            s_flush_gap_us = (int)(atof(argv[++i]) * 1000.0 + 0.5);
+            if (s_flush_gap_us < 0) {
+                fprintf(stderr, "--flush-gap must be >= 0 ms\n");
+                return 1;
+            }
         }
         else if (argv[i][0] == '-') {
             fprintf(stderr, "unknown option '%s'\n", argv[i]);

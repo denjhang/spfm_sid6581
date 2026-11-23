@@ -129,6 +129,15 @@ void spfm_thread_boost_end(void);
 /* Push everything buffered to USB. Returns false on write error. */
 bool spfm_flush(void);
 
+/* Transfer accounting: how many FT_Write calls a stream cost, and how big the
+ * largest one was. Frequency is the number that matters - FT232R does one bulk
+ * transaction per 1 ms USB frame, so anything above ~1000/s queues up inside
+ * the driver no matter how few bytes are involved. Counted in dry-run too, so
+ * a threshold change can be checked without the board. */
+void spfm_flush_stats_reset(void);
+void spfm_flush_stats(unsigned long *writes, unsigned long *bytes,
+                      size_t *max_write);
+
 /* Wall-clock delay for long waits; the byte buffer is flushed first. */
 void spfm_delay_ms(uint32_t ms);
 void spfm_delay_us(uint32_t us);

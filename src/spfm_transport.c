@@ -25,6 +25,16 @@ static FT_HANDLE s_handle = NULL;
 static uint8_t   s_buf[SPFM_BUF_SIZE];
 static size_t    s_len = 0;
 
+/* Transfer accounting. A register stream can be perfectly correct byte for
+ * byte and still sound wrong because it was handed to the driver as thousands
+ * of 4-byte writes: FT232R does one bulk transaction per 1 ms USB frame, so
+ * frequency of FT_Write, not total bytes, is what has to stay under ~1000/s.
+ * Counted in both real and dry-run mode, since dry-run is how we check a
+ * change without the board. */
+static unsigned long s_writes = 0;
+static unsigned long s_write_bytes = 0;
+static size_t        s_max_write = 0;
+
 static bool      s_dry_run = false;
 static uint8_t  *s_cap = NULL;
 static size_t    s_cap_len = 0;
@@ -67,11 +77,11 @@ static void cap_append(const uint8_t *p, size_t n)
 
 static void emit(const uint8_t *p, size_t n)
 {
-    if (s_dry_run) {
-        cap_append(p, n);
-        return;
-    }
-    if (!s_handle) return;
+    if (!s_dry_run && !s_handle) return;
+
+    /* The 64 KiB buffer is part of the model, not an implementation detail: it
+     * is what forces a flush every ~437 ms of paced bytes. Dry-run runs the
+     * same check so its transfer count matches the board's. */
     if (s_len + n > SPFM_BUF_SIZE) spfm_flush();
     if (n > SPFM_BUF_SIZE) {
         /* oversized single write: chunk it */
@@ -84,7 +94,8 @@ static void emit(const uint8_t *p, size_t n)
         }
         return;
     }
-    memcpy(s_buf + s_len, p, n);
+    if (s_dry_run) cap_append(p, n);
+    else           memcpy(s_buf + s_len, p, n);
     s_len += n;
 }
 
@@ -307,6 +318,9 @@ void spfm_nop(uint32_t n)
 
 bool spfm_flush(void)
 {
+    if (s_len > s_max_write) s_max_write = s_len;
+    if (s_len) { s_writes++; s_write_bytes += s_len; }
+
     if (s_dry_run) { s_len = 0; return true; }
     if (!s_handle || s_len == 0) { s_len = 0; return true; }
 
@@ -326,6 +340,21 @@ bool spfm_flush(void)
     }
     s_len = 0;
     return true;
+}
+
+void spfm_flush_stats_reset(void)
+{
+    s_writes = 0;
+    s_write_bytes = 0;
+    s_max_write = 0;
+}
+
+void spfm_flush_stats(unsigned long *writes, unsigned long *bytes,
+                      size_t *max_write)
+{
+    if (writes)    *writes = s_writes;
+    if (bytes)     *bytes = s_write_bytes;
+    if (max_write) *max_write = s_max_write;
 }
 
 /* ------------------------------------------------------------------ */
