@@ -36,6 +36,9 @@ Thumbs.db
 sid/
 sidvgm/
 
+# HVSC archives and the unpacked C64Music tree (same copyrighted library as sid/)
+refs/hvsc/
+
 # packaged release zips
 spfm_sid6581-*.zip
 refs/*.zip

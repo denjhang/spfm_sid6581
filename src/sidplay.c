@@ -89,6 +89,13 @@ static int s_flush_threshold = 4;
  * shortest stretch of stream time worth one USB transfer. */
 static int s_flush_gap_us = -1;
 
+/* --flush-gap trades drum resolution for fewer transfers: the batch gets
+ * coarser the larger the gap. Padding is the opposite trade, and it does not
+ * need the host clock at all - see the block below ship_midframe for the
+ * mechanics. s_pad_us is declared here because ship_midframe has to know that
+ * padding is in charge of the pacing. */
+static int     s_pad_us      = -1;   /* pad gaps up to this many us; -1 = off */
+
 /* True when the batch sitting in the buffer should go out now.
  *
  * With no --flush-gap this is the original rule: ship only when the next event
@@ -99,7 +106,7 @@ static int s_flush_gap_us = -1;
  * batch also goes out once it has spanned that much of stream time. Dense digi
  * passages need that - their events are 136 us apart, so the old rule fires on
  * nearly every one of them and asks for 6000+ transfers/s, which is 6x what
- * FT232R can schedule (one bulk transaction per 1 ms USB frame). The bytes then
+ * FT232R can schedule (one bulk transfer per 1 ms USB frame). The bytes then
  * queue inside the driver and come out in 1-2 ms clumps, which is exactly the
  * "muffled, sounds resampled" report.
  *
@@ -110,6 +117,11 @@ static int s_flush_gap_us = -1;
 static int ship_midframe(int64_t now_us, int64_t next_due_us,
                          int64_t batch_first_us)
 {
+    /* With wire-time padding the byte stream carries the rhythm itself, so the
+     * host must stop trying to hit deadlines: ship only when the transport
+     * buffer fills (which it does by itself) or when the run ends. */
+    if (s_pad_us >= 0) return 0;
+
     if (s_flush_gap_us < 0) {
         int64_t gap = (int64_t)s_flush_threshold * 1000000 / 44100;
         return now_us + gap <= next_due_us;
@@ -120,6 +132,97 @@ static int ship_midframe(int64_t now_us, int64_t next_due_us,
     const int64_t gap = s_flush_gap_us ? (int64_t)s_flush_gap_us : 20000;
     if (batch_first_us >= 0 && next_due_us - batch_first_us >= gap) return 1;
     return now_us + gap <= next_due_us;
+}
+
+/* ------------------------------------------------------------------ */
+/* wire-time padding ("reverse flush-gap")                             */
+/* ------------------------------------------------------------------ */
+
+/* --flush-gap trades drum resolution for fewer transfers: the batch gets
+ * coarser the larger the gap. This is the opposite trade, and it does not need
+ * the host clock at all.
+ *
+ * A byte on the wire is 10 bits at 1.5 Mbaud = 6.6667 us, a fixed UART time
+ * base that USB scheduling cannot disturb. A digi writes $D418 every ~136 us,
+ * which is 20.4 byte-times; the Path A command is 4 of them, so appending ~16
+ * NOP (0x80) bytes reproduces the spacing exactly. The NOPs carry no register
+ * write - the firmware just burns them - so the SID sees nothing extra, and the
+ * host no longer has to hit a deadline per sample: it only has to keep the
+ * 64 KiB buffer non-empty.
+ *
+ * The cost is wire time, and it is not free. Padding every gap of Giana s01
+ * would sit at 98-100% duty, which cannot work. Hence two rules:
+ *
+ *   - only gaps <= s_pad_us are padded (a long rest is the host's business);
+ *   - a leaky bucket caps the filler at s_pad_duty percent of the wire, so a
+ *     dense burst spends the silence around it instead of starving the stream.
+ *
+ * Dropping repeated $D418 values (--dedup-vol) is what makes the budget go far:
+ * on Giana 66% of the volume writes repeat the value already latched, and the
+ * chip is holding it, so removing them changes nothing audible. With dedup the
+ * same 136 us spacing needs 27% of the wire instead of 92%. */
+static int     s_pad_duty    = 75;   /* percent of the wire the filler may use */
+static int     s_dedup_vol   = 0;    /* drop $D418 writes that repeat the value */
+static int64_t s_pad_credit  = 0;    /* us of filler budget in hand */
+static int     s_vol_seen    = 0;
+static uint8_t s_vol_last    = 0;
+
+/* 1.5 Mbaud 8N1: 10 bit per byte, so 1 us of wire is 0.15 bytes. */
+#define WIRE_BYTES_PER_US  0.15
+
+static void pad_reset(void)
+{
+    s_pad_credit = 0;
+    s_vol_seen   = 0;
+    s_vol_last   = 0;
+}
+
+/* --pad cannot work without dropping repeated $D418 values: on Giana the
+ * repeats are 66% of the volume writes, and padding every gap without that
+ * reduction asks for more than 100% of the wire. Enabling it automatically is
+ * the only setting that can produce sound, so there is no way to get it wrong. */
+static void pad_normalize(void)
+{
+    if (s_pad_us > 0) s_dedup_vol = 1;
+}
+
+/* 1 if this $D418 write only repeats what the chip already latches. */
+static int vol_is_dup(const sid_event_t *e)
+{
+    if (!s_dedup_vol || e->reg != SID_REG_MODE_VOL) return 0;
+    const int dup = s_vol_seen && (uint8_t)e->val == s_vol_last;
+    s_vol_seen = 1;
+    s_vol_last = (uint8_t)e->val;
+    return dup;
+}
+
+/* Emit NOP bytes to fill a gap of `gap_us` between two register writes.
+ * Returns how much of the gap the filler covered, in us, so the caller can
+ * wait out the rest when the budget ran dry. */
+static int64_t pad_gap(int64_t gap_us)
+{
+    if (s_pad_us < 0 || gap_us <= 0) return 0;
+    if (gap_us > s_pad_us) {
+        /* A long rest needs no filler, but it does refill the bucket. */
+        s_pad_credit += gap_us * s_pad_duty / 100;
+        if (s_pad_credit > 200000) s_pad_credit = 200000;
+        return 0;
+    }
+
+    const int64_t cmd_us = 27;                    /* 4 bytes = 26.67 us */
+    int64_t want = gap_us - cmd_us;
+    if (want <= 0) return 0;
+
+    s_pad_credit += gap_us * s_pad_duty / 100;
+    if (s_pad_credit > 200000) s_pad_credit = 200000;   /* 200 ms of burst */
+
+    int64_t spend = want < s_pad_credit ? want : s_pad_credit;
+    if (spend <= 0) return 0;
+    s_pad_credit -= spend;
+
+    uint32_t nops = (uint32_t)((double)spend * WIRE_BYTES_PER_US + 0.5);
+    if (nops) spfm_nop(nops);
+    return (int64_t)((double)nops / WIRE_BYTES_PER_US + 0.5);
 }
 
 /* ------------------------------------------------------------------ */
@@ -599,6 +702,14 @@ static void report_link_stats(size_t nevents, double secs)
     printf(", %lu bytes", bytes);
     if (wr) printf(", avg %.1f B, largest %lu B",
                    (double)bytes / (double)wr, (unsigned long)maxw);
+    /* 1.5 Mbaud 8N1: 150000 bytes/s of wire. Above 85% the filler is spending
+     * the rests that the next burst needs, which is the first sign that --pad
+     * is set too high for this tune. */
+    if (secs > 0.5) {
+        const double duty = 100.0 * (double)bytes / (secs * 150000.0);
+        printf(", wire %.0f%%", duty);
+        if (duty > 85.0) printf("  (over budget: lower --pad or --pad-duty)");
+    }
     printf("\n");
     (void)nevents;
 }
@@ -606,6 +717,7 @@ static void report_link_stats(size_t nevents, double secs)
 static int replay(const sid_event_t *ev, size_t n, double speed, int pace)
 {
     if (n == 0) return 0;
+    pad_reset();
 
     /* Dry run: walk the stream as fast as possible unless --pace was given.
      * Pacing would only prove that Sleep() works, and waiting 60 s to check
@@ -625,7 +737,8 @@ static int replay(const sid_event_t *ev, size_t n, double speed, int pace)
                 batch_first = -1;
             }
             if (batch_first < 0) batch_first = now;
-            emit(&ev[i]);
+            if (!vol_is_dup(&ev[i])) emit(&ev[i]);
+            if (i + 1 < n) pad_gap(next - now);
         }
         sid_flush();
         sid_set_deferred_flush(false);
@@ -648,15 +761,35 @@ static int replay(const sid_event_t *ev, size_t n, double speed, int pace)
      * expiries inside one frame and the music would fall apart. */
     sid_set_deferred_flush(s_flush_mode == 2);
     spfm_flush_stats_reset();
+    pad_reset();
+
+    /* Padded mode keeps the host's schedule, but as a soft bound instead of a
+     * per-event deadline: the host may run up to PAD_LEAD of musical time
+     * ahead, never more. Inside that window the NOP filler gives every short
+     * gap exact UART timing (no host jitter), and the lead absorbs USB stalls
+     * so a hiccup cannot starve the board. Gaps longer than --pad are rests and
+     * are reproduced by the host stalling on this same bound, which is why the
+     * tune's total length stays correct. */
+    #define PAD_LEAD_US 100000
 
     int64_t batch_first = -1;
     for (size_t i = 0; i < n; i++) {
         int64_t due = start + (int64_t)(ev[i].t_ms * us_per_ms);
 
-        /* Wait for events that are still in the future; anything already due
-         * is emitted immediately so a stall turns into a bunch rather than a
-         * permanent offset. */
-        if (due > spfm_now_us()) {
+        if (s_pad_us >= 0) {
+            const int64_t target = due - PAD_LEAD_US;
+            while (spfm_now_us() < target) {
+                int k = kb_take();
+                if (k) {
+                    s_interrupt = k;
+                    sid_set_deferred_flush(false);
+                    sid_flush();
+                    return -1;
+                }
+                int64_t left = target - spfm_now_us();
+                spfm_wait_until_us(spfm_now_us() + (left > 5000 ? 5000 : left));
+            }
+        } else if (due > spfm_now_us()) {
             if (ship_midframe(spfm_now_us(), due, batch_first)) {
                 ship();       /* ship what is due so far, then block */
                 batch_first = -1;
@@ -680,7 +813,10 @@ static int replay(const sid_event_t *ev, size_t n, double speed, int pace)
         }
 
         if (batch_first < 0) batch_first = due;
-        emit(&ev[i]);
+        if (!vol_is_dup(&ev[i])) emit(&ev[i]);
+        /* Filler goes AFTER this write and before the next one, so the wire
+         * order is [cmd][nop...][cmd] and the gap is reproduced exactly. */
+        if (i + 1 < n) pad_gap((int64_t)((ev[i + 1].t_ms - ev[i].t_ms) * 1000.0));
 
         /* Dense passages have no gap long enough to land in, so check here as
          * well: one compare per event is nothing next to the USB write. */
@@ -831,6 +967,21 @@ static int cmd_play(int argc, char **argv)
                 return 1;
             }
         }
+        else if (!strcmp(argv[i], "--pad") && i + 1 < argc) {
+            s_pad_us = (int)(atof(argv[++i]) * 1000.0 + 0.5);
+            if (s_pad_us <= 0) {
+                fprintf(stderr, "--pad must be > 0 ms\n");
+                return 1;
+            }
+        }
+        else if (!strcmp(argv[i], "--pad-duty") && i + 1 < argc) {
+            s_pad_duty = atoi(argv[++i]);
+            if (s_pad_duty < 1 || s_pad_duty > 100) {
+                fprintf(stderr, "--pad-duty must be 1..100 (percent)\n");
+                return 1;
+            }
+        }
+        else if (!strcmp(argv[i], "--dedup-vol"))               s_dedup_vol = 1;
         else if (!strcmp(argv[i], "--pace"))                    pace = 1;
         else if (argv[i][0] == '-') {
             fprintf(stderr, "unknown option '%s'\n", argv[i]);
@@ -844,11 +995,17 @@ static int cmd_play(int argc, char **argv)
                         "  --flush register|command   USB flush granularity\n"
                         "  --flush-gap MS   shortest gap worth a separate USB transfer\n"
                         "                   (default: old rule, 0.09 ms; 0 = per frame)\n"
+                        "  --pad MS         reverse of --flush-gap: fill gaps up to MS with\n"
+                        "                   NOP bytes so the 1.5 Mbaud clock carries the\n"
+                        "                   timing. Implies --dedup-vol. Try 0.3 (digi)\n"
+                        "  --pad-duty PCT   cap filler at PCT of the wire (default 75)\n"
+                        "  --dedup-vol      drop $D418 writes that repeat the latched value\n"
                         "  --proto 1step|2step   write protocol\n"
                         "  --seconds N  --subsong N  --speed X  --no-cache\n"
                         "  .sidvgm/.sidreg replay a recording; .sid is emulated live\n");
         return 1;
     }
+    pad_normalize();
     if (speed <= 0) speed = 1.0;
 
     sid_song_info_t info;
@@ -1125,11 +1282,27 @@ static int cmd_playlist(int argc, char **argv)
                 return 1;
             }
         }
+        else if (!strcmp(argv[i], "--pad") && i + 1 < argc) {
+            s_pad_us = (int)(atof(argv[++i]) * 1000.0 + 0.5);
+            if (s_pad_us <= 0) {
+                fprintf(stderr, "--pad must be > 0 ms\n");
+                return 1;
+            }
+        }
+        else if (!strcmp(argv[i], "--pad-duty") && i + 1 < argc) {
+            s_pad_duty = atoi(argv[++i]);
+            if (s_pad_duty < 1 || s_pad_duty > 100) {
+                fprintf(stderr, "--pad-duty must be 1..100 (percent)\n");
+                return 1;
+            }
+        }
+        else if (!strcmp(argv[i], "--dedup-vol"))               s_dedup_vol = 1;
         else if (argv[i][0] == '-') {
             fprintf(stderr, "unknown option '%s'\n", argv[i]);
             return 1;
         } else dir = argv[i];
     }
+    pad_normalize();
 
     entry_t *files = NULL;
     int nfiles = 0;
