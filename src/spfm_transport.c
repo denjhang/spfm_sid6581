@@ -357,20 +357,6 @@ void spfm_flush_stats(unsigned long *writes, unsigned long *bytes,
     if (max_write) *max_write = s_max_write;
 }
 
-/* Everything handed to the wire so far, flushed or still in the buffer. Wire
- * time is bytes x 10 bits / 1.5 Mbaud, so this is also a clock: padding makes
- * the byte stream itself carry the timing, and the host only has to stay far
- * enough ahead of it. */
-size_t spfm_bytes_emitted(void)
-{
-    return s_write_bytes + s_len;
-}
-
-size_t spfm_pending_bytes(void)
-{
-    return s_len;
-}
-
 /* ------------------------------------------------------------------ */
 /* delays                                                              */
 /* ------------------------------------------------------------------ */

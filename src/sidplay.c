@@ -1052,6 +1052,15 @@ static int cmd_play(int argc, char **argv)
     if (subsong >= (int)probe.n_songs) subsong = probe.n_songs - 1;
 
     printf("song: %s / %s\n", probe.name, probe.author);
+    if (s_pad_us >= 0) {
+        /* A live .sid is generated a frame at a time, so there is no known
+         * next-gap to fill; --pad needs the finished stream. Say so rather
+         * than padding nothing and looking like it worked. */
+        fprintf(stderr, "note: --pad needs a finished stream (.sidvgm/.sidreg); "
+                        "ignoring it for this live .sid\n");
+        s_pad_us = -1;
+        s_dedup_vol = 0;
+    }
     if (seconds > 0)
         printf("playing %.0f s (from the start)\n", seconds);
     else

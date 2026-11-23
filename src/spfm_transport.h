@@ -138,13 +138,6 @@ void spfm_flush_stats_reset(void);
 void spfm_flush_stats(unsigned long *writes, unsigned long *bytes,
                       size_t *max_write);
 
-/* Bytes handed to the wire so far (flushed + still buffered). At 1.5 Mbaud 8N1
- * one byte is 6.6667 us, so this doubles as a clock that USB cannot disturb. */
-size_t spfm_bytes_emitted(void);
-
-/* Bytes still sitting in the host buffer, i.e. not yet handed to the driver. */
-size_t spfm_pending_bytes(void);
-
 /* Wall-clock delay for long waits; the byte buffer is flushed first. */
 void spfm_delay_ms(uint32_t ms);
 void spfm_delay_us(uint32_t us);
