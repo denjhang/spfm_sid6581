@@ -1,0 +1,11 @@
+prefix=/e/working/zcode-projects/spfm_sid6581/third_party/local
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: libsidplayfp
+Description: C64 cycle exact stereo sidplayer library.
+Version: 3.1.2
+Libs.private: -LE:/working/zcode-projects/spfm_sid6581/third_party/local/lib -lresidfp   -lpthread
+Libs: -L${libdir} -lsidplayfp
+Cflags: -I${includedir}

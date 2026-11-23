@@ -31,6 +31,17 @@
 #include "sid_rsid.h"
 #include "sidvgm.h"
 #include "sidmodel.h"
+#include "sid_websid.h"
+#include "sid_lsfp.h"
+
+/* Recording back ends: libsidplayfp (reference), WebSid, our fake6502. */
+enum { ENGINE_LSFP = 0, ENGINE_WEBSID = 1, ENGINE_NATIVE = 2 };
+
+static const char *engine_name(int e)
+{
+    return e == ENGINE_LSFP ? "lsfp"
+         : e == ENGINE_WEBSID ? "websid" : "native";
+}
 
 #ifdef _WIN32
 #include <windows.h>
@@ -70,8 +81,48 @@ static void cursor_seek(stream_cursor_t *c, long long tick)
     c->tick = tick;
 }
 
+/* ---- audio sink ---------------------------------------------------- *
+ * Two interchangeable back ends. The native one is our own sidmodel.c; the
+ * WebSid one is the vendored upstream emulator (third_party/websid), which is
+ * what the reference players use and is bit-for-bit its own thing. Selecting
+ * between them must not change the stream walking code below. */
+
+typedef struct {
+    sid_model_t         *native;
+    sid_websid_render_t *web;
+    sid_lsfp_render_t   *lsfp;
+    /* Set when a .sid is played straight through libsidplayfp instead of a
+     * recorded stream (--direct). In that mode the cursor is unused: the
+     * player owns both the CPU and the SID. */
+    sid_lsfp_player_t   *player;
+} sink_t;
+
+static void sink_write(sink_t *s, uint8_t reg, uint8_t val)
+{
+    if (s->player) return;
+    if (s->web)  sid_websid_render_write(s->web, reg, val);
+    if (s->lsfp) sid_lsfp_render_write(s->lsfp, reg, val);
+    if (s->native) sid_model_write(s->native, reg, val);
+}
+
+static void sink_render(sink_t *s, short *buf, size_t frames)
+{
+    if (s->player) { sid_lsfp_player_render(s->player, buf, frames); return; }
+    if (s->web)  sid_websid_render_render(s->web, buf, frames);
+    if (s->lsfp) sid_lsfp_render_render(s->lsfp, buf, frames);
+    if (s->native) sid_model_render(s->native, buf, frames);
+}
+
+static void sink_free(sink_t *s)
+{
+    if (s->player) { sid_lsfp_player_close(s->player); s->player = NULL; }
+    if (s->web) { sid_websid_render_free(s->web); s->web = NULL; }
+    if (s->lsfp) { sid_lsfp_render_free(s->lsfp); s->lsfp = NULL; }
+    if (s->native) { sid_model_free(s->native); s->native = NULL; }
+}
+
 /* Render `frames` samples, applying every event whose tick falls in the block. */
-static void render_block(sid_model_t *m, stream_cursor_t *c,
+static void render_block(sink_t *m, stream_cursor_t *c,
                          short *buf, size_t frames)
 {
     size_t done = 0;
@@ -81,13 +132,13 @@ static void render_block(sid_model_t *m, stream_cursor_t *c,
             long long t = (long long)llround(c->ev[c->pos].t_ms * 44.1);
             long long delta = t - c->tick;
             if (delta <= 0) {
-                sid_model_write(m, c->ev[c->pos].reg, c->ev[c->pos].val);
+                sink_write(m, c->ev[c->pos].reg, c->ev[c->pos].val);
                 c->pos++;
                 continue;
             }
             if (delta < (long long)chunk) chunk = (size_t)delta;
         }
-        sid_model_render(m, buf + done, chunk);
+        sink_render(m, buf + done, chunk);
         done += chunk;
         c->tick += (long long)chunk;
     }
@@ -132,6 +183,8 @@ static void kb_thread_body(void)
         case 'q': case 'Q': case 27: s_action = 'q'; break;
         case 'n': case 'N':          s_action = 'n'; break;
         case 'b': case 'B':          s_action = 'b'; break;
+        case ',':                    s_action = ','; break;
+        case '.':                    s_action = '.'; break;
         default: break;
         }
     }
@@ -216,30 +269,40 @@ static const char *basename_of(const char *p)
     return b;
 }
 
-/* Cache name for a converted .sid: <dir>/<stem>_s<sub>_d<sec>.sidvgm */
+/* Cache name for a converted .sid:
+ *   <dir>/<stem>_s<sub>_d<sec>_<engine>v<cache_rev>.sidvgm
+ * The engine tag keeps the two recorders apart; the revision tag retires
+ * everything recorded by an older build, so a stale stream (or one recorded
+ * before RSID/digi handling was complete) can never be played back by accident.
+ * Bump SID_CACHE_REV whenever the recorder's output changes meaning. */
+#define SID_CACHE_REV "3"
+
 static void convert_cache_name(char *buf, size_t len, const char *cache_dir,
-                               const char *sid_path, int subsong, double seconds)
+                               const char *sid_path, int subsong, double seconds,
+                               const char *engine_tag)
 {
     const char *base = basename_of(sid_path);
     char stem[260];
     snprintf(stem, sizeof stem, "%s", base);
     char *dot = strrchr(stem, '.');
     if (dot) *dot = 0;
-    snprintf(buf, len, "%s%s_s%d_d%ld.sidvgm", cache_dir, stem,
-             subsong < 0 ? 0 : subsong, (long)(seconds + 0.5));
+    snprintf(buf, len, "%s%s_s%d_d%ld_%sv%s.sidvgm", cache_dir, stem,
+             subsong < 0 ? 0 : subsong, (long)(seconds + 0.5), engine_tag,
+             SID_CACHE_REV);
 }
 
 /* Run the 6502 and record. On success the events are owned by the caller. */
 static int convert_sid(const char *path, int subsong, double seconds,
-                       int use_cache, song_t *out,
-                       char *err, size_t errlen)
+                       int use_cache, int engine, int reconvert,
+                       song_t *out, char *err, size_t errlen)
 {
     char cache_dir[512] = "sid_cache/";
     char cache_path[768];
+    const char *engine_tag = engine_name(engine);
     convert_cache_name(cache_path, sizeof cache_path, cache_dir, path,
-                       subsong, seconds);
+                       subsong, seconds, engine_tag);
 
-    if (use_cache && sidvgm_is_file(cache_path)) {
+    if (use_cache && !reconvert && sidvgm_is_file(cache_path)) {
         if (sidvgm_read(cache_path, &out->ev, &out->n, &out->info) == 0) {
             out->owns = 1;
             snprintf(out->title, sizeof out->title, "%.63s", out->info.name);
@@ -248,9 +311,22 @@ static int convert_sid(const char *path, int subsong, double seconds,
         }
     }
 
-    if (sid_song_extract(path, subsong, seconds, &out->ev, &out->n,
-                         &out->info, err, errlen) != 0)
-        return -1;
+    int rc;
+    switch (engine) {
+    case ENGINE_LSFP:
+        rc = sid_lsfp_extract(path, subsong, seconds, &out->ev, &out->n,
+                              &out->info, err, errlen);
+        break;
+    case ENGINE_WEBSID:
+        rc = sid_websid_extract(path, subsong, seconds, &out->ev, &out->n,
+                                &out->info, err, errlen);
+        break;
+    default:
+        rc = sid_song_extract(path, subsong, seconds, &out->ev, &out->n,
+                              &out->info, err, errlen);
+        break;
+    }
+    if (rc != 0) return -1;
     out->owns = 1;
     snprintf(out->title, sizeof out->title, "%.63s",
              out->info.name[0] ? out->info.name : basename_of(path));
@@ -261,21 +337,24 @@ static int convert_sid(const char *path, int subsong, double seconds,
 #else
         mkdir("sid_cache", 0755);
 #endif
-        if (sidvgm_write(cache_path, out->ev, out->n, &out->info,
-                         "converted by sidvgmplay") == 0)
+        char cmt[96];
+        snprintf(cmt, sizeof cmt, "converted by sidvgmplay (%s engine)", engine_tag);
+        if (sidvgm_write(cache_path, out->ev, out->n, &out->info, cmt) == 0)
             printf("  cached: %s\n", cache_path);
     }
     return 0;
 }
 
 static int load_song(const char *path, int subsong, double seconds,
-                     int use_cache, song_t *out, char *err, size_t errlen)
+                     int use_cache, int engine, int reconvert,
+                     song_t *out, char *err, size_t errlen)
 {
     memset(out, 0, sizeof *out);
     if (err && errlen) err[0] = 0;
 
     if (has_suffix(path, ".sid")) {
-        return convert_sid(path, subsong, seconds, use_cache, out, err, errlen);
+        return convert_sid(path, subsong, seconds, use_cache, engine,
+                           reconvert, out, err, errlen);
     }
 
     if (sidvgm_is_file(path)) {
@@ -344,7 +423,7 @@ static int write_wav_header(FILE *f, unsigned rate, unsigned long frames)
     return fwrite(h, 1, 44, f) == 44 ? 0 : -1;
 }
 
-static int render_to_wav(sid_model_t *m, stream_cursor_t *c, const char *path,
+static int render_to_wav(sink_t *m, stream_cursor_t *c, const char *path,
                          long long total_ticks)
 {
     FILE *f = fopen(path, "wb");
@@ -373,7 +452,7 @@ static int render_to_wav(sid_model_t *m, stream_cursor_t *c, const char *path,
  * queue fed, and let WAVEHDR.dwFlags (the equivalent of the DirectSound fill
  * pointer) say when a buffer came back. Returns 'q' if the user asked to quit,
  * 'n' for next track, 0 when the stream ran out. */
-static int play_realtime(sid_model_t *m, stream_cursor_t *c, long long total_ticks)
+static int play_realtime(sink_t *m, stream_cursor_t *c, long long total_ticks)
 {
     HWAVEOUT hwo = NULL;
     WAVEFORMATEX wfx;
@@ -424,7 +503,7 @@ static int play_realtime(sid_model_t *m, stream_cursor_t *c, long long total_tic
         }
         Sleep(10);
         int k = kb_take();
-        if (k == 'q' || k == 'n' || k == 'b') action = k;
+        if (k) action = k;
     }
 
     /* Drain, unless the user is skipping: then cut the tail immediately. */
@@ -567,12 +646,19 @@ static void usage(const char *a0)
         "                   conversion the default is %.0f s)\n"
         "  --start N        start at N seconds\n"
         "  --subsong N      subsong for .sid conversion, 0-based\n"
+        "  --model NAME     audio back end: lsfp (default), websid or native\n"
+        "  --engine NAME    .sid recorder: lsfp (default), websid or native\n"
+        "  --reconvert      ignore the cache and record again\n"
+        "  --record         .sid only: record a register stream first, then\n"
+        "                   replay it (what the hardware gets). Default is to\n"
+        "                   play the .sid straight through libsidplayfp.\n"
         "  --8580           use the 8580 filter curve (default 6581)\n"
         "  --no-filter      bypass the filter\n"
         "  --no-cache       do not read or write sid_cache/\n"
         "  --info           print each stream header and exit\n"
         "\n"
-        "keys while playing: [n] next  [b] back  [q] quit\n",
+        "keys while playing: [n] next file  [b] back file  "
+        "[,] / [.] prev/next subsong (.sid only)  [q] quit\n",
         a0, SID_DEFAULT_SECONDS);
 }
 
@@ -583,15 +669,41 @@ int main(int argc, char **argv)
     double seconds = 0.0, start = 0.0;
     int subsong = -1;
     int use8580 = 0, no_filter = 0, info_only = 0, use_cache = 1;
+    /* libsidplayfp (engine "lsfp") and reSIDfp ("model lsfp") are the defaults:
+     * that pair is what build/lsfp_to.wav was rendered with, so what you hear
+     * here is the reference. --engine/--model websid|native pick the others. */
+    int model = ENGINE_LSFP, engine = ENGINE_LSFP, reconvert = 0;
+    /* A .sid is by default handed straight to libsidplayfp's own player: that
+     * is the path build\lsfpref.exe renders through, so the audio is the
+     * reference audio (bit-identical) and no drum can be lost in translation.
+     * --record goes back to "record a stream, then replay it", which is what
+     * the real hardware gets. */
+    int direct = 1;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--wav") && i + 1 < argc)            wav_path = argv[++i];
         else if (!strcmp(argv[i], "--seconds") && i + 1 < argc)   seconds = atof(argv[++i]);
         else if (!strcmp(argv[i], "--start") && i + 1 < argc)     start = atof(argv[++i]);
         else if (!strcmp(argv[i], "--subsong") && i + 1 < argc)   subsong = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--model") && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (!strcmp(v, "lsfp") || !strcmp(v, "libsidplayfp")) model = ENGINE_LSFP;
+            else if (!strcmp(v, "websid")) model = ENGINE_WEBSID;
+            else if (!strcmp(v, "native")) model = ENGINE_NATIVE;
+            else { fprintf(stderr, "--model must be lsfp, websid or native\n"); return 1; }
+        }
+        else if (!strcmp(argv[i], "--engine") && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (!strcmp(v, "lsfp") || !strcmp(v, "libsidplayfp")) engine = ENGINE_LSFP;
+            else if (!strcmp(v, "websid")) engine = ENGINE_WEBSID;
+            else if (!strcmp(v, "native")) engine = ENGINE_NATIVE;
+            else { fprintf(stderr, "--engine must be lsfp, websid or native\n"); return 1; }
+        }
         else if (!strcmp(argv[i], "--8580"))                      use8580 = 1;
         else if (!strcmp(argv[i], "--no-filter"))                 no_filter = 1;
         else if (!strcmp(argv[i], "--no-cache"))                  use_cache = 0;
+        else if (!strcmp(argv[i], "--reconvert"))                 reconvert = 1;
+        else if (!strcmp(argv[i], "--record"))                    direct = 0;
         else if (!strcmp(argv[i], "--info"))                      info_only = 1;
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
         else if (argv[i][0] == '-') { fprintf(stderr, "unknown option '%s'\n", argv[i]); return 1; }
@@ -605,13 +717,24 @@ int main(int argc, char **argv)
      * inputs is a playlist, which gets the same rule per track. */
     if (!wav_path && !info_only) {
         kb_start();
-        printf("%d track%s\n[n] next   [b] back   [q] quit\n\n",
+        printf("%d track%s\n[n] next file   [b] back file   "
+               "[,] [.] subsong (.sid)   [q] quit\n\n",
                inputs.n, inputs.n == 1 ? "" : "s");
     }
 
     int idx = 0;
     double cur_seconds = seconds;
     int action = 0;
+
+    /* Same key split as the hardware player's sidlist:
+     *   [n] / [b]      another file
+     *   [.] / [,]      next/previous subsong of the SAME file, replayed
+     * The subsong is one running value, exactly like the hardware player's:
+     * it survives a file change and only ,/. move it.
+     * A stream container (sidvgm/sidreg) has no subsongs, so there the
+     * subsong keys are a no-op that says so. */
+    int cur_subsong = subsong;
+    int replay_same = 0;
 
     while (idx >= 0 && idx < inputs.n) {
         const char *path = inputs.v[idx];
@@ -621,8 +744,123 @@ int main(int argc, char **argv)
         double conv_seconds = seconds > 0.0 ? seconds : SID_DEFAULT_SECONDS;
         char err[160];
         song_t song;
-        printf("[%d/%d] %s\n", idx + 1, inputs.n, path);
-        if (load_song(path, subsong, conv_seconds, use_cache, &song,
+        printf("[%d/%d] %s", idx + 1, inputs.n, path);
+        if (cur_subsong > 0) printf("  (subsong %d)", cur_subsong);
+        printf("\n");
+
+        /* --info only looks at the header. Recording is the expensive part
+         * (WebSid runs the whole song cycle by cycle), so it must not happen
+         * here -- a directory of 12 tunes would otherwise re-record all of
+         * them just to print their titles. */
+        if (info_only && has_suffix(path, ".sid")) {
+            sid_song_info_t hdr;
+            if (sid_song_probe(path, &hdr) != 0) {
+                fprintf(stderr, "  cannot read header\n");
+            } else {
+                printf("  title  : %s\n", hdr.name[0] ? hdr.name : "(none)");
+                printf("  author : %s\n", hdr.author[0] ? hdr.author : "(none)");
+                printf("  format : %s, %s, %.0f Hz, %u subsong%s\n",
+                       hdr.is_rsid ? "RSID" : "PSID", hdr.pal ? "PAL" : "NTSC",
+                       hdr.clock_hz, hdr.n_songs, hdr.n_songs == 1 ? "" : "s");
+            }
+            idx++;
+            continue;
+        }
+
+        /* --direct: hand the .sid to libsidplayfp and stream its own audio.
+         * No register stream in the middle, so nothing can be lost in
+         * transcription; this is the same path build\lsfpref.exe takes.
+         * Only the lsfp model can do this -- the other two back ends replay a
+         * recorded stream by definition, so asking for them records first. */
+        if (direct && model == ENGINE_LSFP && has_suffix(path, ".sid")) {
+            sid_song_info_t hdr;
+            if (sid_song_probe(path, &hdr) != 0) {
+                fprintf(stderr, "  cannot read header\n");
+                idx++;
+                continue;
+            }
+            printf("  title  : %s\n", hdr.name[0] ? hdr.name : "(none)");
+            printf("  clock  : %s, %.0f Hz (direct, no recording)\n",
+                   hdr.pal ? "PAL" : "NTSC", hdr.clock_hz);
+
+            sid_lsfp_player_t *pl = sid_lsfp_player_open(
+                path, cur_subsong, OUT_RATE, use8580, err, sizeof err);
+            if (!pl) {
+                fprintf(stderr, "  %s\n", err[0] ? err : "cannot open");
+                idx++;
+                continue;
+            }
+
+            sink_t m;
+            memset(&m, 0, sizeof m);
+            m.player = pl;
+
+            stream_cursor_t cur;
+            memset(&cur, 0, sizeof cur);
+
+            long long total_ticks =
+                (long long)llround((cur_seconds > 0.0 ? cur_seconds
+                                                     : SID_DEFAULT_SECONDS)
+                                   * 44100.0);
+            long long start_tick = (long long)llround(start * 44100.0);
+            if (start_tick > 0) {
+                /* Seeking means clocking the tune silently up to that point. */
+                short skip[BLOCK_FRAMES];
+                long long left = start_tick;
+                while (left > 0) {
+                    size_t want = (left > BLOCK_FRAMES) ? BLOCK_FRAMES
+                                                        : (size_t)left;
+                    sid_lsfp_player_render(pl, skip, want);
+                    left -= (long long)want;
+                }
+            }
+
+            action = 0;
+            if (wav_path) {
+                char out[1024];
+                if (inputs.n > 1) {
+                    const char *dot = strrchr(wav_path, '.');
+                    if (dot) {
+                        int stem = (int)(dot - wav_path);
+                        snprintf(out, sizeof out, "%.*s_%d%s", stem, wav_path,
+                                 idx + 1, dot);
+                    } else {
+                        snprintf(out, sizeof out, "%s_%d", wav_path, idx + 1);
+                    }
+                } else {
+                    snprintf(out, sizeof out, "%s", wav_path);
+                }
+                render_to_wav(&m, &cur, out, total_ticks);
+                idx++;
+            } else {
+#ifdef _WIN32
+                action = play_realtime(&m, &cur, total_ticks);
+                replay_same = 0;
+                if (action == 'q') idx = inputs.n;
+                else if (action == 'b') idx = idx > 0 ? idx - 1 : 0;
+                else if (action == ',' || action == '.') {
+                    if (cur_subsong < 0) cur_subsong = (int)hdr.start_song - 1;
+                    cur_subsong += (action == '.') ? 1 : -1;
+                    if (cur_subsong < 0) cur_subsong = 0;
+                    replay_same = 1;
+                } else idx++;
+#else
+                fprintf(stderr, "real-time output is Windows-only; use --wav\n");
+                idx++;
+#endif
+            }
+            sink_free(&m);
+            if (replay_same) continue;
+            if (!wav_path && !info_only) {
+                int k = kb_take();
+                if (k == 'q') break;
+                if (k == 'b') idx = idx > 0 ? idx - 1 : 0;
+            }
+            continue;
+        }
+
+        if (load_song(path, cur_subsong, conv_seconds, use_cache, engine,
+                      reconvert, &song,
                       err, sizeof err) != 0) {
             fprintf(stderr, "  %s\n", err[0] ? err : "cannot load");
             idx++;
@@ -664,15 +902,29 @@ int main(int argc, char **argv)
         cur.n = song.n;
         cursor_seek(&cur, start_tick);
 
-        sid_model_t *m = sid_model_new(song.info.clock_hz, use8580, OUT_RATE);
-        if (!m) { free_song(&song); list_free(&inputs); return 1; }
-        sid_model_set_filter(m, no_filter ? 0 : 1);
-        sid_model_reset(m);
+        sink_t m;
+        memset(&m, 0, sizeof m);
+        if (model == ENGINE_LSFP) {
+            m.lsfp = sid_lsfp_render_new(song.info.clock_hz, use8580, OUT_RATE);
+            if (!m.lsfp) { free_song(&song); list_free(&inputs); return 1; }
+            sid_lsfp_render_set_filter(m.lsfp, no_filter ? 0 : 1);
+            sid_lsfp_render_reset(m.lsfp);
+        } else if (model == ENGINE_WEBSID) {
+            m.web = sid_websid_render_new(song.info.clock_hz, use8580, OUT_RATE);
+            if (!m.web) { free_song(&song); list_free(&inputs); return 1; }
+            sid_websid_render_set_filter(m.web, no_filter ? 0 : 1);
+            sid_websid_render_reset(m.web);
+        } else {
+            m.native = sid_model_new(song.info.clock_hz, use8580, OUT_RATE);
+            if (!m.native) { free_song(&song); list_free(&inputs); return 1; }
+            sid_model_set_filter(m.native, no_filter ? 0 : 1);
+            sid_model_reset(m.native);
+        }
 
         /* Fast-forward: apply every write at or before the start point so the
          * model begins in the right state. */
         for (size_t i = 0; i < cur.pos; i++)
-            sid_model_write(m, song.ev[i].reg, song.ev[i].val);
+            sink_write(&m, song.ev[i].reg, song.ev[i].val);
 
         long long span = total_ticks - start_tick;
         action = 0;
@@ -691,24 +943,41 @@ int main(int argc, char **argv)
             } else {
                 snprintf(out, sizeof out, "%s", wav_path);
             }
-            render_to_wav(m, &cur, out, span);
+            render_to_wav(&m, &cur, out, span);
             idx++;
         } else {
 #ifdef _WIN32
-            action = play_realtime(m, &cur, span);
-            if (action == 'q') idx = inputs.n;
-            else if (action == 'b') idx = idx > 0 ? idx - 1 : 0;
-            else idx++;
+            action = play_realtime(&m, &cur, span);
+            replay_same = 0;
+            if (action == 'q') {
+                idx = inputs.n;
+            } else if (action == 'b') {
+                idx = idx > 0 ? idx - 1 : 0;
+            } else if (action == ',' || action == '.') {
+                if (!has_suffix(path, ".sid")) {
+                    fprintf(stderr, "  %s has no subsongs (n/b move files)\n", path);
+                    idx++;
+                } else {
+                    if (cur_subsong < 0) cur_subsong = 0;
+                    cur_subsong += (action == '.') ? 1 : -1;
+                    if (cur_subsong < 0) cur_subsong = 0;
+                    replay_same = 1;
+                }
+            } else {
+                idx++;
+            }
 #else
             fprintf(stderr, "real-time output is Windows-only; use --wav\n");
-            sid_model_free(m);
+            sink_free(&m);
             free_song(&song);
             break;
 #endif
         }
 
-        sid_model_free(m);
+        sink_free(&m);
         free_song(&song);
+
+        if (replay_same) continue;
 
         if (!wav_path && !info_only) {
             int k = kb_take();

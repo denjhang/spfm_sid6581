@@ -24,12 +24,25 @@
 
 #include "sid_rsid.h"
 #include "sidvgm.h"
+#include "sid_websid.h"
+#include "sid_lsfp.h"
+
+/* Recording back ends, in order of preference. lsfp is libsidplayfp running
+ * its own 6502/VIC/CIA; websid is the vendored WebSid; native is ours. */
+enum { ENGINE_LSFP = 0, ENGINE_WEBSID = 1, ENGINE_NATIVE = 2 };
+
+static const char *engine_name(int e)
+{
+    return e == ENGINE_LSFP ? "lsfp"
+         : e == ENGINE_WEBSID ? "websid" : "native";
+}
 
 static void usage(const char *argv0)
 {
     fprintf(stderr,
             "usage: %s <file.sid> [<out.sidreg|out.sidvgm>] "
-            "[--seconds N] [--subsong N] [--comment TEXT]\n"
+            "[--seconds N] [--subsong N] [--comment TEXT] "
+            "[--engine lsfp|websid|native]\n"
             "       %s <file.sid> --info\n"
             "       %s <file.sidvgm> --dump [--cmds N]\n"
             "       %s <file.sidvgm> <out.sidreg>\n",
@@ -55,11 +68,24 @@ int main(int argc, char **argv)
     int subsong = -1;
     int info_only = 0;
     int dump_only = 0;
+    /* libsidplayfp by default: it runs the reference player's own 6502, VIC
+     * and CIA, so the register stream and its intra-frame timing are the
+     * benchmark. --engine websid / native pick the other recorders. */
+    int engine = ENGINE_LSFP;
     unsigned max_cmds = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--seconds") && i + 1 < argc) {
             seconds = atof(argv[++i]);
+        } else if (!strcmp(argv[i], "--engine") && i + 1 < argc) {
+            const char *e = argv[++i];
+            if (!strcmp(e, "lsfp") || !strcmp(e, "libsidplayfp")) engine = ENGINE_LSFP;
+            else if (!strcmp(e, "websid")) engine = ENGINE_WEBSID;
+            else if (!strcmp(e, "native")) engine = ENGINE_NATIVE;
+            else {
+                fprintf(stderr, "--engine must be lsfp, websid or native\n");
+                return 1;
+            }
         } else if (!strcmp(argv[i], "--subsong") && i + 1 < argc) {
             subsong = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--comment") && i + 1 < argc) {
@@ -148,13 +174,27 @@ int main(int argc, char **argv)
 
     if (info_only) return 0;
 
-    printf("  running 6502 for %.1f s...\n", seconds);
+    printf("  running %s for %.1f s...\n", engine_name(engine), seconds);
     sid_event_t *ev = NULL;
     size_t n = 0;
     char err[128];
-    if (sid_song_extract(in_path, subsong, seconds, &ev, &n, &info,
-                         err, sizeof err) != 0) {
-        fprintf(stderr, "extract failed: %s\n", err);
+    int rc;
+    switch (engine) {
+    case ENGINE_LSFP:
+        rc = sid_lsfp_extract(in_path, subsong, seconds, &ev, &n, &info,
+                              err, sizeof err);
+        break;
+    case ENGINE_WEBSID:
+        rc = sid_websid_extract(in_path, subsong, seconds, &ev, &n, &info,
+                                err, sizeof err);
+        break;
+    default:
+        rc = sid_song_extract(in_path, subsong, seconds, &ev, &n, &info,
+                              err, sizeof err);
+        break;
+    }
+    if (rc != 0) {
+        fprintf(stderr, "extract failed (%s): %s\n", engine_name(engine), err);
         return 1;
     }
     double len_ms = n ? ev[n - 1].t_ms : 0.0;

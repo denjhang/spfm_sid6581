@@ -1,7 +1,26 @@
 # build artifacts
-build/*.o
-build/*.exe
-build/*.dll
+build/
+sid_cache/
+
+# Upstream trees are vendored as archives; the unpacked sources are what the
+# build reads, but their configure/make output must never be committed.
+third_party/upstream/*/src/.libs/
+third_party/upstream/*/src/.deps/
+third_party/upstream/*/.libs/
+third_party/upstream/*/.deps/
+third_party/upstream/*/*.o
+third_party/upstream/*/*.lo
+third_party/upstream/*/*.la
+third_party/upstream/*/configure.log
+third_party/upstream/*/make.log
+third_party/upstream/*/install.log
+third_party/upstream/*/config.log
+third_party/upstream/*/config.status
+third_party/upstream/*/libtool
+third_party/upstream/*/stamp-h1
+
+# libtool descriptors; the static libraries next to them are what we link
+*.la
 
 # extracted reference archives (keep the zips, drop the unpacked trees)
 refs/x/
@@ -11,9 +30,6 @@ refs/x/
 *.swp
 .DS_Store
 Thumbs.db
-
-# rendered .sid streams (regenerated on demand, seconds per file)
-sid_cache/
 
 # local music library (copyrighted HVSC tunes, not published here)
 sid/

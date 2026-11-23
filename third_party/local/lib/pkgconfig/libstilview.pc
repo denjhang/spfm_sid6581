@@ -1,0 +1,10 @@
+prefix=/e/working/zcode-projects/spfm_sid6581/third_party/local
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: libstilview
+Description: STILview library.
+Version: 3.1.2
+Libs: -L${libdir} -lstilview
+Cflags: -I${includedir}

@@ -18,17 +18,23 @@ SID 6581 / 8580 挂到 SPFM 并行总线的驱动 + 控制台冒烟测试。
 | [docs/驱动说明.md](docs/驱动说明.md) | 驱动 API、写模式、字节流验证方法 |
 | [docs/播放器使用说明.md](docs/播放器使用说明.md) | **PowerShell 用法**：`sidplay`/`sidlist`/`sidextract`、定时器与发送粒度、排错 |
 | [docs/sidvgm文件规范.md](docs/sidvgm文件规范.md) | **格式规范**：VGM 式容器、相对偏移、0x65/66/67 芯片 ID、0x41/42/43 写命令、GD3 |
-| [docs/sidvgm录制与离线播放.md](docs/sidvgm录制与离线播放.md) | **录制 + 软件 SID 模型播放**：`sidextract` 出 sidvgm、`sidvgmplay` 出 WAV/出声 |
+| [docs/sidvgm录制与离线播放.md](docs/sidvgm录制与离线播放.md) | **录制 + 离线播放**：默认 libsidplayfp + reSIDfp（与标杆逐字节一致）；`--engine` / `--model` 可切回 websid / native |
+| [docs/libsidplayfp构建.md](docs/libsidplayfp构建.md) | **音质标杆**：原版 libsidplayfp 3.1.2 + reSIDfp 1.3.0 的构建方法，以及为什么 WebSid 不能当标准 |
+| [third_party/upstream/README.md](third_party/upstream/README.md) | 上游 WebSid / libsidplayfp / libresidfp 原样源码 + 压缩包（换版本时从这里重取） |
 
 ## 当前状态
 
-**✅ 已上机验证通过：三个声部同时演奏正常，`.sid` 播放已跑通。**
+**✅ 已上机验证通过：三个声部同时演奏正常，`.sid` 播放已跑通；
+带中断、带数字鼓的曲目（PSID 与 RSID）离线回放全部正常。**
 
 - 写时序已解决，单次写入（`--repeat 1`）稳定，音高正确
 - `music` 命令三声部同时工作：脉冲波旋律 + 三角波低音 + 噪声打击乐
 - 曲目：小星星、欢乐颂、生日快乐、巴赫（移植自 `Arduino_SID/SID_Bach`）
 - `sidplay` 可以直接放 C64 的 `.sid` 文件：内嵌 6502 跑一遍，把寄存器流按时序推到
   真芯片上；10 秒 R-Type 实测最大滞后 2 ms（一帧 19.96 ms）
+- 离线引擎换成了 libsidplayfp 3.1.2 + reSIDfp 1.3.0：CIA 中断、RSID、数字鼓
+  （`$D418` 采样和 `$D416/$D417` 滤波扫描两种）都能还原，
+  输出与官方 `lsfpref.exe` 逐字节相同
 
 问题曾是：只有 `--repeat` ≥ 4 才能稳定发声，且音高不跟随指令。根因是 `/CS` 与 `R/W`
 两路不同源（一路过两个 NOR 门、一路裸接 `/WR`），且 `/CS` 在两相之间一直是低的。
@@ -174,10 +180,57 @@ MinGW-w64（本机在 `D:\msys64`）：
 
 ```bash
 export PATH="/d/msys64/mingw64/bin:/d/msys64/usr/bin:$PATH"
-make
+make            # 硬件播放器 + 两个离线工具
+make tools      # 只重新编两个离线工具（播放器正在跑时用这个）
+make ref        # 只编参考渲染器 build/lsfpref.exe
 ```
 
-产物：`build/sidtest.exe`（已静态链接，只需同目录的 `ftd2xx64.dll`）。
+产物在 `build/`：
+
+| 文件 | 作用 |
+|---|---|
+| `sidtest.exe` | 硬件播放器（已静态链接，只需同目录的 `ftd2xx64.dll`） |
+| `sidextract.exe` | `.sid` → `.sidreg` / `.sidvgm` |
+| `sidvgmplay.exe` | 播放 `.sidvgm` / `.sidreg` / `.sid`，输出 WAV 或实时出声 |
+| `lsfpref.exe` | 音质标杆渲染器（`make ref`），原版 API，不含本项目 SID 代码 |
+
+两个离线工具的 SID 引擎用第三方的 libsidplayfp 3.1.2 + reSIDfp 1.3.0，
+静态库和头文件已经放在 `third_party/local/`，**直接 `make` 就能编，不需要先建库**。
+要从上游 release tarball 重新建库（换版本时）：
+
+```bash
+/d/msys64/usr/bin/bash.exe tools/build_libsidplayfp.sh
+```
+
+必须用 MSYS2 的 bash；Git Bash 的 autoconf 看不到 gcc。细节和三个坑见
+[docs/libsidplayfp构建.md](docs/libsidplayfp构建.md)。
+
+## 离线播放 / 试听（不需要硬件）
+
+```powershell
+# 实时出声，.sid 直通 libsidplayfp，和标杆逐字节相同
+.\build\sidvgmplay.exe sid\turboutrun.sid
+
+# 整目录连播，每首 60 秒
+.\build\sidvgmplay.exe sid --seconds 60
+
+# 出 WAV
+.\build\sidvgmplay.exe sid\turboutrun.sid --wav to.wav --seconds 20
+
+# 和真芯片走同一条路：先录寄存器流，再重放
+.\build\sidvgmplay.exe sid\turboutrun.sid --record
+
+# 8580 滤波曲线 / 只打印标题
+.\build\sidvgmplay.exe sid\Golden_Axe.sid --8580
+.\build\sidvgmplay.exe sid --info
+```
+
+按键：`n` 下一个文件、`b` 上一个、`,` / `.` 切子曲（仅 `.sid`）、`q` 退出。
+
+`--engine lsfp|websid|native` 选录制器，`--model lsfp|websid|native` 选音频后端，
+默认都是 `lsfp`。**带中断、带数字鼓的曲目只有 lsfp 是对的**（WebSid 在
+`turboutrun.sid` 上鼓点瞬态 0 vs 55）。详见
+[docs/sidvgm录制与离线播放.md](docs/sidvgm录制与离线播放.md)。
 
 ## 用法
 
