@@ -33,3 +33,6 @@ Thumbs.db
 
 # local music library (copyrighted HVSC tunes, not published here)
 sid/
+
+# packaged release zips
+spfm_sid6581-*.zip
