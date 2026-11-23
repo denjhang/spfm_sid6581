@@ -176,6 +176,11 @@ sidtest.exe sidlist sidvgm                        :: sidlist 也扫 .sidvgm / .s
 播放列表里按键：`n` 下一首、`b` 上一首、`,` 上一个子曲、`.` 下一个子曲、`q` 退出。
 不带 `--seconds` 时每首一直播到你按键，没有时长上限，也不去猜循环点。
 
+**`sidtest` 的行为是冻结的**：`.sid` 仍然走内置 fake6502（每帧一次 `play()`、
+`play=0000` 靠 `$FFFE`/`$0314` 猜入口），RSID 没有任何特殊处理，和以前逐字节
+相同。新增的只是"认识 `.sidvgm` 这个容器"——读完交给 `.sidreg` 现成的那条回放
+路径。`sidtest.exe` 不链接 libsidplayfp，想用那个引擎只有 `spfmplayer.exe`。
+
 | 参数 | 作用 | 默认 |
 |---|---|---|
 | `--seconds N` | 提取/播放多长 | 0 = 无限 |
