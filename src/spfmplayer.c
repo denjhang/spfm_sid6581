@@ -521,6 +521,13 @@ static int has_suffix(const char *s, const char *suf)
     return 1;
 }
 
+/* Everything spfmplayer can open, so a folder of any mix plays. */
+static int is_playable_name(const char *name)
+{
+    return has_suffix(name, ".sid") || has_suffix(name, ".sidvgm") ||
+           has_suffix(name, ".sidreg");
+}
+
 /* Play one file. Returns 0 when the file finished, 1 if the user asked for the
  * next track, -1 to quit, 2 on a load/emulation error (skip it). */
 static int play_file(const char *path, int *key)
@@ -618,11 +625,86 @@ static int play_file(const char *path, int *key)
 /* playlist                                                            */
 /* ------------------------------------------------------------------ */
 
-typedef struct { char name[260]; } entry_t;
+typedef struct {
+    char name[512];     /* relative to the playlist root, so a recursive walk
+                         * keeps the subdirectory ("rsid/x.sidvgm") */
+} entry_t;
 
 static int cmp_entry(const void *a, const void *b)
 {
     return strcmp(((const entry_t *)a)->name, ((const entry_t *)b)->name);
+}
+
+static int add_entry(entry_t **list, int *n, int *cap, const char *relname)
+{
+    if (*n == *cap) {
+        int want = *cap ? *cap * 2 : 64;
+        entry_t *nl = (entry_t *)realloc(*list, (size_t)want * sizeof(*nl));
+        if (!nl) return -1;
+        *list = nl;
+        *cap = want;
+    }
+    snprintf((*list)[*n].name, sizeof (*list)[*n].name, "%.511s", relname);
+    (*n)++;
+    return 0;
+}
+
+/* Walk the whole tree: sid/ and sidvgm/ both keep an rsid/ subdirectory, and a
+ * top-level-only listing silently hid almost every tune. */
+static int scan_walk(const char *root, const char *rel,
+                     entry_t **list, int *n, int *cap)
+{
+#ifdef _WIN32
+    char pattern[1024];
+    if (*rel) snprintf(pattern, sizeof pattern, "%s/%s/*", root, rel);
+    else      snprintf(pattern, sizeof pattern, "%s/*", root);
+
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return (*n > 0) ? 0 : -1;
+    do {
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+
+        char child[1024];
+        if (*rel) snprintf(child, sizeof child, "%s/%s", rel, fd.cFileName);
+        else      snprintf(child, sizeof child, "%s", fd.cFileName);
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            scan_walk(root, child, list, n, cap);
+            continue;
+        }
+        if (!is_playable_name(fd.cFileName)) continue;
+        if (add_entry(list, n, cap, child) != 0) { FindClose(h); return -1; }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    char full[1024];
+    if (*rel) snprintf(full, sizeof full, "%s/%s", root, rel);
+    else      snprintf(full, sizeof full, "%s", root);
+
+    DIR *d = opendir(full);
+    if (!d) return (*n > 0) ? 0 : -1;
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+
+        char child[1024];
+        if (*rel) snprintf(child, sizeof child, "%s/%s", rel, de->d_name);
+        else      snprintf(child, sizeof child, "%s", de->d_name);
+
+        char childfull[1200];
+        snprintf(childfull, sizeof childfull, "%s/%s", root, child);
+        struct stat sst;
+        if (stat(childfull, &sst) == 0 && S_ISDIR(sst.st_mode)) {
+            scan_walk(root, child, list, n, cap);
+            continue;
+        }
+        if (!is_playable_name(de->d_name)) continue;
+        if (add_entry(list, n, cap, child) != 0) { closedir(d); return -1; }
+    }
+    closedir(d);
+#endif
+    return 0;
 }
 
 static int scan_dir(const char *dir, entry_t **out, int *count)
@@ -630,41 +712,10 @@ static int scan_dir(const char *dir, entry_t **out, int *count)
     entry_t *list = NULL;
     int n = 0, cap = 0;
 
-#ifdef _WIN32
-    char pattern[512];
-    snprintf(pattern, sizeof pattern, "%s/*.sid", dir);
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return -1;
-    do {
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        if (n == cap) {
-            cap = cap ? cap * 2 : 64;
-            entry_t *nl = (entry_t *)realloc(list, (size_t)cap * sizeof(*nl));
-            if (!nl) { free(list); FindClose(h); return -1; }
-            list = nl;
-        }
-        snprintf(list[n].name, sizeof list[n].name, "%s", fd.cFileName);
-        n++;
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
-#else
-    DIR *d = opendir(dir);
-    if (!d) return -1;
-    struct dirent *de;
-    while ((de = readdir(d))) {
-        if (!has_suffix(de->d_name, ".sid")) continue;
-        if (n == cap) {
-            cap = cap ? cap * 2 : 64;
-            entry_t *nl = (entry_t *)realloc(list, (size_t)cap * sizeof(*nl));
-            if (!nl) { free(list); closedir(d); return -1; }
-            list = nl;
-        }
-        snprintf(list[n].name, sizeof list[n].name, "%s", de->d_name);
-        n++;
+    if (scan_walk(dir, "", &list, &n, &cap) != 0 && n == 0) {
+        free(list);
+        return -1;
     }
-    closedir(d);
-#endif
 
     if (n > 1) qsort(list, (size_t)n, sizeof(*list), cmp_entry);
     *out = list;

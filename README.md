@@ -156,7 +156,7 @@ CIA：`play()` 由曲目真正的 CIA/VIC 中断触发，所以
 
 ## 调试与录制：`sidtest.exe`
 
-`sid/` 下面有 6 首单曲和 `sid/rsid/` 里 111 首 RSID。`sidtest` 是上机调试工具
+`sid/` 下面有 12 首单曲、`sid/rsid/` 里 111 首、`sid/rsid/ganasis/` 里 3 首（共 126）。`sidtest` 是上机调试工具
 （探针、时序、寄存器扫描），它的 `.sid` 播放走内置 6502，用于对照和离线录制。
 
 ```cmd
