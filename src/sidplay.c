@@ -936,6 +936,45 @@ static int scan_dir(const char *dir, entry_t **out, int *count)
     return 0;
 }
 
+/* Directory part of an entry ("a/b/c.sidvgm" -> "a/b", "c.sid" -> ""). */
+static void entry_dir(const char *name, char *out, size_t len)
+{
+    const char *slash = NULL;
+    for (const char *p = name; *p; p++)
+        if (*p == '/' || *p == '\\') slash = p;
+    if (!slash) { out[0] = 0; return; }
+    size_t k = (size_t)(slash - name);
+    if (k >= len) k = len - 1;
+    memcpy(out, name, k);
+    out[k] = 0;
+}
+
+/* Bounds of the run of entries sharing this entry's directory.
+ *
+ * The playlist is sorted by relative path, so every file of one folder is
+ * contiguous. A recording that has subsongs lives in its own folder
+ * (Golden_Axe/Golden_Axe_s01.sidvgm ...), which is what makes "," and "."
+ * mean "previous/next subsong" for .sidvgm exactly as they do for .sid. */
+static void group_bounds(const entry_t *files, int n, int idx, int *first, int *last)
+{
+    char here[512], other[512];
+    entry_dir(files[idx].name, here, sizeof here);
+
+    int f = idx, l = idx;
+    while (f > 0) {
+        entry_dir(files[f - 1].name, other, sizeof other);
+        if (strcmp(here, other) != 0) break;
+        f--;
+    }
+    while (l + 1 < n) {
+        entry_dir(files[l + 1].name, other, sizeof other);
+        if (strcmp(here, other) != 0) break;
+        l++;
+    }
+    *first = f;
+    *last  = l;
+}
+
 static int cmd_playlist(int argc, char **argv)
 {
     const char *dir = "sid";
@@ -998,28 +1037,41 @@ static int cmd_playlist(int argc, char **argv)
 
     int idx = start_idx < 0 ? 0 : (start_idx >= nfiles ? nfiles - 1 : start_idx);
 
+    /* `subsong` is the CLI request and applies to a .sid. For a recording the
+     * subsong is a file inside the tune's own folder, so the selected index
+     * there is the play position instead. */
+    int sid_sub = subsong;
+
     while (idx >= 0 && idx < nfiles) {
         char path[768];
         snprintf(path, sizeof path, "%s/%s", dir, files[idx].name);
 
-        /* A rendered stream has no PSID header for sid_probe to read, so its
-         * title comes from the container (GD3 for .sidvgm) or the file name. */
+        int first, last;
+        group_bounds(files, nfiles, idx, &first, &last);
+        const int gn = last - first + 1;      /* files in this tune's folder */
         const int rendered = is_rendered(path);
-        sid_song_info_t probe;
-        int nsongs = 1;
-        if (!rendered && sid_song_probe(path, &probe) == 0) {
-            nsongs = probe.n_songs ? probe.n_songs : 1;
-            if (subsong >= nsongs) subsong = nsongs - 1;
-            printf("[%d/%d] %s\n        %s / %s  (%d subsong%s)\n",
-                   idx + 1, nfiles, files[idx].name,
-                   probe.name[0] ? probe.name : "?", probe.author[0] ? probe.author : "?",
-                   nsongs, nsongs == 1 ? "" : "s");
-            printf("        subsong %d, playing...\n", subsong);
-        } else if (rendered) {
-            printf("[%d/%d] %s  (%s)\n", idx + 1, nfiles, files[idx].name,
-                   is_sidvgm(path) ? "sidvgm" : "sidreg");
+
+        if (rendered) {
+            printf("[%d/%d] %s%s\n", idx + 1, nfiles, files[idx].name,
+                   gn > 1 ? "" : (is_sidvgm(path) ? "  (sidvgm)" : "  (sidreg)"));
+            if (gn > 1)
+                printf("        subsong %d of %d, playing...\n",
+                       idx - first + 1, gn);
         } else {
-            printf("[%d/%d] %s\n", idx + 1, nfiles, files[idx].name);
+            sid_song_info_t probe;
+            int nsongs = 1;
+            if (sid_song_probe(path, &probe) == 0) {
+                nsongs = probe.n_songs ? probe.n_songs : 1;
+                if (sid_sub >= nsongs) sid_sub = nsongs - 1;
+                printf("[%d/%d] %s\n        %s / %s  (%d subsong%s)\n",
+                       idx + 1, nfiles, files[idx].name,
+                       probe.name[0] ? probe.name : "?",
+                       probe.author[0] ? probe.author : "?",
+                       nsongs, nsongs == 1 ? "" : "s");
+                printf("        subsong %d, playing...\n", sid_sub);
+            } else {
+                printf("[%d/%d] %s\n", idx + 1, nfiles, files[idx].name);
+            }
         }
         fflush(stdout);
 
@@ -1036,7 +1088,7 @@ static int cmd_playlist(int argc, char **argv)
             stream_t st;
             char err[128];
             double span = seconds > 0 ? seconds : 1e9;
-            if (load_stream(path, subsong, span, 0, &st, err, sizeof err) != 0) {
+            if (load_stream(path, sid_sub, span, 0, &st, err, sizeof err) != 0) {
                 fprintf(stderr, "  skip: %s\n", err);
                 idx++;
                 continue;
@@ -1045,7 +1097,7 @@ static int cmd_playlist(int argc, char **argv)
             stream_free(&st);
         } else {
             /* Normal mode: run live, forever, until a key arrives. */
-            rc = stream_play_sid(path, subsong, speed, NULL);
+            rc = stream_play_sid(path, sid_sub, speed, NULL);
         }
 
         hw_mute();
@@ -1056,10 +1108,50 @@ static int cmd_playlist(int argc, char **argv)
         if (action == 'q') break;
 
         switch (action) {
-        case 'b': idx = idx > 0 ? idx - 1 : 0; printf("\n[BACK]\n\n"); break;
-        case ',': subsong = subsong > 0 ? subsong - 1 : 0; printf("\n[SUBSONG %d]\n\n", subsong); break;
-        case '.': subsong++; printf("\n[SUBSONG %d]\n\n", subsong); break;
-        default:  idx++; break;
+        /* b = the previous tune, not the previous subsong: stepping back one
+         * file inside a 23-subsong folder is never what a listener means. */
+        case 'b':
+            if (idx <= 0) {
+                idx = 0;
+            } else {
+                int pf, pl;
+                group_bounds(files, nfiles, idx - 1, &pf, &pl);
+                idx = pf;
+            }
+            printf("\n[BACK]\n\n");
+            break;
+
+        /* Either kind of subsong change: a recording steps through its own
+         * folder, a .sid re-extracts the same file with another subsong. */
+        case ',':
+            if (rendered && gn > 1) {
+                idx = idx > first ? idx - 1 : first;
+                printf("\n[SUBSONG %d/%d]\n\n", idx - first + 1, gn);
+            } else {
+                sid_sub = sid_sub > 0 ? sid_sub - 1 : 0;
+                printf("\n[SUBSONG %d]\n\n", sid_sub);
+            }
+            break;
+
+        case '.':
+            if (rendered && gn > 1) {
+                idx = idx < last ? idx + 1 : last;
+                printf("\n[SUBSONG %d/%d]\n\n", idx - first + 1, gn);
+            } else {
+                sid_sub++;
+                printf("\n[SUBSONG %d]\n\n", sid_sub);
+            }
+            break;
+
+        /* n = leave this tune behind; for a folder that means all its
+         * subsongs, otherwise one file. */
+        case 'n':
+            idx = (rendered && gn > 1) ? last + 1 : idx + 1;
+            break;
+
+        default:
+            idx++;
+            break;
         }
         (void)rc;
         spfm_delay_ms(200);

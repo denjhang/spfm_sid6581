@@ -38,3 +38,5 @@ sidvgm/
 
 # packaged release zips
 spfm_sid6581-*.zip
+refs/*.zip
+refs/*.pdf
