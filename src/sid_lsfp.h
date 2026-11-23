@@ -42,6 +42,42 @@ int sid_lsfp_extract(const char *path, int subsong, double seconds,
                      sid_event_t **events, size_t *count,
                      sid_song_info_t *info, char *err, size_t errlen);
 
+/* ---- live streaming (real hardware) --------------------------------- *
+ * The hardware player cannot render audio, it needs the register writes as
+ * they happen. sid_lsfp_extract() pays for the whole song up front, which is
+ * wrong for a tune that has no end: a .sid plays forever. This walks
+ * libsidplayfp one frame at a time and hands back only that frame's writes, so
+ * the emulation of frame N+1 hides inside the ~20 ms frame N is playing.
+ *
+ * Same 6502/VIC/CIA as the extractor, so $D418 drum writes and CIA timer
+ * cadence are the reference ones rather than the old fake6502 approximation.
+ *
+ *   sid_lsfp_stream_t *s = sid_lsfp_stream_open(path, subsong, err, sizeof err);
+ *   while (sid_lsfp_stream_next(s, &ev, &n) == 0) {
+ *       ... emit ev[0..n) at their t_ms, then wait for the frame to end ...
+ *   }
+ *
+ * t_ms is absolute from the first play frame for the whole session. Only one
+ * stream is open at a time in practice, but the API holds no global state. */
+
+typedef struct sid_lsfp_stream sid_lsfp_stream_t;
+
+sid_lsfp_stream_t *sid_lsfp_stream_open(const char *path, int subsong,
+                                        char *err, size_t errlen);
+
+/* Advance one frame (except the first call, which also returns the init
+ * writes and may run a couple of frames to find where the init burst ends).
+ * Returns 0 on success, -1 when the tune ended or the emulator failed.
+ * *ev points into a buffer owned by the stream and is valid until the next
+ * call; *n may be 0 for a frame that writes no registers. */
+int sid_lsfp_stream_next(sid_lsfp_stream_t *s,
+                         const sid_event_t **ev, size_t *n);
+
+/* Length of one frame in ms (19.96 PAL / 16.67 NTSC). */
+double sid_lsfp_stream_frame_ms(const sid_lsfp_stream_t *s);
+
+void sid_lsfp_stream_close(sid_lsfp_stream_t *s);
+
 /* ---- audio renderer, same shape as sidmodel.h ------------------------ */
 
 typedef struct sid_lsfp_render sid_lsfp_render_t;

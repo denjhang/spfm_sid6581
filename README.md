@@ -16,7 +16,8 @@ SID 6581 / 8580 挂到 SPFM 并行总线的驱动 + 控制台冒烟测试。
 | [docs/接线表_374_02.md](docs/接线表_374_02.md) | 最早的接线（问题来源，仅作历史记录） |
 | [docs/交接文档.md](docs/交接文档.md) | 项目状态、寄存器速查、风险清单 |
 | [docs/驱动说明.md](docs/驱动说明.md) | 驱动 API、写模式、字节流验证方法 |
-| [docs/播放器使用说明.md](docs/播放器使用说明.md) | **PowerShell 用法**：`sidplay`/`sidlist`/`sidextract`、定时器与发送粒度、排错 |
+| [docs/播放器_spfmplayer.md](docs/播放器_spfmplayer.md) | **听音乐用这个**：`spfmplayer.exe` 的三种输入、播放列表、`--engine lsfp/native`、排错 |
+| [docs/播放器使用说明.md](docs/播放器使用说明.md) | **调试用**：`sidtest.exe` 的 `sidplay`/`sidlist`/`sidextract`、定时器与发送粒度、排错 |
 | [docs/sidvgm文件规范.md](docs/sidvgm文件规范.md) | **格式规范**：VGM 式容器、相对偏移、0x65/66/67 芯片 ID、0x41/42/43 写命令、GD3 |
 | [docs/sidvgm录制与离线播放.md](docs/sidvgm录制与离线播放.md) | **录制 + 离线播放**：默认 libsidplayfp + reSIDfp（与标杆逐字节一致）；`--engine` / `--model` 可切回 websid / native |
 | [docs/libsidplayfp构建.md](docs/libsidplayfp构建.md) | **音质标杆**：原版 libsidplayfp 3.1.2 + reSIDfp 1.3.0 的构建方法，以及为什么 WebSid 不能当标准 |
@@ -37,6 +38,8 @@ SID 6581 / 8580 挂到 SPFM 并行总线的驱动 + 控制台冒烟测试。
 - 离线引擎换成了 libsidplayfp 3.1.2 + reSIDfp 1.3.0：CIA 中断、RSID、数字鼓
   （`$D418` 采样和 `$D416/$D417` 滤波扫描两种）都能还原，
   输出与官方 `lsfpref.exe` 逐字节相同
+- **`spfmplayer.exe`（SPFM SIDVGM Player）** 把这个引擎接到真芯片上：边仿真边推，
+  第 N+1 帧在仿真时第 N 帧还在响，所以 digi 鼓和真 RSID 的节奏都还在
 
 问题曾是：只有 `--repeat` ≥ 4 才能稳定发声，且音高不跟随指令。根因是 `/CS` 与 `R/W`
 两路不同源（一路过两个 NOR 门、一路裸接 `/WR`），且 `/CS` 在两相之间一直是低的。
@@ -117,11 +120,44 @@ sidtest.exe music --song twinkle --bpm 150 --loops 2
 sidtest.exe --dry-run music --song bach
 ```
 
-## 播放 C64 的 .sid 文件
+## 听音乐：`spfmplayer.exe`
 
-`sid/` 下面有 6 首单曲和 `sid/rsid/` 里 93 首 RSID。`.sid` 里不是音符而是 6502 代码，
-所以播放流程是：**内嵌 6502 跑一遍 → 记录每一条寄存器写入和时间戳 → 按原速推给真芯片**。
-全程纯 C，不依赖 Python。
+**听曲子用这个。** 它专做一件事：把 SID 曲目放到真芯片上。三种输入都认。
+`sidtest.exe` 保留为调试工具，它的 `sidplay` 在普通 PSID 上听感仍更好。
+
+```cmd
+spfmplayer.exe sid\Golden_Axe.sid            :: 一直播到按键
+spfmplayer.exe sid\R-Type.sid --seconds 60    :: 只播 60 秒
+spfmplayer.exe sid\rsid                      :: 整个目录连播
+spfmplayer.exe sid\rsid --list               :: 先看目录里有什么
+```
+
+`.sid` 的录制器默认是 **libsidplayfp**（`--engine lsfp`），它跑自己的 6502 + VIC +
+CIA：`play()` 由曲目真正的 CIA/VIC 中断触发，所以
+
+- **digi 鼓**能听到（同一首 Turbo Outrun：lsfp 记到 98035 次 `$D418` 写入，
+  内置核心是 0）；
+- **真 RSID**（`play=0000`、自己装中断向量的曲目）按原来的速率跑，不再被当成
+  每帧一次的 VBI 曲目。
+
+**但普通 PSID 用 `--engine native`（内置 fake6502，纯 C）听着更好**——这是人工
+试听的结论。普通 PSID 每帧只调一次 `play()`、没有帧内 `$D418` 写入，两套核心的
+寄存器流本就接近。所以：
+
+| 曲子 | 用哪个 |
+|---|---|
+| 普通 PSID | `--engine native`（默认仍是 `lsfp`，两者都试一遍最稳） |
+| digi 鼓 / 真 RSID（`play=0000`） | `--engine lsfp` |
+
+旧的 `sidtest.exe sidplay` 仍然保留，走的就是 `native` 那条路。详见
+[docs/播放器_spfmplayer.md](docs/播放器_spfmplayer.md)。
+
+播放列表按键：`n` 下一首、`b` 上一首、`,` 上一个子曲、`.` 下一个子曲、`q` 退出。
+
+## 调试与录制：`sidtest.exe`
+
+`sid/` 下面有 6 首单曲和 `sid/rsid/` 里 111 首 RSID。`sidtest` 是上机调试工具
+（探针、时序、寄存器扫描），它的 `.sid` 播放走内置 6502，用于对照和离线录制。
 
 ```cmd
 sidtest.exe sidinfo sid/Commando.sid              :: 看标题、PAL/NTSC、子曲数
@@ -182,8 +218,9 @@ MinGW-w64（本机在 `D:\msys64`）：
 
 ```bash
 export PATH="/d/msys64/mingw64/bin:/d/msys64/usr/bin:$PATH"
-make            # 硬件播放器 + 两个离线工具
-make tools      # 只重新编两个离线工具（播放器正在跑时用这个）
+make            # 全部：sidtest + spfmplayer + 两个离线工具
+make player     # 只编 build/spfmplayer.exe（边跑边听的那个）
+make tools      # 只重新编两个离线工具（硬件程序正在跑时用这个）
 make ref        # 只编参考渲染器 build/lsfpref.exe
 ```
 
@@ -191,7 +228,8 @@ make ref        # 只编参考渲染器 build/lsfpref.exe
 
 | 文件 | 作用 |
 |---|---|
-| `sidtest.exe` | 硬件播放器（已静态链接，只需同目录的 `ftd2xx64.dll`） |
+| `spfmplayer.exe` | **听音乐用这个**：`.sid` / `.sidvgm` / `.sidreg` / 目录，走真芯片 |
+| `sidtest.exe` | 上机调试工具：寄存器试探、时序扫描、自检（也要 `ftd2xx64.dll`） |
 | `sidextract.exe` | `.sid` → `.sidreg` / `.sidvgm` |
 | `sidvgmplay.exe` | 播放 `.sidvgm` / `.sidreg` / `.sid`，输出 WAV 或实时出声 |
 | `lsfpref.exe` | 音质标杆渲染器（`make ref`），原版 API，不含本项目 SID 代码 |

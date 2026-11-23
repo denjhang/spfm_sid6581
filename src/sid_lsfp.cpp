@@ -325,7 +325,227 @@ int sid_lsfp_extract(const char *path, int subsong, double seconds,
     return 0;
 }
 
-/* ---- reSIDfp audio renderer ------------------------------------------ */
+/* ---- live streaming, one frame at a time ----------------------------- *
+ * Same capture SID as the extractor, but the engine is clocked in chunks and
+ * the replay boundary is a frame, not a duration. The player then emulates
+ * frame N+1 while the hardware is still playing frame N, which is what makes
+ * an endless .sid playable without pre-rendering it.
+ *
+ * The frame grid is kept in PHI1 cycles from the first play burst (the same
+ * origin find_play_origin() picks), so it cannot drift: frame k ends at
+ * origin + k*frame_cycles regardless of how the chunking fell. */
+
+struct sid_lsfp_stream {
+    capture_t        cap;
+    sidplayfp       *engine;
+    SidTune         *tune;
+    CaptureBuilder  *builder;
+    double           clock_hz;
+    double           frame_cycles;
+    double           vsync_hz;
+    double           origin;          /* cycles at t=0 */
+    double           boundary;        /* end of the next frame, in cycles */
+    long long        run;             /* cycles played so far */
+    size_t           consumed;        /* cap.ev[0..consumed) already returned */
+    int              started;
+    int              finished;
+    std::vector<sid_event_t> out;
+};
+
+sid_lsfp_stream_t *sid_lsfp_stream_open(const char *path, int subsong,
+                                        char *err, size_t errlen)
+{
+    if (err && errlen) err[0] = 0;
+
+    sid_song_info_t hdr;
+    if (sid_song_probe(path, &hdr) != 0) {
+        if (err && errlen) snprintf(err, errlen, "not a PSID/RSID file");
+        return NULL;
+    }
+
+    sid_lsfp_stream_t *s = new (std::nothrow) sid_lsfp_stream();
+    if (!s) {
+        if (err && errlen) snprintf(err, errlen, "out of memory");
+        return NULL;
+    }
+    memset(&s->cap, 0, sizeof s->cap);
+    s->engine = new (std::nothrow) sidplayfp();
+    s->builder = new (std::nothrow) CaptureBuilder(&s->cap);
+    s->tune = new (std::nothrow) SidTune(path);
+    s->origin = -1.0;
+    s->boundary = 0.0;
+    s->run = 0;
+    s->consumed = 0;
+    s->started = 0;
+    s->finished = 0;
+
+    if (!s->engine || !s->builder || !s->tune) {
+        if (err && errlen) snprintf(err, errlen, "out of memory");
+        sid_lsfp_stream_close(s);
+        return NULL;
+    }
+    if (!s->tune->getStatus()) {
+        if (err && errlen) snprintf(err, errlen, "%s", s->tune->statusString());
+        sid_lsfp_stream_close(s);
+        return NULL;
+    }
+    s->tune->selectSong(subsong < 0 ? 0u : (unsigned)subsong + 1u);
+
+    SidConfig cfg;
+    cfg.frequency = 44100;
+    cfg.samplingMethod = SidConfig::INTERPOLATE;
+    cfg.defaultC64Model = SidConfig::PAL;
+    cfg.forceC64Model = false;
+    cfg.defaultSidModel = SidConfig::MOS6581;
+    cfg.forceSidModel = false;
+    cfg.sidEmulation = s->builder;
+    cfg.powerOnDelay = SidConfig::MAX_POWER_ON_DELAY;
+
+    if (!s->engine->config(cfg) || !s->engine->load(s->tune)) {
+        if (err && errlen) snprintf(err, errlen, "%s", s->engine->error());
+        sid_lsfp_stream_close(s);
+        return NULL;
+    }
+
+    const SidTuneInfo *ti = s->tune->getInfo();
+    if (ti->sidChips() > 1) {
+        if (err && errlen)
+            snprintf(err, errlen, "%d SID chips; the player drives one slot",
+                     ti->sidChips());
+        sid_lsfp_stream_close(s);
+        return NULL;
+    }
+
+    int pal;
+    resolve_clock(ti, &pal, &s->clock_hz, &s->vsync_hz);
+    s->frame_cycles = s->clock_hz / s->vsync_hz;
+    return s;
+}
+
+void sid_lsfp_stream_close(sid_lsfp_stream_t *s)
+{
+    if (!s) return;
+    delete s->engine;
+    delete s->builder;
+    delete s->tune;
+    free_capture(&s->cap);
+    delete s;
+}
+
+double sid_lsfp_stream_frame_ms(const sid_lsfp_stream_t *s)
+{
+    return s ? 1000.0 / s->vsync_hz : 0.0;
+}
+
+/* Clock the engine by `cycles`. Returns 0 on success. */
+static int stream_advance(sid_lsfp_stream_t *s, unsigned cycles)
+{
+    while (cycles > 0) {
+        unsigned step = cycles > 5000u ? 5000u : cycles;
+        int res = s->engine->play(step);
+        if (res < 0) return -1;
+        s->run += step;
+        cycles -= step;
+        if (s->cap.oom) return -1;
+    }
+    return 0;
+}
+
+int sid_lsfp_stream_next(sid_lsfp_stream_t *s, const sid_event_t **ev, size_t *n)
+{
+    if (!s || !ev || !n) return -1;
+    *ev = NULL;
+    *n = 0;
+    if (s->finished) return -1;
+
+    const double ms_per_cycle = 1000.0 / s->clock_hz;
+
+    /* First call: run until the init burst has ended and the first play burst
+     * has been seen, then hand back everything up to that point as t=0. */
+    if (!s->started) {
+        /* The origin is the first gap of more than half a frame; the init
+         * writes are everything before it. Some inits are not quick: R-Type
+         * spends ~160 ms there, so the search has to run well past three
+         * frames or it gives up and shifts the whole tune by that stall. One
+         * second of 6502 is a few tens of milliseconds of host time, paid
+         * once at open. */
+        const double search_limit = s->clock_hz * 1.0;
+        while (s->origin < 0.0) {
+            if ((double)s->run > search_limit) {
+                /* No recognisable gap (a tune that writes throughout init).
+                 * Treat the start of the stream as t=0 and let the frame grid
+                 * fall where it falls; timing is still monotonic. */
+                s->origin = s->cap.n ? s->cap.cyc[0] : 0.0;
+                break;
+            }
+            double found = -1.0;
+            for (size_t i = 1; i < s->cap.n; i++) {
+                if (s->cap.cyc[i] - s->cap.cyc[i - 1] > s->frame_cycles * 0.5) {
+                    found = s->cap.cyc[i];
+                    break;
+                }
+            }
+            if (found >= 0.0) { s->origin = found; break; }
+            if (stream_advance(s, 5000u) != 0) {
+                /* The tune halted during init. Return what we have, once. */
+                s->origin = 0.0;
+                s->finished = 1;
+                break;
+            }
+        }
+        if (s->origin < 0.0) s->origin = 0.0;
+
+        s->out.clear();
+        size_t i = 0;
+        for (; i < s->cap.n; i++) {
+            if (s->cap.cyc[i] >= s->origin) break;
+            double d = s->cap.cyc[i] - s->origin;
+            sid_event_t e = s->cap.ev[i];
+            e.t_ms = d < 0.0 ? 0.0 : d * ms_per_cycle;
+            s->out.push_back(e);
+        }
+        s->consumed = i;
+        s->boundary = s->origin + s->frame_cycles;
+        s->started = 1;
+        *ev = s->out.empty() ? NULL : s->out.data();
+        *n = s->out.size();
+        return 0;
+    }
+
+    /* One frame: clock exactly to the boundary, then take everything the
+     * engine wrote before it. */
+    double need = s->boundary - (double)s->run;
+    if (need > 0.0) {
+        /* Round up so the boundary is always reached; the leftover cycles are
+         * carried by the cycle stamps, not by the counter. */
+        long long want = (long long)(need + 0.5);
+        if (want < 1) want = 1;
+        if (stream_advance(s, (unsigned)want) != 0) s->finished = 1;
+    }
+
+    s->out.clear();
+    size_t i = s->consumed;
+    for (; i < s->cap.n; i++) {
+        if (s->cap.cyc[i] >= s->boundary) break;
+        sid_event_t e = s->cap.ev[i];
+        double d = s->cap.cyc[i] - s->origin;
+        e.t_ms = d < 0.0 ? 0.0 : d * ms_per_cycle;
+        s->out.push_back(e);
+    }
+    s->consumed = i;
+
+    if (s->finished) {
+        /* A halted tune still owes the caller this last frame's writes. */
+        if (s->out.empty()) return -1;
+    }
+
+    s->boundary += s->frame_cycles;
+    *ev = s->out.empty() ? NULL : s->out.data();
+    *n = s->out.size();
+    return 0;
+}
+
+/* ---- audio renderer ------------------------------------------ */
 
 struct sid_lsfp_render {
     reSIDfp::residfp *sid;

@@ -87,9 +87,10 @@ g++ -std=c++17 -O2 -I$P/include tools/lsfpref.cpp `
 - 我们自己的录制/渲染必须和它在**同一段**听到同样的鼓点数量与位置；
 - 只有通过了这一步，才谈"精度"和"体积"。
 
-## 现在已经接进两个工具
+## 现在已经接进三个程序
 
-`src/sid_lsfp.cpp` 把这两个库包成 C 接口，`sidextract` / `sidvgmplay` 默认就用它：
+`src/sid_lsfp.cpp` 把这两个库包成 C 接口，`sidextract` / `sidvgmplay` /
+`spfmplayer` 都用它：
 
 - **录制**（`--engine lsfp`）：自定义 `sidbuilder` + `sidemu`，`sidemu::write()` 是
   所有 `$D400-$D41F` 写入的唯一入口，在那里记下 libsidplayfp 自己的 PHI1 时钟。
@@ -112,3 +113,36 @@ g++ -std=c++17 -O2 -I$P/include tools/lsfpref.cpp `
 
 编译这两个文件需要的不是公开头文件，还要 libsidplayfp 源码树里的内部头
 （`src/sidemu.h` 等）。`makefile` 里的 `LS_CXXFLAGS` 已经带上了。
+
+## 流式录制：`spfmplayer.exe` 用的那条路
+
+上面的 `sid_lsfp_extract()` 是"录 N 秒再交出来"，适合出文件，不适合听：一首
+`.sid` 没有结尾，先录完就没有"一直在播"这回事了。
+
+`sid_lsfp_stream_*()` 是同一套捕获 SID，但边界换成帧：`sid_lsfp_stream_next()`
+只把引擎推到下一帧边界，返回这一帧的写入。第 N+1 帧的仿真发生在第 N 帧还在
+芯片上响的 19.96 ms 里，所以没有停顿、也不需要预渲染。
+
+时间戳是**从第一帧 play 突发算起的绝对 PHI1 周期**，帧边界钉在
+`origin + k * frame_cycles`，分块大小不影响结果。
+
+三个坑，都是实测踩出来的：
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 整首被推迟 163 ms（R-Type） | init 写了 160 ms 才有第一个 play 突发，搜索只给了 3 帧就放弃 | 搜索窗口放到 1 秒（`clock_hz * 1.0`） |
+| 某些曲目帧边界抖动 | 用 `run` 计数当边界，会随分块累积 | 边界用 `origin + k*frame_cycles`，`run` 只用来决定还要推多少 |
+| 最后一帧写入丢掉 | `finished` 后直接返回 -1 | 带 halt 的那一帧仍然把写入交出去，再返回 -1 |
+
+一致性用 `tools/streamcheck.cpp`（`make ref`）守住：
+
+```bash
+./build/streamcheck.exe sid/turboutrun.sid 10
+# extract : 47337 writes, last 9999.95 ms
+# stream  : 47340 writes over 546 frames, last 10000.43 ms
+# compare first 47337 writes (up to 10000.43 ms): identical (0 mismatches)
+```
+
+它把两条路径的每一条写入（寄存器、值、时间戳 ±1 ms）逐条比对。目前
+R-Type / Turbo Outrun / Giana RSID / Ambient / Alcorythm / Golden Axe /
+Echoes / 3_Ankare / L.E.D. Storm 全部 0 mismatch。

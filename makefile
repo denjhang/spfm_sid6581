@@ -51,6 +51,15 @@ SRCS := src/spfm_transport.c src/sid6581.c src/sid_freq_table.c \
 OBJS := $(patsubst src/%.c,$(BUILD)/%.o,$(SRCS))
 TARGET := $(BUILD)/sidtest.exe
 
+# The listening program: spfmplayer.exe. Same driver, plus libsidplayfp for the
+# .sid recorder and sidvgm for recorded streams. Separate binary from sidtest
+# on purpose - sidtest is the bring-up tool, this is the thing you leave
+# playing.
+PLAYER_SRCS := src/spfm_transport.c src/sid6581.c src/sid_freq_table.c \
+               src/sid_rsid.c src/sidvgm.c src/spfmplayer.c
+PLAYER_BIN  := $(BUILD)/spfmplayer.exe
+PLAYER_BIN_OBJS := $(patsubst src/%.c,$(BUILD)/%.o,$(PLAYER_SRCS))
+
 # Offline tools: no FTDI, no driver.
 #   sidextract  .sid -> .sidreg / .sidvgm
 #   sidvgmplay  .sidvgm / .sidreg -> WAV or waveOut, through a software model
@@ -64,17 +73,27 @@ PLAYER_OBJS  := $(BUILD)/sidvgmplay.o $(BUILD)/sidmodel.o \
                 $(BUILD)/sidvgm.o $(BUILD)/sid_rsid.o
 ENGINE_OBJS  := $(WS_OBJS) $(LS_OBJS)
 
-all: $(TARGET) tools
+all: $(TARGET) tools player
 
 # `make tools` is the safe target while the player binary is running.
+# `make player` builds spfmplayer.exe without touching sidtest.exe.
 tools: $(EXTRACT) $(PLAYER)
+
+player: $(PLAYER_BIN)
 
 # The reference renderer is built on demand (make ref), not by tools/all: it is
 # a measuring instrument, not something a user needs. Same for sidscan.
-ref: $(LSFPREF) $(SCAN)
+STREAMCHK := $(BUILD)/streamcheck.exe
+
+ref: $(LSFPREF) $(SCAN) $(STREAMCHK)
 
 $(LSFPREF): tools/lsfpref.cpp $(LS_LIBS) | $(BUILD)
 	$(CXX) -std=gnu++17 -O2 -I$(LS_DIR)/include -o $@ $< $(LS_LIBS) -static
+
+# Asserts that the live recorder in spfmplayer and the up-front recorder in
+# sidextract produce the same writes at the same times.
+$(STREAMCHK): tools/streamcheck.cpp $(LS_OBJS) $(BUILD)/sid_rsid.o $(LS_LIBS) | $(BUILD)
+	$(CXX) $(LS_CXXFLAGS) -o $@ $< $(LS_OBJS) $(BUILD)/sid_rsid.o $(LS_LIBS) -static
 
 $(SCAN): tools/sidscan.cpp $(LS_OBJS) $(BUILD)/sid_rsid.o $(BUILD)/sidvgm.o $(LS_LIBS) | $(BUILD)
 	$(CXX) $(LS_CXXFLAGS) -o $@ tools/sidscan.cpp $(LS_OBJS) \
@@ -91,6 +110,12 @@ $(EXTRACT): $(EXTRACT_OBJS) $(ENGINE_OBJS) $(LS_LIBS)
 
 $(PLAYER): $(PLAYER_OBJS) $(ENGINE_OBJS) $(LS_LIBS)
 	$(CXX) -o $@ $(PLAYER_OBJS) $(ENGINE_OBJS) $(LS_LIBS) -static -lwinmm
+
+# spfmplayer.exe: C objects + the libsidplayfp adapter, no WebSid.
+$(PLAYER_BIN): $(PLAYER_BIN_OBJS) $(LS_OBJS) $(LS_LIBS) | $(BUILD)
+	$(CXX) -o $@ $(PLAYER_BIN_OBJS) $(LS_OBJS) $(LS_LIBS) \
+	    -L$(FTDI) -lftd2xx -static -lwinmm
+	cp $(FTDI)/ftd2xx64.dll $(BUILD)/ 2>/dev/null || true
 
 $(BUILD)/%.o: src/%.c | $(BUILD)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -121,7 +146,7 @@ selftest: $(TARGET)
 	./$(TARGET) selftest
 
 clean:
-	rm -f $(BUILD)/*.o $(TARGET) $(EXTRACT) $(PLAYER) $(LSFPREF) $(SCAN)
+	rm -f $(BUILD)/*.o $(TARGET) $(EXTRACT) $(PLAYER) $(PLAYER_BIN) $(LSFPREF) $(SCAN) $(STREAMCHK)
 	rm -rf $(BUILD)/websid
 
-.PHONY: all tools ref clean freq selftest
+.PHONY: all tools player ref clean freq selftest
