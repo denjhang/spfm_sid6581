@@ -44,10 +44,10 @@ LS_OBJS     := $(BUILD)/sid_lsfp.o
 # It links the same two static libraries as the tools.
 LSFPREF     := $(BUILD)/lsfpref.exe
 
-# The hardware player. Deliberately unchanged: no sidvgm object is linked into
-# it, so rebuilding the offline tools never relinks or replaces this binary.
+# The hardware bring-up tool. sidvgm.c is linked in only so `sidplay` can
+# replay a recorded .sidvgm stream; the recorder itself stays offline.
 SRCS := src/spfm_transport.c src/sid6581.c src/sid_freq_table.c \
-        src/sid_rsid.c src/sidplay.c src/sidtest.c
+        src/sid_rsid.c src/sidvgm.c src/sidplay.c src/sidtest.c
 OBJS := $(patsubst src/%.c,$(BUILD)/%.o,$(SRCS))
 TARGET := $(BUILD)/sidtest.exe
 

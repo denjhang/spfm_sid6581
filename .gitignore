@@ -31,8 +31,10 @@ refs/x/
 .DS_Store
 Thumbs.db
 
-# local music library (copyrighted HVSC tunes, not published here)
+# local music library (copyrighted HVSC tunes, not published here) and the
+# register streams rendered from it -- same recordings, another container
 sid/
+sidvgm/
 
 # packaged release zips
 spfm_sid6581-*.zip

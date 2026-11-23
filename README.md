@@ -167,6 +167,10 @@ sidtest.exe sidplay sid/R-Type.sid --subsong 3    :: 换子曲（0 起）
 sidtest.exe sidplay sid/R-Type.sid --speed 1.5    :: 1.5 倍速
 sidtest.exe sidlist sid                           :: 整个目录连着放
 sidtest.exe sidlist sid/rsid --from 10            :: 从第 11 首开始
+
+:: 预渲染的寄存器流也能直接放，不再跑 6502
+sidtest.exe sidplay sidvgm\Golden_Axe.sidvgm
+sidtest.exe sidlist sidvgm                        :: sidlist 也扫 .sidvgm / .sidreg
 ```
 
 播放列表里按键：`n` 下一首、`b` 上一首、`,` 上一个子曲、`.` 下一个子曲、`q` 退出。
@@ -199,6 +203,19 @@ sidtest.exe sidplay rtype.sidreg
 
 **性能**：30 秒的音乐提取约 30 ms（旧 Python/py65 版要几分钟）；实机 10 秒 R-Type
 最大滞后 2 ms。缓存目录 `sid_cache/` 已在 `.gitignore` 里。
+
+### 一次性转好整个目录
+
+`sidvgm/` 是给 `sidplay` / `sidlist` 直接回放的预渲染流，和 `sid/` 分开放
+（同样被 `.gitignore` 排除，因为内容是同一批有版权的曲子）：
+
+```bash
+./tools/convert_all_sidvgm.sh --seconds 60
+# sid/x.sid -> sidvgm/x.sidvgm，sid/rsid/y.sid -> sidvgm/rsid/y.sidvgm
+```
+
+已有输出会跳过，中断后重跑即可续；`--force` 全部重录。录制器是
+`sidextract` 的默认 libsidplayfp，digi 鼓和真 RSID 的节奏都不会丢。
 
 ## 三声部分配
 

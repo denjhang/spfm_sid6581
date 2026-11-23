@@ -21,6 +21,7 @@
  * bunched - so a slow USB transfer degrades timing rather than dropping notes.
  */
 #include "sid_rsid.h"
+#include "sidvgm.h"
 #include "sidplay.h"
 #include "sid6581.h"
 #include "spfm_transport.h"
@@ -256,6 +257,19 @@ static int is_sidreg(const char *path)
     return has_suffix(path, ".sidreg");
 }
 
+/* A rendered stream in the project's own container. Checked by magic as well
+ * as by name, so a renamed file still plays instead of being fed to the 6502. */
+static int is_sidvgm(const char *path)
+{
+    return has_suffix(path, ".sidvgm") || sidvgm_is_file(path);
+}
+
+/* True for both pre-rendered containers: they are replayed, never emulated. */
+static int is_rendered(const char *path)
+{
+    return is_sidreg(path) || is_sidvgm(path);
+}
+
 static const char *g_cache_dir_override = NULL;
 
 void sidplay_set_cache_dir(const char *dir)
@@ -290,6 +304,30 @@ static int load_stream(const char *path, int subsong, double seconds,
 
     /* A pre-rendered stream needs no emulation at all - useful when iterating
      * on playback timing without paying the 6502 run every time. */
+    if (is_sidvgm(path)) {
+        /* sidvgm_read hands back a malloc'd buffer, so it is owned here. The
+         * header carries the clock/region and the GD3 tags, so unlike .sidreg
+         * the info block is real rather than invented. */
+        if (sidvgm_read(path, &st->events, &st->count, &st->info) != 0) {
+            snprintf(err, errlen, "cannot read %s as sidvgm", path);
+            return -1;
+        }
+        if (!st->info.name[0]) {
+            const char *base = path;
+            for (const char *p = path; *p; p++)
+                if (*p == '/' || *p == '\\') base = p + 1;
+            snprintf(st->info.name, sizeof st->info.name, "%s", base);
+        }
+        /* A recording is longer than an audition needs to be. Trimming here
+         * (rather than in replay) means --seconds shortens a .sidvgm too. */
+        if (seconds > 0.0 && seconds < 1e8) {
+            const double limit = seconds * 1000.0;
+            while (st->count > 0 && st->events[st->count - 1].t_ms > limit)
+                st->count--;
+        }
+        return 0;
+    }
+
     if (is_sidreg(path)) {
         if (sid_sidreg_read(path, &st->events, &st->count) != 0) {
             snprintf(err, errlen, "cannot read %s", path);
@@ -694,11 +732,12 @@ static int cmd_play(int argc, char **argv)
     }
 
     if (!path) {
-        fprintf(stderr, "usage: sidplay <file.sid|file.sidreg> [options]\n"
+        fprintf(stderr, "usage: sidplay <file.sid|file.sidvgm|file.sidreg> [options]\n"
                         "  --timer hprec|hybrid|mmtimer|vgmplay  wait primitive\n"
                         "  --flush register|command   USB flush granularity\n"
                         "  --proto 1step|2step   write protocol\n"
-                        "  --seconds N  --subsong N  --speed X  --no-cache\n");
+                        "  --seconds N  --subsong N  --speed X  --no-cache\n"
+                        "  .sidvgm/.sidreg replay a recording; .sid is emulated live\n");
         return 1;
     }
     if (speed <= 0) speed = 1.0;
@@ -706,10 +745,10 @@ static int cmd_play(int argc, char **argv)
     sid_song_info_t info;
     memset(&info, 0, sizeof info);
 
-    /* A pre-rendered .sidreg has a fixed length by construction - it is a
-     * dump, not a song - so that path still replays the buffer once. A real
-     * .sid runs live and forever. */
-    if (is_sidreg(path)) {
+    /* A pre-rendered .sidreg / .sidvgm has a fixed length by construction -
+     * it is a dump, not a song - so those paths replay the buffer once. A
+     * real .sid runs live and forever. */
+    if (is_rendered(path)) {
         stream_t st;
         char err[128];
         if (load_stream(path, subsong, seconds > 0 ? seconds : 1e9,
@@ -800,6 +839,14 @@ static int cmp_entry(const void *a, const void *b)
     return strcmp(((const entry_t *)a)->name, ((const entry_t *)b)->name);
 }
 
+/* The playlist accepts every format `sidplay` can open, so a folder of
+ * recorded .sidvgm streams plays just like a folder of .sid files. */
+static int is_playable_name(const char *name)
+{
+    return has_suffix(name, ".sid") || has_suffix(name, ".sidvgm") ||
+           has_suffix(name, ".sidreg");
+}
+
 static int scan_dir(const char *dir, entry_t **out, int *count)
 {
     entry_t *list = NULL;
@@ -807,12 +854,13 @@ static int scan_dir(const char *dir, entry_t **out, int *count)
 
 #ifdef _WIN32
     char pattern[512];
-    snprintf(pattern, sizeof pattern, "%s/*.sid", dir);
+    snprintf(pattern, sizeof pattern, "%s/*", dir);
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(pattern, &fd);
     if (h == INVALID_HANDLE_VALUE) return -1;
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (!is_playable_name(fd.cFileName)) continue;
         if (n == cap) {
             cap = cap ? cap * 2 : 64;
             entry_t *nl = (entry_t *)realloc(list, (size_t)cap * sizeof(*nl));
@@ -828,7 +876,7 @@ static int scan_dir(const char *dir, entry_t **out, int *count)
     if (!d) return -1;
     struct dirent *de;
     while ((de = readdir(d))) {
-        if (!has_suffix(de->d_name, ".sid")) continue;
+        if (!is_playable_name(de->d_name)) continue;
         if (n == cap) {
             cap = cap ? cap * 2 : 64;
             entry_t *nl = (entry_t *)realloc(list, (size_t)cap * sizeof(*nl));
@@ -913,19 +961,25 @@ static int cmd_playlist(int argc, char **argv)
         char path[768];
         snprintf(path, sizeof path, "%s/%s", dir, files[idx].name);
 
+        /* A rendered stream has no PSID header for sid_probe to read, so its
+         * title comes from the container (GD3 for .sidvgm) or the file name. */
+        const int rendered = is_rendered(path);
         sid_song_info_t probe;
         int nsongs = 1;
-        if (sid_song_probe(path, &probe) == 0) {
+        if (!rendered && sid_song_probe(path, &probe) == 0) {
             nsongs = probe.n_songs ? probe.n_songs : 1;
             if (subsong >= nsongs) subsong = nsongs - 1;
             printf("[%d/%d] %s\n        %s / %s  (%d subsong%s)\n",
                    idx + 1, nfiles, files[idx].name,
                    probe.name[0] ? probe.name : "?", probe.author[0] ? probe.author : "?",
                    nsongs, nsongs == 1 ? "" : "s");
+            printf("        subsong %d, playing...\n", subsong);
+        } else if (rendered) {
+            printf("[%d/%d] %s  (%s)\n", idx + 1, nfiles, files[idx].name,
+                   is_sidvgm(path) ? "sidvgm" : "sidreg");
         } else {
             printf("[%d/%d] %s\n", idx + 1, nfiles, files[idx].name);
         }
-        printf("        subsong %d, playing...\n", subsong);
         fflush(stdout);
 
         s_action = 0;
@@ -935,11 +989,13 @@ static int cmd_playlist(int argc, char **argv)
         sid_flush();
 
         int rc;
-        if (seconds > 0) {
-            /* Bounded mode: still available for a quick audition. */
+        if (seconds > 0 || rendered) {
+            /* Bounded mode, and the only mode a recording has: a stream has a
+             * fixed end, so it is replayed once (span 1e9 = the whole thing). */
             stream_t st;
             char err[128];
-            if (load_stream(path, subsong, seconds, 0, &st, err, sizeof err) != 0) {
+            double span = seconds > 0 ? seconds : 1e9;
+            if (load_stream(path, subsong, span, 0, &st, err, sizeof err) != 0) {
                 fprintf(stderr, "  skip: %s\n", err);
                 idx++;
                 continue;
