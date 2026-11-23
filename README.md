@@ -20,6 +20,7 @@ SID 6581 / 8580 挂到 SPFM 并行总线的驱动 + 控制台冒烟测试。
 | [docs/sidvgm文件规范.md](docs/sidvgm文件规范.md) | **格式规范**：VGM 式容器、相对偏移、0x65/66/67 芯片 ID、0x41/42/43 写命令、GD3 |
 | [docs/sidvgm录制与离线播放.md](docs/sidvgm录制与离线播放.md) | **录制 + 离线播放**：默认 libsidplayfp + reSIDfp（与标杆逐字节一致）；`--engine` / `--model` 可切回 websid / native |
 | [docs/libsidplayfp构建.md](docs/libsidplayfp构建.md) | **音质标杆**：原版 libsidplayfp 3.1.2 + reSIDfp 1.3.0 的构建方法，以及为什么 WebSid 不能当标准 |
+| [docs/RSID判定与体积对比.md](docs/RSID判定与体积对比.md) | **123 首实测**：RSID 的真正标志是 `play=0000`（不是头 magic），以及新引擎相对旧引擎的体积膨胀（常规 1.45×，digi 曲 6–22×） |
 | [third_party/upstream/README.md](third_party/upstream/README.md) | 上游 WebSid / libsidplayfp / libresidfp 原样源码 + 压缩包（换版本时从这里重取） |
 
 ## 当前状态

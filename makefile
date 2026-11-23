@@ -56,6 +56,8 @@ TARGET := $(BUILD)/sidtest.exe
 #   sidvgmplay  .sidvgm / .sidreg -> WAV or waveOut, through a software model
 EXTRACT := $(BUILD)/sidextract.exe
 PLAYER  := $(BUILD)/sidvgmplay.exe
+#   sidscan     classify tunes by driver (IRQ / CIA / VBI) and size them
+SCAN    := $(BUILD)/sidscan.exe
 
 EXTRACT_OBJS := $(BUILD)/sidextract_cli.o $(BUILD)/sid_rsid.o $(BUILD)/sidvgm.o
 PLAYER_OBJS  := $(BUILD)/sidvgmplay.o $(BUILD)/sidmodel.o \
@@ -68,11 +70,15 @@ all: $(TARGET) tools
 tools: $(EXTRACT) $(PLAYER)
 
 # The reference renderer is built on demand (make ref), not by tools/all: it is
-# a measuring instrument, not something a user needs.
-ref: $(LSFPREF)
+# a measuring instrument, not something a user needs. Same for sidscan.
+ref: $(LSFPREF) $(SCAN)
 
 $(LSFPREF): tools/lsfpref.cpp $(LS_LIBS) | $(BUILD)
 	$(CXX) -std=gnu++17 -O2 -I$(LS_DIR)/include -o $@ $< $(LS_LIBS) -static
+
+$(SCAN): tools/sidscan.cpp $(LS_OBJS) $(BUILD)/sid_rsid.o $(BUILD)/sidvgm.o $(LS_LIBS) | $(BUILD)
+	$(CXX) $(LS_CXXFLAGS) -o $@ tools/sidscan.cpp $(LS_OBJS) \
+	    $(BUILD)/sid_rsid.o $(BUILD)/sidvgm.o $(LS_LIBS) -static
 
 $(TARGET): $(OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
@@ -115,7 +121,7 @@ selftest: $(TARGET)
 	./$(TARGET) selftest
 
 clean:
-	rm -f $(BUILD)/*.o $(TARGET) $(EXTRACT) $(PLAYER) $(LSFPREF)
+	rm -f $(BUILD)/*.o $(TARGET) $(EXTRACT) $(PLAYER) $(LSFPREF) $(SCAN)
 	rm -rf $(BUILD)/websid
 
 .PHONY: all tools ref clean freq selftest
