@@ -1560,12 +1560,15 @@ static int cmd_play(int argc, char **argv)
     if (subsong >= (int)probe.n_songs) subsong = probe.n_songs - 1;
 
     printf("song: %s / %s\n", probe.name, probe.author);
-    if (s_pad_us >= 0) {
-        /* A live .sid is generated a frame at a time, so there is no known
-         * next-gap to fill; --pad needs the finished stream. Say so rather
-         * than padding nothing and looking like it worked. */
-        fprintf(stderr, "note: --pad needs a finished stream (.sidvgm/.sidreg); "
-                        "ignoring it for this live .sid\n");
+    if (s_pad_us >= 0 && seconds <= 0) {
+        /* Only a *live* .sid is out of reach: it is generated a frame at a
+         * time, so the next gap is not known yet. With --seconds the whole
+         * span is rendered first and replayed from a finished buffer, which is
+         * exactly what padding needs, so leave it alone in that case. */
+        fprintf(stderr, "note: --pad needs a finished stream; either play a "
+                        ".sidvgm/.sidreg or give --seconds N (the first N "
+                        "seconds are rendered, then padded). "
+                        "Ignoring --pad for this live .sid\n");
         s_pad_us = -1;
         s_dedup_vol = 0;
     }
