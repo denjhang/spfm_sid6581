@@ -231,6 +231,125 @@ static int64_t pad_gap(int64_t gap_us)
 }
 
 /* ------------------------------------------------------------------ */
+/* digi decimation                                                     */
+/* ------------------------------------------------------------------ */
+
+/* The digital drum is a stream of $D418 writes, one per raster interrupt, and
+ * it is the only thing in a SID tune whose rate is anywhere near the link's
+ * limit. Everything else (frequency, gate, ADSR, filter) is sparse and must be
+ * left alone.
+ *
+ * --digi HZ puts those writes on a fixed 1/HZ grid: the first $D418 write in a
+ * slot becomes that slot's sample, later writes in the same slot overwrite it
+ * (sample and hold - the value the DAC would rest at by the end of the window),
+ * and writes that repeat the already-latched value are dropped because the chip
+ * is holding it. Nothing else in the stream is touched, and every timestamp
+ * stays on the original time base, so the tune's length never changes.
+ *
+ * This is the knob the drum quality follows. It is independent of --pad:
+ *
+ *   --digi 8000   almost everything kept, hardest on the link
+ *   --digi 4000   roughly one sample per 250 us
+ *   --digi 2000   one per 500 us, clearly grittier
+ *
+ * Measured on Giana s01: 6625 raw $D418/s include 66% repeats, so dedup alone
+ * gets to ~2271/s; --digi 4000 keeps that whole rate. */
+static int s_digi_hz = 0;            /* 0 = leave $D418 alone */
+
+typedef struct {
+    unsigned long in, out, dropped_dup, merged;
+} digi_stats_t;
+
+static digi_stats_t s_digi_stats;
+
+/* Build a filtered copy of the stream. Returns NULL when nothing is enabled,
+ * in which case the caller keeps using the original array. */
+static sid_event_t *digi_decimate(const sid_event_t *ev, size_t n, size_t *out_n)
+{
+    if (s_digi_hz <= 0) return NULL;
+
+    sid_event_t *out = (sid_event_t *)malloc(n * sizeof(*out));
+    if (!out) return NULL;
+
+    const double slot_ms = 1000.0 / (double)s_digi_hz;
+    size_t m = 0;
+    long   cur_slot = -1;
+    size_t slot_idx = 0;             /* index in `out` of this slot's sample */
+    int    slot_has = 0;             /* 0 = this slot has no kept sample yet */
+    int    have_held = 0;
+    uint8_t held = 0;
+    double  last_t = 0.0;
+
+    s_digi_stats.in = s_digi_stats.out = 0;
+    s_digi_stats.dropped_dup = s_digi_stats.merged = 0;
+
+    /* Quantising to the slot start can land a sample before a melody write that
+     * was emitted between the two, so every timestamp is clamped forward. */
+    #define PUSH(x) do {                                  \
+        sid_event_t _s = (x);                              \
+        if (_s.t_ms < last_t) _s.t_ms = last_t;            \
+        last_t = _s.t_ms;                                  \
+        out[m++] = _s;                                     \
+    } while (0)
+
+    for (size_t i = 0; i < n; i++) {
+        const sid_event_t *e = &ev[i];
+
+        if (e->reg != SID_REG_MODE_VOL) {
+            PUSH(*e);                  /* melody/gate/ADSR: never touched */
+            continue;
+        }
+
+        s_digi_stats.in++;
+
+        long slot = (long)(e->t_ms / slot_ms);
+        if (slot < 0) slot = 0;
+
+        if (slot == cur_slot) {
+            if (slot_has) {
+                /* Same slot: the last write wins (sample and hold). */
+                out[slot_idx].val = e->val;
+                s_digi_stats.merged++;
+            } else if (have_held && e->val == held) {
+                s_digi_stats.dropped_dup++;
+            } else {
+                /* First kept sample of a slot that previously only held dups. */
+                sid_event_t s = *e;
+                s.t_ms = (double)slot * slot_ms;
+                PUSH(s);
+                slot_idx = m - 1;
+                slot_has = 1;
+                held = e->val;
+                have_held = 1;
+                s_digi_stats.out++;
+            }
+            continue;
+        }
+
+        cur_slot = slot;
+        slot_has = 0;
+
+        if (have_held && e->val == held) {
+            s_digi_stats.dropped_dup++;
+            continue;
+        }
+
+        sid_event_t s = *e;
+        s.t_ms = (double)slot * slot_ms;      /* quantise to the slot start */
+        PUSH(s);
+        slot_idx = m - 1;
+        slot_has = 1;
+        held = e->val;
+        have_held = 1;
+        s_digi_stats.out++;
+    }
+    #undef PUSH
+
+    *out_n = m;
+    return out;
+}
+
+/* ------------------------------------------------------------------ */
 /* hardware                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -723,14 +842,29 @@ static void report_link_stats(size_t nevents, double secs)
         printf(", wire %.0f%%", duty);
         if (duty > 85.0) printf("  (over budget: lower --pad or --pad-duty)");
     }
+    if (s_digi_hz > 0) {
+        printf("\n  digi: %lu $D418 in -> %lu out", s_digi_stats.in,
+               s_digi_stats.out);
+        if (secs > 0.5) printf(" (%.0f/s)", s_digi_stats.out / secs);
+        printf(", %lu merged, %lu duplicate-dropped",
+               s_digi_stats.merged, s_digi_stats.dropped_dup);
+    }
     printf("\n");
     (void)nevents;
 }
 
-static int replay(const sid_event_t *ev, size_t n, double speed, int pace)
+static int replay(const sid_event_t *ev_in, size_t n_in, double speed, int pace)
 {
-    if (n == 0) return 0;
+    if (n_in == 0) return 0;
     pad_reset();
+
+    /* --digi works on the finished stream, before anything is sent: it decides
+     * which $D418 writes exist at all, so it is upstream of --pad and of the
+     * flush rules. Everything else in the stream passes through untouched. */
+    size_t n = n_in;
+    sid_event_t *decimated = digi_decimate(ev_in, n_in, &n);
+    const sid_event_t *ev = decimated ? decimated : ev_in;
+    if (n == 0) { free(decimated); return 0; }
 
     /* Padded mode produces bytes much faster than 1.5 Mbaud drains them, so the
      * transport must not wait for its 64 KiB buffer to fill: 64 KiB is 437 ms
@@ -765,6 +899,7 @@ static int replay(const sid_event_t *ev, size_t n, double speed, int pace)
         printf("  dry-run: %lu events -> %lu bytes\n",
                (unsigned long)n, (unsigned long)spfm_capture_size());
         report_link_stats(n, ev[n - 1].t_ms / 1000.0);
+        free(decimated);
         return 0;
     }
 
@@ -871,6 +1006,7 @@ static int replay(const sid_event_t *ev, size_t n, double speed, int pace)
            ev[n - 1].t_ms / 1000.0, (unsigned long)n,
            (long)(worst_lag_us / 1000));
     report_link_stats(n, ev[n - 1].t_ms / 1000.0);
+    free(decimated);
     return 0;
 }
 
@@ -1005,6 +1141,10 @@ static int cmd_play(int argc, char **argv)
                 return 1;
             }
         }
+        else if (!strcmp(argv[i], "--digi") && i + 1 < argc) {
+            s_digi_hz = atoi(argv[++i]);
+            if (s_digi_hz < 0) s_digi_hz = 0;
+        }
         else if (!strcmp(argv[i], "--pad-lead") && i + 1 < argc) {
             s_pad_lead_us = (int)(atof(argv[++i]) * 1000.0 + 0.5);
             if (s_pad_lead_us < 1000) {
@@ -1043,6 +1183,9 @@ static int cmd_play(int argc, char **argv)
                         "                   latency, and the underrun margin (default 25)\n"
                         "  --pad-chunk KB   bytes queued before a forced USB flush (default 2)\n"
                         "  --pad-burst MS   leaky-bucket ceiling for the filler (default 200)\n"
+                        "  --digi HZ        resample ONLY the $D418 drum writes onto a\n"
+                        "                   1/HZ grid; melody/gate/ADSR untouched.\n"
+                        "                   0 = off. 8000 = near-lossless, 4000/2000 = grittier\n"
                         "  --dedup-vol      drop $D418 writes that repeat the latched value\n"
                         "  --proto 1step|2step   write protocol\n"
                         "  --seconds N  --subsong N  --speed X  --no-cache\n"
@@ -1348,6 +1491,10 @@ static int cmd_playlist(int argc, char **argv)
                 fprintf(stderr, "--pad-duty must be 1..100 (percent)\n");
                 return 1;
             }
+        }
+        else if (!strcmp(argv[i], "--digi") && i + 1 < argc) {
+            s_digi_hz = atoi(argv[++i]);
+            if (s_digi_hz < 0) s_digi_hz = 0;
         }
         else if (!strcmp(argv[i], "--pad-lead") && i + 1 < argc) {
             s_pad_lead_us = (int)(atof(argv[++i]) * 1000.0 + 0.5);
