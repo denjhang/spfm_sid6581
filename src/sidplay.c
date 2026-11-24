@@ -162,6 +162,9 @@ static int ship_midframe(int64_t now_us, int64_t next_due_us,
  * chip is holding it, so removing them changes nothing audible. With dedup the
  * same 136 us spacing needs 27% of the wire instead of 92%. */
 static int     s_pad_duty    = 75;   /* percent of the wire the filler may use */
+static int     s_pad_lead_us = 25000;/* how far the host may run ahead (latency) */
+static int     s_pad_chunk   = 2048; /* bytes queued before a forced flush */
+static int     s_pad_burst_ms= 200;  /* leaky-bucket ceiling, ms of wire */
 static int     s_dedup_vol   = 0;    /* drop $D418 writes that repeat the value */
 static int64_t s_pad_credit  = 0;    /* us of filler budget in hand */
 static int     s_vol_seen    = 0;
@@ -202,10 +205,12 @@ static int vol_is_dup(const sid_event_t *e)
 static int64_t pad_gap(int64_t gap_us)
 {
     if (s_pad_us < 0 || gap_us <= 0) return 0;
+    const int64_t cap_us = (int64_t)s_pad_burst_ms * 1000;
+
     if (gap_us > s_pad_us) {
         /* A long rest needs no filler, but it does refill the bucket. */
         s_pad_credit += gap_us * s_pad_duty / 100;
-        if (s_pad_credit > 200000) s_pad_credit = 200000;
+        if (s_pad_credit > cap_us) s_pad_credit = cap_us;
         return 0;
     }
 
@@ -214,7 +219,7 @@ static int64_t pad_gap(int64_t gap_us)
     if (want <= 0) return 0;
 
     s_pad_credit += gap_us * s_pad_duty / 100;
-    if (s_pad_credit > 200000) s_pad_credit = 200000;   /* 200 ms of burst */
+    if (s_pad_credit > cap_us) s_pad_credit = cap_us;
 
     int64_t spend = want < s_pad_credit ? want : s_pad_credit;
     if (spend <= 0) return 0;
@@ -730,9 +735,9 @@ static int replay(const sid_event_t *ev, size_t n, double speed, int pace)
     /* Padded mode produces bytes much faster than 1.5 Mbaud drains them, so the
      * transport must not wait for its 64 KiB buffer to fill: 64 KiB is 437 ms
      * of wire queued behind every flush, which is both the track-change latency
-     * and what jammed the link. 2 KiB = 13.6 ms of wire. The unpaced dry run
-     * needs the same setting to report the board's real transfer pattern. */
-    spfm_set_flush_bytes(s_pad_us >= 0 ? 2048 : SPFM_BUF_SIZE);
+     * and what jammed the link. --pad-chunk sets the real size. The unpaced dry
+     * run needs the same setting to report the board's transfer pattern. */
+    spfm_set_flush_bytes(s_pad_us >= 0 ? (size_t)s_pad_chunk : SPFM_BUF_SIZE);
 
     /* Dry run: walk the stream as fast as possible unless --pace was given.
      * Pacing would only prove that Sleep() works, and waiting 60 s to check
@@ -781,10 +786,9 @@ static int replay(const sid_event_t *ev, size_t n, double speed, int pace)
     /* Padded mode keeps the host's schedule, but as a soft bound instead of a
      * per-event deadline: the host may run this far ahead of the music, never
      * more. Inside that window the NOP filler gives every short gap exact UART
-     * timing (no host jitter). The bound must stay small - it is the playback
-     * latency on a track change - while still covering an FTDI hiccup. 25 ms of
-     * music plus a 2 KiB flush chunk (13.6 ms of wire) is ~40 ms end to end. */
-    #define PAD_LEAD_US 25000
+     * timing (no host jitter). The bound IS the playback latency, so it is
+     * exposed as --pad-lead. */
+    #define PAD_LEAD_US (s_pad_lead_us)
 
     if (s_pad_us >= 0) {
         spfm_purge_tx();
@@ -1001,6 +1005,22 @@ static int cmd_play(int argc, char **argv)
                 return 1;
             }
         }
+        else if (!strcmp(argv[i], "--pad-lead") && i + 1 < argc) {
+            s_pad_lead_us = (int)(atof(argv[++i]) * 1000.0 + 0.5);
+            if (s_pad_lead_us < 1000) {
+                fprintf(stderr, "--pad-lead must be >= 1 ms\n");
+                return 1;
+            }
+        }
+        else if (!strcmp(argv[i], "--pad-chunk") && i + 1 < argc) {
+            s_pad_chunk = (int)(atof(argv[++i]) * 1024.0 + 0.5);
+            if (s_pad_chunk < 256) s_pad_chunk = 256;
+            if (s_pad_chunk > SPFM_BUF_SIZE) s_pad_chunk = SPFM_BUF_SIZE;
+        }
+        else if (!strcmp(argv[i], "--pad-burst") && i + 1 < argc) {
+            s_pad_burst_ms = atoi(argv[++i]);
+            if (s_pad_burst_ms < 0) s_pad_burst_ms = 0;
+        }
         else if (!strcmp(argv[i], "--dedup-vol"))               s_dedup_vol = 1;
         else if (!strcmp(argv[i], "--pace"))                    pace = 1;
         else if (argv[i][0] == '-') {
@@ -1019,6 +1039,10 @@ static int cmd_play(int argc, char **argv)
                         "                   NOP bytes so the 1.5 Mbaud clock carries the\n"
                         "                   timing. Implies --dedup-vol. Try 0.3 (digi)\n"
                         "  --pad-duty PCT   cap filler at PCT of the wire (default 75)\n"
+                        "  --pad-lead MS    how far the host may run ahead; this is the playback\n"
+                        "                   latency, and the underrun margin (default 25)\n"
+                        "  --pad-chunk KB   bytes queued before a forced USB flush (default 2)\n"
+                        "  --pad-burst MS   leaky-bucket ceiling for the filler (default 200)\n"
                         "  --dedup-vol      drop $D418 writes that repeat the latched value\n"
                         "  --proto 1step|2step   write protocol\n"
                         "  --seconds N  --subsong N  --speed X  --no-cache\n"
@@ -1324,6 +1348,22 @@ static int cmd_playlist(int argc, char **argv)
                 fprintf(stderr, "--pad-duty must be 1..100 (percent)\n");
                 return 1;
             }
+        }
+        else if (!strcmp(argv[i], "--pad-lead") && i + 1 < argc) {
+            s_pad_lead_us = (int)(atof(argv[++i]) * 1000.0 + 0.5);
+            if (s_pad_lead_us < 1000) {
+                fprintf(stderr, "--pad-lead must be >= 1 ms\n");
+                return 1;
+            }
+        }
+        else if (!strcmp(argv[i], "--pad-chunk") && i + 1 < argc) {
+            s_pad_chunk = (int)(atof(argv[++i]) * 1024.0 + 0.5);
+            if (s_pad_chunk < 256) s_pad_chunk = 256;
+            if (s_pad_chunk > SPFM_BUF_SIZE) s_pad_chunk = SPFM_BUF_SIZE;
+        }
+        else if (!strcmp(argv[i], "--pad-burst") && i + 1 < argc) {
+            s_pad_burst_ms = atoi(argv[++i]);
+            if (s_pad_burst_ms < 0) s_pad_burst_ms = 0;
         }
         else if (!strcmp(argv[i], "--dedup-vol"))               s_dedup_vol = 1;
         else if (argv[i][0] == '-') {
