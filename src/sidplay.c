@@ -261,6 +261,10 @@ static void hw_disconnect(void)
  * change does not carry the previous tune's tail into the next one. */
 static void hw_mute(void)
 {
+    /* A padded stream can have tens of ms of music queued. Send the mute now
+     * instead of after it, otherwise the previous tune keeps playing over the
+     * pause and the next track starts late. */
+    spfm_purge_tx();
     for (uint8_t v = 0; v < 3; v++)
         sid_write(s_opt.slot, (uint8_t)(v * 7 + SID_REG_CONTROL), 0x00);
     sid_write(s_opt.slot, SID_REG_MODE_VOL, 0x00);
@@ -609,6 +613,10 @@ static int stream_play_sid(const char *path, int subsong, double speed,
     }
     sid_set_deferred_flush(s_flush_mode == 2);
     spfm_flush_stats_reset();
+    /* A live .sid is paced by its own deadlines, so the default 64 KiB batch is
+     * right; make sure a padded track earlier in the playlist did not leave the
+     * small flush size behind. */
+    spfm_set_flush_bytes(SPFM_BUF_SIZE);
     for (size_t i = 0; i < n; i++) emit(&ev[i]);
     ship();
 
@@ -719,6 +727,13 @@ static int replay(const sid_event_t *ev, size_t n, double speed, int pace)
     if (n == 0) return 0;
     pad_reset();
 
+    /* Padded mode produces bytes much faster than 1.5 Mbaud drains them, so the
+     * transport must not wait for its 64 KiB buffer to fill: 64 KiB is 437 ms
+     * of wire queued behind every flush, which is both the track-change latency
+     * and what jammed the link. 2 KiB = 13.6 ms of wire. The unpaced dry run
+     * needs the same setting to report the board's real transfer pattern. */
+    spfm_set_flush_bytes(s_pad_us >= 0 ? 2048 : SPFM_BUF_SIZE);
+
     /* Dry run: walk the stream as fast as possible unless --pace was given.
      * Pacing would only prove that Sleep() works, and waiting 60 s to check
      * that the bytes came out right is not a useful test. */
@@ -764,13 +779,18 @@ static int replay(const sid_event_t *ev, size_t n, double speed, int pace)
     pad_reset();
 
     /* Padded mode keeps the host's schedule, but as a soft bound instead of a
-     * per-event deadline: the host may run up to PAD_LEAD of musical time
-     * ahead, never more. Inside that window the NOP filler gives every short
-     * gap exact UART timing (no host jitter), and the lead absorbs USB stalls
-     * so a hiccup cannot starve the board. Gaps longer than --pad are rests and
-     * are reproduced by the host stalling on this same bound, which is why the
-     * tune's total length stays correct. */
-    #define PAD_LEAD_US 100000
+     * per-event deadline: the host may run this far ahead of the music, never
+     * more. Inside that window the NOP filler gives every short gap exact UART
+     * timing (no host jitter). The bound must stay small - it is the playback
+     * latency on a track change - while still covering an FTDI hiccup. 25 ms of
+     * music plus a 2 KiB flush chunk (13.6 ms of wire) is ~40 ms end to end. */
+    #define PAD_LEAD_US 25000
+
+    if (s_pad_us >= 0) {
+        spfm_purge_tx();
+    } else {
+        spfm_set_flush_bytes(SPFM_BUF_SIZE);
+    }
 
     int64_t batch_first = -1;
     for (size_t i = 0; i < n; i++) {

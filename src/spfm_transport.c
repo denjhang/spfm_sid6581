@@ -25,6 +25,13 @@ static FT_HANDLE s_handle = NULL;
 static uint8_t   s_buf[SPFM_BUF_SIZE];
 static size_t    s_len = 0;
 
+/* Flush as soon as this many bytes are queued, instead of waiting for the
+ * 64 KiB buffer to fill. 64 KiB is 437 ms of wire at 1.5 Mbaud, so filling it
+ * before the first transfer would both delay the first note and leave a
+ * half-second backlog that a track change has to drain first. A few KiB keeps
+ * the transfer count low (4 KiB = 27 ms of wire) while staying responsive. */
+static size_t    s_flush_bytes = SPFM_BUF_SIZE;
+
 /* Transfer accounting. A register stream can be perfectly correct byte for
  * byte and still sound wrong because it was handed to the driver as thousands
  * of 4-byte writes: FT232R does one bulk transaction per 1 ms USB frame, so
@@ -79,10 +86,11 @@ static void emit(const uint8_t *p, size_t n)
 {
     if (!s_dry_run && !s_handle) return;
 
-    /* The 64 KiB buffer is part of the model, not an implementation detail: it
-     * is what forces a flush every ~437 ms of paced bytes. Dry-run runs the
-     * same check so its transfer count matches the board's. */
-    if (s_len + n > SPFM_BUF_SIZE) spfm_flush();
+    /* Flush when the queue hits s_flush_bytes, not only when the 64 KiB buffer
+     * is full: the buffer holds 437 ms of wire, which is far too much to sit on
+     * before the first transfer. Dry-run runs the same check so its transfer
+     * count matches the board's. */
+    if (s_len + n > s_flush_bytes) spfm_flush();
     if (n > SPFM_BUF_SIZE) {
         /* oversized single write: chunk it */
         size_t off = 0;
@@ -324,19 +332,38 @@ bool spfm_flush(void)
     if (s_dry_run) { s_len = 0; return true; }
     if (!s_handle || s_len == 0) { s_len = 0; return true; }
 
+    /* A 64 KiB batch takes 437 ms to leave a 1.5 Mbaud line, so a short write
+     * timeout is not a reason to throw the bytes away - they are music, and
+     * dropping them is exactly the "no data reaching the chip" symptom.
+     *
+     * FT_Write returns FT_OK with a short count when the driver's queue is
+     * full (the D2XX timeout applies to that queue, not to the line), so the
+     * retry here is "accept what went in and wait for room". Only a genuine
+     * I/O error, repeated for a second, aborts. */
     size_t total = 0;
+    int stalls = 0;
     while (total < s_len) {
         size_t chunk = s_len - total;
         if (chunk > 4096) chunk = 4096;
         DWORD written = 0;
         FT_STATUS st = FT_Write(s_handle, s_buf + total, (DWORD)chunk, &written);
-        if (st != FT_OK || written != chunk) {
+
+        total += written;
+        if (st == FT_OK && written == chunk) { stalls = 0; continue; }
+
+        if (st != FT_OK && st != FT_IO_ERROR) {
             fprintf(stderr, "spfm_flush: FT_Write failed (st=%d written=%lu of %lu)\n",
                     (int)st, (unsigned long)written, (unsigned long)chunk);
             s_len = 0;
             return false;
         }
-        total += written;
+        if (++stalls > 200) {
+            fprintf(stderr, "spfm_flush: driver stalled for 1 s, dropping %lu bytes\n",
+                    (unsigned long)(s_len - total));
+            s_len = 0;
+            return false;
+        }
+        spfm_delay_ms(5);
     }
     s_len = 0;
     return true;
@@ -347,6 +374,39 @@ void spfm_flush_stats_reset(void)
     s_writes = 0;
     s_write_bytes = 0;
     s_max_write = 0;
+}
+
+/* Cap on how much wire time may sit queued before a flush. Shorter = lower
+ * latency and faster key response, longer = fewer USB transfers. This is the
+ * knob the padded player uses to stay responsive: padding produces bytes far
+ * faster than 1.5 Mbaud drains them, so without a cap the backlog becomes the
+ * whole tune. */
+void spfm_set_flush_bytes(size_t n)
+{
+    if (n < 512) n = 512;
+    if (n > SPFM_BUF_SIZE) n = SPFM_BUF_SIZE;
+    s_flush_bytes = n;
+}
+
+size_t spfm_get_flush_bytes(void)
+{
+    return s_flush_bytes;
+}
+
+/* Bytes queued but not yet handed to the driver. */
+size_t spfm_pending_bytes(void)
+{
+    return s_len;
+}
+
+/* Throw away anything the driver has not sent yet. Used when a track change
+ * must be immediate: a padded stream can have hundreds of ms queued, and
+ * letting it play out would delay (and then talk over) the next tune. */
+void spfm_purge_tx(void)
+{
+    s_len = 0;
+    if (s_dry_run || !s_handle) return;
+    FT_Purge(s_handle, FT_PURGE_TX);
 }
 
 void spfm_flush_stats(unsigned long *writes, unsigned long *bytes,

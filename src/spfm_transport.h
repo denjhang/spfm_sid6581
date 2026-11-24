@@ -138,6 +138,21 @@ void spfm_flush_stats_reset(void);
 void spfm_flush_stats(unsigned long *writes, unsigned long *bytes,
                       size_t *max_write);
 
+/* How many bytes may sit queued before a flush is forced. Default is the whole
+ * 64 KiB buffer, which is 437 ms of wire at 1.5 Mbaud - fine when the player
+ * hands over bytes at the line rate, far too much when it runs ahead (padding).
+ * The padded player caps this so a track change does not have to drain a
+ * backlog first. */
+void   spfm_set_flush_bytes(size_t n);
+size_t spfm_get_flush_bytes(void);
+
+/* Bytes queued but not yet handed to the driver. */
+size_t spfm_pending_bytes(void);
+
+/* Discard everything not yet sent. A fast track change must not wait for a
+ * padded stream's backlog to play out. */
+void spfm_purge_tx(void);
+
 /* Wall-clock delay for long waits; the byte buffer is flushed first. */
 void spfm_delay_ms(uint32_t ms);
 void spfm_delay_us(uint32_t us);
