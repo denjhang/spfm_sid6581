@@ -176,10 +176,11 @@ sidtest.exe sidlist sidvgm                        :: sidlist 也扫 .sidvgm / .s
 播放列表里按键：`n` 下一首、`b` 上一首、`,` 上一个子曲、`.` 下一个子曲、`q` 退出。
 不带 `--seconds` 时每首一直播到你按键，没有时长上限，也不去猜循环点。
 
-**`sidtest` 的行为是冻结的**：`.sid` 仍然走内置 fake6502（每帧一次 `play()`、
-`play=0000` 靠 `$FFFE`/`$0314` 猜入口），RSID 没有任何特殊处理，和以前逐字节
-相同。新增的只是"认识 `.sidvgm` 这个容器"——读完交给 `.sidreg` 现成的那条回放
-路径。`sidtest.exe` 不链接 libsidplayfp，想用那个引擎只有 `spfmplayer.exe`。
+**`sidtest` 的默认行为是冻结的**：`.sid` 仍然走内置 fake6502（每帧一次 `play()`、
+`play=0000` 靠 `$FFFE`/`$0314` 猜入口），RSID 没有任何特殊处理，不加新参数时输出
+与以前逐字节相同。新增的是两类东西：认识 `.sidvgm` 这个容器（读完交给 `.sidreg`
+现成的那条回放路径），以及下面 `--pad` / `--digi` 这些**必须显式开启**的 digi
+调音旋钮。`sidtest.exe` 不链接 libsidplayfp，想用那个引擎只有 `spfmplayer.exe`。
 
 | 参数 | 作用 | 默认 |
 |---|---|---|
@@ -193,6 +194,53 @@ sidtest.exe sidlist sidvgm                        :: sidlist 也扫 .sidvgm / .s
 写协议是唯一需要按硬件调的参数：这套接线下 SID 是异步写器件，`1step` 实测兼容性
 更好（`2step` 会放坏一部分曲子）；换回旧的四芯片接线时用 `--proto 2step`。
 启动时会打印实际用的协议。
+
+### 数字鼓（digi）音质：`--pad` 系列
+
+这是目前唯一能让 digi 鼓"听着像原曲"的办法，也是唯一需要按曲子调的一组参数。
+
+**为什么需要它。** 数字鼓是每 ~136 µs 写一次 `$D418`。老路径靠主机 `Sleep` 给
+每个采样计时，而 Windows 的睡眠精度是毫秒级——比 136 µs 大 7 倍。采样间隔一抖，
+鼓的音色就没了（发闷、像被降采样）。而 136 µs 在 1.5 Mbaud 下正好是 **20.4 字节**：
+命令占 4 个，剩下 16 个用 NOP（`0x80`）填满，时间就由 UART 硬件时钟精确复现，
+抖动从 ~1 ms 降到 1 个字节时间（6.7 µs）。
+
+```powershell
+# 推荐起手式：只填鼓侧的间隔，每 50 ms 内最多占 50% 线速
+.\build\sidtest.exe sidplay "sidvgm\rsid\turboutrun\turboutrun_s01.sidvgm" `
+    --pad 1 --pad-window 50 --pad-local 50 --pad-scope digi
+```
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--pad MS` | 关 | 填充 ≤MS 的间隔。**越大鼓越好，也越吃带宽** |
+| `--pad-scope all\|digi` | `all` | `digi` 只填与 `$D418` 相邻的间隔，不动旋律 |
+| `--pad-window MS` | 0 | 滑动窗口；配合 `--pad-local` 限制局部超支 |
+| `--pad-local PCT` | 100 | 窗口内允许的线速上限 |
+| `--pad-duty PCT` | 75 | 全局平均上限（漏桶） |
+| `--pad-lead MS` | 25 | 主机领先音乐多少 = 延迟 + 欠载余量 |
+| `--pad-chunk KB` | 2 | 每次 USB 传输的块大小 |
+| `--pad-burst MS` | 200 | 漏桶能攒多少 |
+| `--pad-min MS` | 0 | 短于此的间隔不填 |
+| `--pad-lag MS` | 0 | 线上时间领先音乐过多时暂停填充 |
+| `--pad-partial` | 关 | 允许半填；默认全填或全不填（半填会造成变速感） |
+
+**"pad 越大越好但速度不均匀"是局部超支。** 全局 `--pad-duty` 按整首平均，
+看不见 20 ms 窗口内的尖峰：平均 56% 的一首，有些 20 ms 窗口会到 105%。一旦超
+100%，那段时间的字节排不下，`FT_Write` 阻塞，主机错过下一个录音时间点，整首往后
+推——听感就是忽快忽慢。`--pad-window` + `--pad-local` 就是给这种尖峰加的就地闸门：
+超了就当场放弃那一处填充，该间隔退回主机计时。
+
+结束时会打印两行，用来判断调得对不对：
+
+```
+  link: 800 transfers (40/s), 1636484 bytes, largest 2048 B, wire 55%
+  pad: 9427 ms filler, 834 gaps refused
+```
+
+`wire` 是平均占空比；`refused` 是被闸门拒掉的间隔数——尖峰多的曲子上它会涨，
+那是闸门在起作用，不是坏事。`--digi HZ`（默认关）是另一条正交的旋钮：
+把 `$D418` 按 1/HZ 重采样，**只会降低鼓的信息量**，省带宽但音质变差。
 
 离线渲染（不需要硬件，也不需要 FTDI）：
 
