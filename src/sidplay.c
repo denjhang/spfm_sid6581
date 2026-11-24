@@ -96,6 +96,23 @@ static int s_flush_gap_us = -1;
  * padding is in charge of the pacing. */
 static int     s_pad_us      = -1;   /* pad gaps up to this many us; -1 = off */
 
+/* 1 while the filler owns the pacing for the gap being replayed.
+ *
+ * Padding replaces the host's per-event deadlines with "flush when the buffer
+ * fills", which is only affordable where the stream is dense. On a PSID, or on
+ * the intro of a digi tune, a frame writes a hundred-odd bytes, so a 2048-byte
+ * chunk takes hundreds of milliseconds to fill: the music lags and the tempo
+ * drifts. That is a property of the *pacing*, not of the filler, so --pad-scope
+ * cannot fix it. Hence this flag: the gate below turns padding on only inside a
+ * window where $D418 is written densely, and everywhere else the replay loop
+ * uses the original deadline path untouched. */
+static int     s_pad_active  = 0;
+static int     s_pad_gate    = 1;    /* 0 = --pad-always: engage unconditionally */
+static int     s_pad_rate    = 200;  /* $D418 writes/s needed to engage */
+static int     s_pad_hold_ms = 60;   /* how far the drum credit outlasts the drum */
+static double  s_pad_on_from = -1;   /* music time of the first gated event */
+static double  s_pad_on_to   = -1;   /* music time of the last gated event */
+
 /* True when the batch sitting in the buffer should go out now.
  *
  * With no --flush-gap this is the original rule: ship only when the next event
@@ -119,8 +136,10 @@ static int ship_midframe(int64_t now_us, int64_t next_due_us,
 {
     /* With wire-time padding the byte stream carries the rhythm itself, so the
      * host must stop trying to hit deadlines: ship only when the transport
-     * buffer fills (which it does by itself) or when the run ends. */
-    if (s_pad_us >= 0) return 0;
+     * buffer fills (which it does by itself) or when the run ends. This applies
+     * only inside a gated dense passage - outside it the original deadline rule
+     * below must run unchanged or a sparse tune stalls. */
+    if (s_pad_active) return 0;
 
     if (s_flush_gap_us < 0) {
         int64_t gap = (int64_t)s_flush_threshold * 1000000 / 44100;
@@ -202,8 +221,70 @@ static void pad_reset(void)
     s_wire_us = 0;
     s_pad_win_head = s_pad_win_n = 0;
     s_pad_win_bytes = 0.0;
+    s_pad_active = 0;
+    s_pad_on_from = -1;
+    s_pad_on_to   = -1;
     s_vol_seen   = 0;
     s_vol_last   = 0;
+}
+
+/* Which stretches of the stream are worth padding.
+ *
+ * The filler is only affordable, and only *useful*, where $D418 is written
+ * densely. Everywhere else it costs the thing that made whole tunes stutter:
+ * the host runs --pad-lead ahead of the music and leans on the transport buffer
+ * to hide that lead, but a sparse passage produces far fewer bytes than the
+ * wire drains, so the chip starves for the length of the lead and then gets a
+ * clump. That is heard as a PSID, or the intro of a digi tune, "stuttering and
+ * playing at the wrong tempo" - not as anything to do with the drum.
+ *
+ * So the marks are computed up front from the finished stream: an event is
+ * marked when the $D418 write rate over the preceding PAD_GATE_WIN_US clears
+ * --pad-rate, and for --pad-hold ms after the last time it did. The replay loop
+ * then switches pacing exactly there, and uses the original host-deadline path
+ * everywhere else - which is byte-for-byte what a plain PSID replay does.
+ *
+ * Returns NULL when the gate is off (--pad-always) or nothing is dense. */
+#define PAD_GATE_WIN_US 250000
+static unsigned char *pad_gate_marks(const sid_event_t *ev, size_t n)
+{
+    if (s_pad_us < 0 || !s_pad_gate || n == 0) return NULL;
+
+    unsigned char *m = (unsigned char *)calloc(n, 1);
+    if (!m) return NULL;
+
+    /* One slot per volume write is enough: the window is a lookback over those
+     * timestamps only, so no ring of all n events is needed. */
+    int64_t *ts = (int64_t *)malloc(n * sizeof(*ts));
+    if (!ts) { free(m); return NULL; }
+
+    const int64_t hold_us = (int64_t)s_pad_hold_ms * 1000;
+    size_t head = 0, cnt = 0;
+    int64_t keep_until = -1;
+
+    for (size_t i = 0; i < n; i++) {
+        const int64_t t = (int64_t)(ev[i].t_ms * 1000.0);
+
+        if (ev[i].reg == SID_REG_MODE_VOL) ts[cnt++] = t;
+
+        while (head < cnt && ts[head] < t - PAD_GATE_WIN_US) head++;
+        const size_t in_win = cnt - head;
+
+        if ((int64_t)in_win * 1000000 / PAD_GATE_WIN_US >= s_pad_rate)
+            keep_until = t + hold_us;
+
+        m[i] = (keep_until >= 0 && t <= keep_until) ? 1 : 0;
+    }
+
+    free(ts);
+
+    /* Nothing dense anywhere: say so instead of handing back an all-zero array
+     * the caller cannot tell apart from "gate broken". */
+    for (size_t i = 0; i < n; i++)
+        if (m[i]) return m;
+
+    free(m);
+    return NULL;
 }
 
 /* How many bytes the line can carry in `win_ms` of music. */
@@ -270,7 +351,7 @@ static int vol_is_dup(const sid_event_t *e)
  * out the rest when the budget ran dry. */
 static int64_t pad_gap2(int64_t gap_us, int from_vol, int to_vol, int64_t music_us)
 {
-    if (s_pad_us < 0 || gap_us <= 0) return 0;
+    if (!s_pad_active || gap_us <= 0) return 0;
     const int64_t cap_us = (int64_t)s_pad_burst_ms * 1000;
 
     /* Every command costs 26.67 us of wire; count it so the backlog figure
@@ -977,6 +1058,13 @@ static void report_link_stats(size_t nevents, double secs)
          * where the ear hears it as uneven tempo. */
         printf("\n  pad: %lld ms filler, %d gaps refused",
                (long long)(s_pad_used_us / 1000), s_pad_skipped);
+        if (!s_pad_gate)
+            printf(" (--pad-always)");
+        else if (s_pad_on_from >= 0)
+            printf(", gated on %.1f-%.1f s", s_pad_on_from / 1000.0,
+                   s_pad_on_to / 1000.0);
+        else
+            printf(" (no dense $D418 passage: nothing padded)");
     }
     printf("\n");
     (void)nevents;
@@ -1000,7 +1088,15 @@ static int replay(const sid_event_t *ev_in, size_t n_in, double speed, int pace)
      * of wire queued behind every flush, which is both the track-change latency
      * and what jammed the link. --pad-chunk sets the real size. The unpaced dry
      * run needs the same setting to report the board's transfer pattern. */
-    spfm_set_flush_bytes(s_pad_us >= 0 ? (size_t)s_pad_chunk : SPFM_BUF_SIZE);
+    const int pad_cfg  = (s_pad_us >= 0);
+    const int gate_cfg = pad_cfg && s_pad_gate;   /* marks decide, not the flag */
+    spfm_set_flush_bytes(pad_cfg ? (size_t)s_pad_chunk : SPFM_BUF_SIZE);
+
+    /* Which stretches actually get the filler. In gate mode a NULL result
+     * means "no dense passage in this tune", i.e. pad nowhere; with
+     * --pad-always the flag itself decides. */
+    unsigned char *gate = pad_gate_marks(ev, n);
+    const int pad_all = pad_cfg && !gate_cfg;     /* --pad-always */
 
     /* Dry run: walk the stream as fast as possible unless --pace was given.
      * Pacing would only prove that Sleep() works, and waiting 60 s to check
@@ -1015,6 +1111,16 @@ static int replay(const sid_event_t *ev_in, size_t n_in, double speed, int pace)
             const int64_t now = (int64_t)(ev[i].t_ms * 1000.0);
             const int64_t next = (i + 1 < n) ? (int64_t)(ev[i + 1].t_ms * 1000.0)
                                              : now;
+            const int pad_on = gate ? gate[i] : pad_all;
+            if (pad_on != s_pad_active) {
+                sid_flush();          /* same boundary flush as the live path */
+                s_pad_active = pad_on;
+                spfm_set_flush_bytes(pad_on ? (size_t)s_pad_chunk : SPFM_BUF_SIZE);
+            }
+            if (s_pad_active) {
+                if (s_pad_on_from < 0) s_pad_on_from = ev[i].t_ms;
+                s_pad_on_to = ev[i].t_ms;
+            }
             if (ship_midframe(now, next, batch_first)) {
                 sid_flush();
                 batch_first = -1;
@@ -1030,6 +1136,7 @@ static int replay(const sid_event_t *ev_in, size_t n_in, double speed, int pace)
         printf("  dry-run: %lu events -> %lu bytes\n",
                (unsigned long)n, (unsigned long)spfm_capture_size());
         report_link_stats(n, ev[n - 1].t_ms / 1000.0);
+        free(gate);
         free(decimated);
         return 0;
     }
@@ -1056,8 +1163,14 @@ static int replay(const sid_event_t *ev_in, size_t n_in, double speed, int pace)
      * exposed as --pad-lead. */
     #define PAD_LEAD_US (s_pad_lead_us)
 
-    if (s_pad_us >= 0) {
+    if (gate || pad_all) {
         spfm_purge_tx();
+    } else if (pad_cfg) {
+        /* --pad was asked for but no passage is dense enough to use it: this
+         * tune replays exactly like a plain one. */
+        printf("  pad: no dense $D418 passage (needs ~%d writes/s); "
+               "replaying without filler\n", s_pad_rate);
+        spfm_set_flush_bytes(SPFM_BUF_SIZE);
     } else {
         spfm_set_flush_bytes(SPFM_BUF_SIZE);
     }
@@ -1066,7 +1179,30 @@ static int replay(const sid_event_t *ev_in, size_t n_in, double speed, int pace)
     for (size_t i = 0; i < n; i++) {
         int64_t due = start + (int64_t)(ev[i].t_ms * us_per_ms);
 
-        if (s_pad_us >= 0) {
+        /* The pacing mode is a property of this event, not of the run: inside a
+         * drum passage the filler owns the timing, outside it the original
+         * deadline rule does. Switch both the pacing flag and the transport
+         * chunk size at the boundary, so a sparse section batches exactly like
+         * a plain PSID replay. */
+        {
+            const int pad_on = gate ? gate[i] : pad_all;
+            if (pad_on != s_pad_active) {
+                /* Both directions need a push. Leaving a padded passage, the
+                 * filler has run up to --pad-lead ahead and those bytes are
+                 * still queued; entering one, the sparse path may be holding
+                 * up to 64 KiB. Either way the chunk size is about to change,
+                 * so drain first - the wait is affordable on both sides. */
+                sid_flush();
+                s_pad_active = pad_on;
+                spfm_set_flush_bytes(pad_on ? (size_t)s_pad_chunk : SPFM_BUF_SIZE);
+            }
+            if (pad_on) {
+                if (s_pad_on_from < 0) s_pad_on_from = ev[i].t_ms;
+                s_pad_on_to = ev[i].t_ms;
+            }
+        }
+
+        if (s_pad_active) {
             const int64_t target = due - PAD_LEAD_US;
             while (spfm_now_us() < target) {
                 int k = kb_take();
@@ -1074,6 +1210,7 @@ static int replay(const sid_event_t *ev_in, size_t n_in, double speed, int pace)
                     s_interrupt = k;
                     sid_set_deferred_flush(false);
                     sid_flush();
+                    free(gate);
                     return -1;
                 }
                 int64_t left = target - spfm_now_us();
@@ -1092,6 +1229,7 @@ static int replay(const sid_event_t *ev_in, size_t n_in, double speed, int pace)
                     s_interrupt = k;
                     sid_set_deferred_flush(false);
                     sid_flush();
+                    free(gate);
                     return -1;
                 }
                 int64_t left = due - spfm_now_us();
@@ -1119,6 +1257,7 @@ static int replay(const sid_event_t *ev_in, size_t n_in, double speed, int pace)
             s_interrupt = k;
             sid_set_deferred_flush(false);
             sid_flush();
+            free(gate);
             return -1;
         }
 
@@ -1141,6 +1280,7 @@ static int replay(const sid_event_t *ev_in, size_t n_in, double speed, int pace)
            ev[n - 1].t_ms / 1000.0, (unsigned long)n,
            (long)(worst_lag_us / 1000));
     report_link_stats(n, ev[n - 1].t_ms / 1000.0);
+    free(gate);
     free(decimated);
     return 0;
 }
@@ -1319,6 +1459,16 @@ static int cmd_play(int argc, char **argv)
         else if (!strcmp(argv[i], "--pad-burst") && i + 1 < argc) {
             s_pad_burst_ms = atoi(argv[++i]);
             if (s_pad_burst_ms < 0) s_pad_burst_ms = 0;
+        }
+        else if (!strcmp(argv[i], "--pad-always"))              s_pad_gate = 0;
+        else if (!strcmp(argv[i], "--no-pad-gate"))             s_pad_gate = 0;
+        else if (!strcmp(argv[i], "--pad-rate") && i + 1 < argc) {
+            s_pad_rate = atoi(argv[++i]);
+            if (s_pad_rate < 1) s_pad_rate = 1;
+        }
+        else if (!strcmp(argv[i], "--pad-hold") && i + 1 < argc) {
+            s_pad_hold_ms = atoi(argv[++i]);
+            if (s_pad_hold_ms < 0) s_pad_hold_ms = 0;
         }
         else if (!strcmp(argv[i], "--dedup-vol"))               s_dedup_vol = 1;
         else if (!strcmp(argv[i], "--pace"))                    pace = 1;
@@ -1706,6 +1856,16 @@ static int cmd_playlist(int argc, char **argv)
         else if (!strcmp(argv[i], "--pad-burst") && i + 1 < argc) {
             s_pad_burst_ms = atoi(argv[++i]);
             if (s_pad_burst_ms < 0) s_pad_burst_ms = 0;
+        }
+        else if (!strcmp(argv[i], "--pad-always"))              s_pad_gate = 0;
+        else if (!strcmp(argv[i], "--no-pad-gate"))             s_pad_gate = 0;
+        else if (!strcmp(argv[i], "--pad-rate") && i + 1 < argc) {
+            s_pad_rate = atoi(argv[++i]);
+            if (s_pad_rate < 1) s_pad_rate = 1;
+        }
+        else if (!strcmp(argv[i], "--pad-hold") && i + 1 < argc) {
+            s_pad_hold_ms = atoi(argv[++i]);
+            if (s_pad_hold_ms < 0) s_pad_hold_ms = 0;
         }
         else if (!strcmp(argv[i], "--dedup-vol"))               s_dedup_vol = 1;
         else if (argv[i][0] == '-') {
