@@ -165,8 +165,29 @@ static int     s_pad_duty    = 75;   /* percent of the wire the filler may use *
 static int     s_pad_lead_us = 25000;/* how far the host may run ahead (latency) */
 static int     s_pad_chunk   = 2048; /* bytes queued before a forced flush */
 static int     s_pad_burst_ms= 200;  /* leaky-bucket ceiling, ms of wire */
+static int     s_pad_min_us  = 0;    /* never pad a gap shorter than this */
+static int     s_pad_scope   = 0;    /* 0 = every gap, 1 = only gaps touching $D418 */
+static int     s_pad_fit     = 1;    /* all-or-nothing: no half-filled gaps */
+static int     s_pad_lag_us  = 0;    /* max wire-vs-music lag before padding pauses */
+static int     s_pad_win_ms  = 0;    /* local sliding window for the duty cap */
+static int     s_pad_local   = 100;  /* max % of the line inside that window */
+static int64_t s_wire_us     = 0;    /* wire time queued since the tune started */
+
+/* Sliding window of (music_us, bytes) used by --pad-window. A global leaky
+ * bucket averages over the whole tune, so a 20 ms burst can still ask for more
+ * than the line carries and the host falls behind - which is heard as uneven
+ * tempo. This cap is local: no window of --pad-window ms of music may exceed
+ * --pad-local percent of the line, so padding is refused right where it would
+ * overdraw instead of being averaged away. */
+typedef struct { int64_t music_us; double bytes; } pad_win_t;
+#define PAD_WIN_MAX 4096
+static pad_win_t s_pad_win[PAD_WIN_MAX];
+static int       s_pad_win_head, s_pad_win_n;
+static double    s_pad_win_bytes;
 static int     s_dedup_vol   = 0;    /* drop $D418 writes that repeat the value */
 static int64_t s_pad_credit  = 0;    /* us of filler budget in hand */
+static int64_t s_pad_used_us = 0;    /* total filler emitted, for reporting */
+static int     s_pad_skipped = 0;    /* gaps refused for lack of budget */
 static int     s_vol_seen    = 0;
 static uint8_t s_vol_last    = 0;
 
@@ -176,8 +197,51 @@ static uint8_t s_vol_last    = 0;
 static void pad_reset(void)
 {
     s_pad_credit = 0;
+    s_pad_used_us = 0;
+    s_pad_skipped = 0;
+    s_wire_us = 0;
+    s_pad_win_head = s_pad_win_n = 0;
+    s_pad_win_bytes = 0.0;
     s_vol_seen   = 0;
     s_vol_last   = 0;
+}
+
+/* How many bytes the line can carry in `win_ms` of music. */
+static double pad_window_cap(void)
+{
+    return 150000.0 * (double)s_pad_win_ms / 1000.0 * (double)s_pad_local / 100.0;
+}
+
+/* Drop entries older than win_ms behind `music_us`, then say whether `add`
+ * bytes still fit. Returns 1 if they do. */
+static int pad_window_fits(int64_t music_us, double add)
+{
+    if (s_pad_win_ms <= 0) return 1;
+
+    const int64_t horizon = music_us - (int64_t)s_pad_win_ms * 1000;
+    while (s_pad_win_n > 0 && s_pad_win[s_pad_win_head].music_us < horizon) {
+        s_pad_win_bytes -= s_pad_win[s_pad_win_head].bytes;
+        s_pad_win_head = (s_pad_win_head + 1) % PAD_WIN_MAX;
+        s_pad_win_n--;
+    }
+    return (s_pad_win_bytes + add) <= pad_window_cap();
+}
+
+/* Record bytes emitted at a given musical position. */
+static void pad_window_add(int64_t music_us, double bytes)
+{
+    if (s_pad_win_ms <= 0) return;
+    if (s_pad_win_n == PAD_WIN_MAX) {
+        /* Oldest entry is the only one we can drop without losing accuracy. */
+        s_pad_win_bytes -= s_pad_win[s_pad_win_head].bytes;
+        s_pad_win_head = (s_pad_win_head + 1) % PAD_WIN_MAX;
+        s_pad_win_n--;
+    }
+    const int tail = (s_pad_win_head + s_pad_win_n) % PAD_WIN_MAX;
+    s_pad_win[tail].music_us = music_us;
+    s_pad_win[tail].bytes = bytes;
+    s_pad_win_n++;
+    s_pad_win_bytes += bytes;
 }
 
 /* --pad cannot work without dropping repeated $D418 values: on Giana the
@@ -200,15 +264,49 @@ static int vol_is_dup(const sid_event_t *e)
 }
 
 /* Emit NOP bytes to fill a gap of `gap_us` between two register writes.
- * Returns how much of the gap the filler covered, in us, so the caller can
- * wait out the rest when the budget ran dry. */
-static int64_t pad_gap(int64_t gap_us)
+ * `from_vol`/`to_vol` say whether either side of the gap is a $D418 write, which
+ * --pad-scope uses to restrict the filler to the drum.
+ * Returns how much of the gap the filler covered, in us, so the caller can wait
+ * out the rest when the budget ran dry. */
+static int64_t pad_gap2(int64_t gap_us, int from_vol, int to_vol, int64_t music_us)
 {
     if (s_pad_us < 0 || gap_us <= 0) return 0;
     const int64_t cap_us = (int64_t)s_pad_burst_ms * 1000;
 
+    /* Every command costs 26.67 us of wire; count it so the backlog figure
+     * below reflects the real line, not just the filler. */
+    s_wire_us += 27;
+
+    /* The line is 1.5 Mbaud and the music is not. Filler emitted to reproduce a
+     * gap still costs wire time, and once the queued wire has run ahead of the
+     * music beyond --pad-lag the bytes cannot be played back on schedule any
+     * more - FT_Write starts blocking, the host misses the next `due`, and the
+     * whole tune slows down. That is the "tempo becomes uneven" report. Stop
+     * padding until the music catches up: the sample stream keeps its internal
+     * spacing, only some gaps fall back to host timing. */
+    if (s_pad_lag_us > 0 && s_wire_us - music_us > (int64_t)s_pad_lag_us) {
+        s_pad_skipped++;
+        return 0;
+    }
+
+    if (s_pad_scope == 1 && !from_vol && !to_vol) {
+        /* Melody-to-melody: never padded. Its own spacing is what the host
+         * deadlines are for, and padding it is what made whole tunes sound
+         * too slow - the bytes were there but the music was still waiting on
+         * the line. */
+        s_pad_credit += gap_us * s_pad_duty / 100;
+        if (s_pad_credit > cap_us) s_pad_credit = cap_us;
+        return 0;
+    }
+
     if (gap_us > s_pad_us) {
         /* A long rest needs no filler, but it does refill the bucket. */
+        s_pad_credit += gap_us * s_pad_duty / 100;
+        if (s_pad_credit > cap_us) s_pad_credit = cap_us;
+        return 0;
+    }
+
+    if (gap_us < s_pad_min_us) {
         s_pad_credit += gap_us * s_pad_duty / 100;
         if (s_pad_credit > cap_us) s_pad_credit = cap_us;
         return 0;
@@ -222,11 +320,35 @@ static int64_t pad_gap(int64_t gap_us)
     if (s_pad_credit > cap_us) s_pad_credit = cap_us;
 
     int64_t spend = want < s_pad_credit ? want : s_pad_credit;
-    if (spend <= 0) return 0;
+
+    /* Partial filler is the worst of both worlds: the gap ends up neither at its
+     * recorded length nor at the host's natural pace, which is exactly what
+     * makes a tune sound like it changes speed. So the budget is all-or-nothing
+     * - either the whole gap is reproduced on the wire, or none of it is and the
+     * host waits it out normally. */
+    if (s_pad_fit && spend < want) { s_pad_skipped++; return 0; }
+
+    if (spend <= 0) { s_pad_skipped++; return 0; }
+
+    /* Local cap: refuse if the filler would push the last --pad-window ms of
+     * music past --pad-local percent of the line. This is what stops the
+     * uneven tempo - a global average cannot see a 20 ms burst asking for more
+     * than the line has. */
+    {
+        const double add_bytes = (double)spend * WIRE_BYTES_PER_US;
+        if (!pad_window_fits(music_us, add_bytes)) {
+            s_pad_skipped++;
+            return 0;
+        }
+        pad_window_add(music_us, add_bytes);
+    }
+
     s_pad_credit -= spend;
+    s_pad_used_us += spend;
 
     uint32_t nops = (uint32_t)((double)spend * WIRE_BYTES_PER_US + 0.5);
     if (nops) spfm_nop(nops);
+    s_wire_us += (int64_t)((double)nops / WIRE_BYTES_PER_US + 0.5);
     return (int64_t)((double)nops / WIRE_BYTES_PER_US + 0.5);
 }
 
@@ -849,6 +971,13 @@ static void report_link_stats(size_t nevents, double secs)
         printf(", %lu merged, %lu duplicate-dropped",
                s_digi_stats.merged, s_digi_stats.dropped_dup);
     }
+    if (s_pad_us >= 0) {
+        /* A refused gap falls back to host timing. Some refusals are harmless
+         * (long rests, tiny gaps); a steady stream of them is the cap biting
+         * where the ear hears it as uneven tempo. */
+        printf("\n  pad: %lld ms filler, %d gaps refused",
+               (long long)(s_pad_used_us / 1000), s_pad_skipped);
+    }
     printf("\n");
     (void)nevents;
 }
@@ -892,7 +1021,9 @@ static int replay(const sid_event_t *ev_in, size_t n_in, double speed, int pace)
             }
             if (batch_first < 0) batch_first = now;
             if (!vol_is_dup(&ev[i])) emit(&ev[i]);
-            if (i + 1 < n) pad_gap(next - now);
+            if (i + 1 < n)
+                pad_gap2(next - now, ev[i].reg == SID_REG_MODE_VOL,
+                         ev[i + 1].reg == SID_REG_MODE_VOL, next);
         }
         sid_flush();
         sid_set_deferred_flush(false);
@@ -975,7 +1106,11 @@ static int replay(const sid_event_t *ev_in, size_t n_in, double speed, int pace)
         if (!vol_is_dup(&ev[i])) emit(&ev[i]);
         /* Filler goes AFTER this write and before the next one, so the wire
          * order is [cmd][nop...][cmd] and the gap is reproduced exactly. */
-        if (i + 1 < n) pad_gap((int64_t)((ev[i + 1].t_ms - ev[i].t_ms) * 1000.0));
+        if (i + 1 < n)
+            pad_gap2((int64_t)((ev[i + 1].t_ms - ev[i].t_ms) * 1000.0),
+                     ev[i].reg == SID_REG_MODE_VOL,
+                     ev[i + 1].reg == SID_REG_MODE_VOL,
+                     (int64_t)(ev[i + 1].t_ms * 1000.0));
 
         /* Dense passages have no gap long enough to land in, so check here as
          * well: one compare per event is nothing next to the USB write. */
@@ -1157,6 +1292,30 @@ static int cmd_play(int argc, char **argv)
             if (s_pad_chunk < 256) s_pad_chunk = 256;
             if (s_pad_chunk > SPFM_BUF_SIZE) s_pad_chunk = SPFM_BUF_SIZE;
         }
+        else if (!strcmp(argv[i], "--pad-window") && i + 1 < argc) {
+            s_pad_win_ms = atoi(argv[++i]);
+            if (s_pad_win_ms < 0) s_pad_win_ms = 0;
+        }
+        else if (!strcmp(argv[i], "--pad-local") && i + 1 < argc) {
+            s_pad_local = atoi(argv[++i]);
+            if (s_pad_local < 10) s_pad_local = 10;
+            if (s_pad_local > 100) s_pad_local = 100;
+        }
+        else if (!strcmp(argv[i], "--pad-lag") && i + 1 < argc) {
+            s_pad_lag_us = (int)(atof(argv[++i]) * 1000.0 + 0.5);
+            if (s_pad_lag_us < 0) s_pad_lag_us = 0;
+        }
+        else if (!strcmp(argv[i], "--pad-partial"))      s_pad_fit = 0;
+        else if (!strcmp(argv[i], "--pad-min") && i + 1 < argc) {
+            s_pad_min_us = (int)(atof(argv[++i]) * 1000.0 + 0.5);
+            if (s_pad_min_us < 0) s_pad_min_us = 0;
+        }
+        else if (!strcmp(argv[i], "--pad-scope") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "all"))        s_pad_scope = 0;
+            else if (!strcmp(m, "digi"))  s_pad_scope = 1;
+            else { fprintf(stderr, "--pad-scope must be all|digi\n"); return 1; }
+        }
         else if (!strcmp(argv[i], "--pad-burst") && i + 1 < argc) {
             s_pad_burst_ms = atoi(argv[++i]);
             if (s_pad_burst_ms < 0) s_pad_burst_ms = 0;
@@ -1183,6 +1342,18 @@ static int cmd_play(int argc, char **argv)
                         "                   latency, and the underrun margin (default 25)\n"
                         "  --pad-chunk KB   bytes queued before a forced USB flush (default 2)\n"
                         "  --pad-burst MS   leaky-bucket ceiling for the filler (default 200)\n"
+                        "  --pad-scope S    all | digi: pad every gap, or only gaps\n"
+                        "                   touching $D418 (default all)\n"
+                        "  --pad-min MS     never pad a gap shorter than this (default 0)\n"
+                        "  --pad-partial    allow half-filled gaps (default: all-or-nothing,\n"
+                        "                   which is what keeps the tempo even)\n"
+                        "  --pad-lag MS     stop padding once queued wire time runs this\n"
+                        "                   far ahead of the music (0 = off). This is the\n"
+                        "                   knob that keeps the tempo even under heavy fill.\n"
+                        "  --pad-window MS  sliding window for the local filler cap (0 = off).\n"
+                        "                   This is the fix for uneven tempo: a global average\n"
+                        "                   cannot see a 20 ms burst overdrawing the line.\n"
+                        "  --pad-local PCT  max line use inside that window (default 100)\n"
                         "  --digi HZ        resample ONLY the $D418 drum writes onto a\n"
                         "                   1/HZ grid; melody/gate/ADSR untouched.\n"
                         "                   0 = off. 8000 = near-lossless, 4000/2000 = grittier\n"
@@ -1507,6 +1678,30 @@ static int cmd_playlist(int argc, char **argv)
             s_pad_chunk = (int)(atof(argv[++i]) * 1024.0 + 0.5);
             if (s_pad_chunk < 256) s_pad_chunk = 256;
             if (s_pad_chunk > SPFM_BUF_SIZE) s_pad_chunk = SPFM_BUF_SIZE;
+        }
+        else if (!strcmp(argv[i], "--pad-window") && i + 1 < argc) {
+            s_pad_win_ms = atoi(argv[++i]);
+            if (s_pad_win_ms < 0) s_pad_win_ms = 0;
+        }
+        else if (!strcmp(argv[i], "--pad-local") && i + 1 < argc) {
+            s_pad_local = atoi(argv[++i]);
+            if (s_pad_local < 10) s_pad_local = 10;
+            if (s_pad_local > 100) s_pad_local = 100;
+        }
+        else if (!strcmp(argv[i], "--pad-lag") && i + 1 < argc) {
+            s_pad_lag_us = (int)(atof(argv[++i]) * 1000.0 + 0.5);
+            if (s_pad_lag_us < 0) s_pad_lag_us = 0;
+        }
+        else if (!strcmp(argv[i], "--pad-partial"))      s_pad_fit = 0;
+        else if (!strcmp(argv[i], "--pad-min") && i + 1 < argc) {
+            s_pad_min_us = (int)(atof(argv[++i]) * 1000.0 + 0.5);
+            if (s_pad_min_us < 0) s_pad_min_us = 0;
+        }
+        else if (!strcmp(argv[i], "--pad-scope") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "all"))        s_pad_scope = 0;
+            else if (!strcmp(m, "digi"))  s_pad_scope = 1;
+            else { fprintf(stderr, "--pad-scope must be all|digi\n"); return 1; }
         }
         else if (!strcmp(argv[i], "--pad-burst") && i + 1 < argc) {
             s_pad_burst_ms = atoi(argv[++i]);
