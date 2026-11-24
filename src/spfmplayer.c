@@ -41,6 +41,7 @@
 #include "sid_lsfp.h"
 #include "sid6581.h"
 #include "spfm_transport.h"
+#include "spfm_pad.h"
 
 #ifdef _WIN32
 #include <conio.h>
@@ -252,17 +253,52 @@ static int wait_due(int64_t due_us)
  *
  * With a dry run and no pacing the whole buffer goes out as fast as the
  * buffer accepts it: waiting 60 s just to prove the bytes came out right is
- * not a useful test. */
-static int replay_buffer(const sid_event_t *ev, size_t n, int paced, int *key)
+ * not a useful test.
+ *
+ * --pad is applied here and only here: it needs a finished stream so the next
+ * gap is known, which a buffer has and a live .sid does not. The density gate
+ * decides per event whether the filler owns the pacing, so a PSID or the intro
+ * of a digi tune replays exactly as it would without any of these options. */
+static int replay_buffer(const sid_event_t *ev_in, size_t n_in, int paced, int *key)
 {
     *key = 0;
-    if (n == 0) return 0;
+    if (n_in == 0) return 0;
+
+    /* --digi is upstream of everything: it decides which $D418 writes exist. */
+    size_t n = n_in;
+    sid_event_t *decimated = spfm_digi_decimate(ev_in, n_in, &n);
+    const sid_event_t *ev = decimated ? decimated : ev_in;
+    if (n == 0) { free(decimated); return 0; }
+
+    const int pad_cfg  = (spfm_pad.pad_us >= 0);
+    const int gate_cfg = pad_cfg && spfm_pad.gate;
+    const int pad_all  = pad_cfg && !gate_cfg;      /* --pad-always */
+    spfm_pad_reset();
+
+    unsigned char *gate = spfm_pad_gate_marks(ev, n);
+    spfm_pad_set_active(0);
 
     if (opt.dry_run && !paced) {
-        for (size_t i = 0; i < n; i++) emit(&ev[i]);
+        spfm_flush_stats_reset();
+        for (size_t i = 0; i < n; i++) {
+            const int pad_on = gate ? gate[i] : pad_all;
+            if (pad_on) {
+                spfm_pad_set_active(1);
+                spfm_pad_mark_on(ev[i].t_ms);
+            }
+            if (!spfm_pad_vol_is_dup(&ev[i])) emit(&ev[i]);
+            if (i + 1 < n)
+                spfm_pad_gap((int64_t)((ev[i + 1].t_ms - ev[i].t_ms) * 1000.0),
+                             ev[i].reg == SID_REG_MODE_VOL,
+                             ev[i + 1].reg == SID_REG_MODE_VOL,
+                             (int64_t)(ev[i + 1].t_ms * 1000.0));
+        }
         sid_flush();
         printf("  dry-run: %lu writes -> %lu bytes\n",
                (unsigned long)n, (unsigned long)spfm_capture_size());
+        spfm_pad_report();
+        free(gate);
+        free(decimated);
         return 0;
     }
 
@@ -272,11 +308,44 @@ static int replay_buffer(const sid_event_t *ev, size_t n, int paced, int *key)
     size_t last_sec = (size_t)-1;
 
     sid_set_deferred_flush(!opt.flush_register);
+    spfm_flush_stats_reset();
+
+    if (gate || pad_all) spfm_purge_tx();
+    spfm_set_flush_bytes(pad_cfg ? (size_t)spfm_pad.chunk : SPFM_BUF_SIZE);
 
     for (size_t i = 0; i < n; i++) {
         int64_t due = start + (int64_t)(ev[i].t_ms * us_per_ms);
 
-        if (due > spfm_now_us()) {
+        /* Pacing is a property of this event: inside a drum passage the filler
+         * owns the timing (the host just keeps the buffer fed), outside it the
+         * original deadline rule runs unchanged. */
+        {
+            const int pad_on = gate ? gate[i] : pad_all;
+            if (pad_on != spfm_pad_active()) {
+                sid_flush();     /* boundary: nothing may straddle the switch */
+                spfm_pad_set_active(pad_on);
+                spfm_set_flush_bytes(pad_on ? (size_t)spfm_pad.chunk
+                                            : SPFM_BUF_SIZE);
+            }
+            if (pad_on) spfm_pad_mark_on(ev[i].t_ms);
+        }
+
+        if (spfm_pad_active()) {
+            const int64_t target = due - (int64_t)spfm_pad.lead_us;
+            while (spfm_now_us() < target) {
+                int k = kb_take();
+                if (k) {
+                    sid_set_deferred_flush(false);
+                    sid_flush();
+                    *key = k;
+                    free(gate);
+                    free(decimated);
+                    return k == 'q' ? -1 : 1;
+                }
+                int64_t left = target - spfm_now_us();
+                spfm_wait_until_us(spfm_now_us() + (left > 5000 ? 5000 : left));
+            }
+        } else if (due > spfm_now_us()) {
             /* Ship what is already due before blocking, so a long wait
              * mid-frame does not hold the batch back. */
             if (spfm_now_us() + (int64_t)FLUSH_THRESHOLD_TICKS * 1000000 / 44100 <= due)
@@ -286,6 +355,8 @@ static int replay_buffer(const sid_event_t *ev, size_t n, int paced, int *key)
                 sid_set_deferred_flush(false);
                 sid_flush();
                 *key = k;
+                free(gate);
+                free(decimated);
                 return k == 'q' ? -1 : 1;
             }
         } else {
@@ -293,13 +364,23 @@ static int replay_buffer(const sid_event_t *ev, size_t n, int paced, int *key)
             if (lag > worst_lag_us) worst_lag_us = lag;
         }
 
-        emit(&ev[i]);
+        if (!spfm_pad_vol_is_dup(&ev[i])) emit(&ev[i]);
+
+        /* Filler goes after this write and before the next, so the wire order
+         * is [cmd][nop...][cmd] and the recorded spacing is reproduced. */
+        if (i + 1 < n)
+            spfm_pad_gap((int64_t)((ev[i + 1].t_ms - ev[i].t_ms) * 1000.0),
+                         ev[i].reg == SID_REG_MODE_VOL,
+                         ev[i + 1].reg == SID_REG_MODE_VOL,
+                         (int64_t)(ev[i + 1].t_ms * 1000.0));
 
         int k = kb_take();
         if (k) {
             sid_set_deferred_flush(false);
             sid_flush();
             *key = k;
+            free(gate);
+            free(decimated);
             return k == 'q' ? -1 : 1;
         }
 
@@ -318,6 +399,10 @@ static int replay_buffer(const sid_event_t *ev, size_t n, int paced, int *key)
     printf("\r  %5.1f s  %lu writes  worst lag %ld ms        \n",
            ev[n - 1].t_ms / 1000.0, (unsigned long)n,
            (long)(worst_lag_us / 1000));
+    spfm_pad_report();
+    if (spfm_pad.pad_us >= 0) printf("\n");
+    free(gate);
+    free(decimated);
     return 0;
 }
 
@@ -613,14 +698,23 @@ static int play_file(const char *path, int *key)
         }
         printf("  %lu writes, playing\n", (unsigned long)n);
         rc = replay_buffer(ev, n, 1, key);
-        sid_song_free(ev);
-        return rc;
+        sid_song_free(ev);        return rc;
+    }
+
+    /* A live .sid is generated one frame at a time, so the next gap is not
+     * known yet and the filler has nothing to fill. Say so rather than
+     * accepting the options and silently doing nothing. */
+    if (spfm_pad.pad_us >= 0) {
+        fprintf(stderr, "note: --pad needs a finished stream; for a .sid give "
+                        "--seconds N so the span is recorded first. "
+                        "Ignoring --pad for this live .sid\n");
+        spfm_pad.pad_us = -1;
+        spfm_pad.dedup_vol = 0;
     }
 
     return opt.use_lsfp ? play_live_lsfp(path, subsong, NULL, key)
                         : play_live_native(path, subsong, NULL, key);
 }
-
 /* ------------------------------------------------------------------ */
 /* playlist                                                            */
 /* ------------------------------------------------------------------ */
@@ -827,6 +921,34 @@ static void usage(void)
     printf("  --gap-rand N    add 0..N random ticks to the gap\n");
     printf("  --dry-run       no hardware, just walk the byte stream\n");
     printf("  --list          list the .sid files in a directory\n");
+    printf("\n");
+    printf("digital-drum timing (buffered playback only: .sidvgm/.sidreg, or a\n");
+    printf(".sid with --seconds; a live --seconds 0 .sid cannot use these):\n");
+    printf("  --pad MS        fill gaps up to MS with NOP bytes so the 1.5 Mbaud\n");
+    printf("                  UART clock carries the timing instead of host sleeps.\n");
+    printf("                  This is what makes digi drums sound like the original.\n");
+    printf("                  Implies --dedup-vol. Try 1.\n");
+    printf("  --pad-scope S   all | digi (default all): pad every gap, or only the\n");
+    printf("                  gaps touching $D418\n");
+    printf("  --pad-window MS sliding window for the local filler cap (0 = off)\n");
+    printf("  --pad-local PCT max line use inside that window (default 100)\n");
+    printf("  --pad-duty PCT  cap the filler at PCT of the wire (default 75)\n");
+    printf("  --pad-lead MS   how far the host may run ahead; this is the playback\n");
+    printf("                  latency (default 25)\n");
+    printf("  --pad-chunk KB  bytes queued before a forced flush (default 2)\n");
+    printf("  --pad-burst MS  leaky-bucket ceiling for the filler (default 200)\n");
+    printf("  --pad-min MS    never pad a gap shorter than this (default 0)\n");
+    printf("  --pad-lag MS    stop padding once queued wire runs this far ahead\n");
+    printf("  --pad-partial   allow half-filled gaps (default all-or-nothing)\n");
+    printf("  --pad-rate HZ   $D418 writes/s that count as a drum passage.\n");
+    printf("                  --pad engages only inside such passages; the rest of\n");
+    printf("                  the tune keeps the plain deadline path, so PSID tunes\n");
+    printf("                  and digi intros keep their own tempo (default 200)\n");
+    printf("  --pad-hold MS   keep padding this long after the drum stops (default 60)\n");
+    printf("  --pad-always    ignore the density gate and pad everywhere\n");
+    printf("  --dedup-vol     drop $D418 writes that repeat the latched value\n");
+    printf("  --digi HZ       resample ONLY the $D418 drum onto a 1/HZ grid;\n");
+    printf("                  0 = off, 8000 near-lossless, 4000/2000 grittier\n");
     printf("  --help          this text\n\n");
     printf("while playing: [n] next  [b] back  [,] [.] subsong  [q] quit\n");
 }
@@ -884,6 +1006,57 @@ static int parse_args(int argc, char **argv, const char **path, int *list_only,
         else if (!strcmp(a, "--dry-run"))    opt.dry_run = 1;
         else if (!strcmp(a, "--list"))       *list_only = 1;
         else if (!strcmp(a, "--help") || !strcmp(a, "-h")) { usage(); exit(0); }
+        /* ---- digital-drum timing ---- */
+        else if (!strcmp(a, "--pad") && i + 1 < argc) {
+            spfm_pad.pad_us = (int)(atof(argv[++i]) * 1000.0 + 0.5);
+            if (spfm_pad.pad_us <= 0) {
+                fprintf(stderr, "--pad must be > 0 ms\n");
+                return -1;
+            }
+        }
+        else if (!strcmp(a, "--pad-duty") && i + 1 < argc) {
+            spfm_pad.duty = atoi(argv[++i]);
+            if (spfm_pad.duty < 1 || spfm_pad.duty > 100) {
+                fprintf(stderr, "--pad-duty must be 1..100 (percent)\n");
+                return -1;
+            }
+        }
+        else if (!strcmp(a, "--pad-lead") && i + 1 < argc) {
+            spfm_pad.lead_us = (int)(atof(argv[++i]) * 1000.0 + 0.5);
+            if (spfm_pad.lead_us < 1000) {
+                fprintf(stderr, "--pad-lead must be >= 1 ms\n");
+                return -1;
+            }
+        }
+        else if (!strcmp(a, "--pad-chunk") && i + 1 < argc) {
+            spfm_pad.chunk = (int)(atof(argv[++i]) * 1024.0 + 0.5);
+        }
+        else if (!strcmp(a, "--pad-burst") && i + 1 < argc)
+            spfm_pad.burst_ms = atoi(argv[++i]);
+        else if (!strcmp(a, "--pad-min") && i + 1 < argc)
+            spfm_pad.min_us = (int)(atof(argv[++i]) * 1000.0 + 0.5);
+        else if (!strcmp(a, "--pad-lag") && i + 1 < argc)
+            spfm_pad.lag_us = (int)(atof(argv[++i]) * 1000.0 + 0.5);
+        else if (!strcmp(a, "--pad-window") && i + 1 < argc)
+            spfm_pad.win_ms = atoi(argv[++i]);
+        else if (!strcmp(a, "--pad-local") && i + 1 < argc)
+            spfm_pad.local = atoi(argv[++i]);
+        else if (!strcmp(a, "--pad-rate") && i + 1 < argc)
+            spfm_pad.rate = atoi(argv[++i]);
+        else if (!strcmp(a, "--pad-hold") && i + 1 < argc)
+            spfm_pad.hold_ms = atoi(argv[++i]);
+        else if (!strcmp(a, "--pad-partial"))  spfm_pad.fit = 0;
+        else if (!strcmp(a, "--pad-always") || !strcmp(a, "--no-pad-gate"))
+            spfm_pad.gate = 0;
+        else if (!strcmp(a, "--dedup-vol"))    spfm_pad.dedup_vol = 1;
+        else if (!strcmp(a, "--digi") && i + 1 < argc)
+            spfm_pad.digi_hz = atoi(argv[++i]);
+        else if (!strcmp(a, "--pad-scope") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "all"))       spfm_pad.scope = 0;
+            else if (!strcmp(m, "digi")) spfm_pad.scope = 1;
+            else { fprintf(stderr, "--pad-scope must be all|digi\n"); return -1; }
+        }
         else if (a[0] == '-') {
             fprintf(stderr, "unknown option '%s'\n", a);
             return -1;
@@ -900,6 +1073,7 @@ static int parse_args(int argc, char **argv, const char **path, int *list_only,
         fprintf(stderr, "--slot must be 0..%d\n", SPFM_MAX_SLOT);
         return -1;
     }
+    spfm_pad_normalize();
     return 0;
 }
 
@@ -908,6 +1082,8 @@ int main(int argc, char **argv)
     const char *path = NULL;
     int list_only = 0;
     int from_idx = 0;
+
+    spfm_pad_defaults();
 
     if (argc < 2) { usage(); return 1; }
     if (parse_args(argc, argv, &path, &list_only, &from_idx) != 0) {

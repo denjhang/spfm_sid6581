@@ -46,7 +46,7 @@ LSFPREF     := $(BUILD)/lsfpref.exe
 
 # The hardware bring-up tool. sidvgm.c is linked in only so `sidplay` can
 # replay a recorded .sidvgm stream; the recorder itself stays offline.
-SRCS := src/spfm_transport.c src/sid6581.c src/sid_freq_table.c \
+SRCS := src/spfm_transport.c src/spfm_pad.c src/sid6581.c src/sid_freq_table.c \
         src/sid_rsid.c src/sidvgm.c src/sidplay.c src/sidtest.c
 OBJS := $(patsubst src/%.c,$(BUILD)/%.o,$(SRCS))
 TARGET := $(BUILD)/sidtest.exe
@@ -55,8 +55,9 @@ TARGET := $(BUILD)/sidtest.exe
 # .sid recorder and sidvgm for recorded streams. Separate binary from sidtest
 # on purpose - sidtest is the bring-up tool, this is the thing you leave
 # playing.
-PLAYER_SRCS := src/spfm_transport.c src/sid6581.c src/sid_freq_table.c \
-               src/sid_rsid.c src/sidvgm.c src/spfmplayer.c
+PLAYER_SRCS := src/spfm_transport.c src/spfm_pad.c src/sid6581.c \
+               src/sid_freq_table.c src/sid_rsid.c src/sidvgm.c \
+               src/spfmplayer.c
 PLAYER_BIN  := $(BUILD)/spfmplayer.exe
 PLAYER_BIN_OBJS := $(patsubst src/%.c,$(BUILD)/%.o,$(PLAYER_SRCS))
 

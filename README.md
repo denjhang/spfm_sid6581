@@ -149,6 +149,23 @@ CIA：`play()` 由曲目真正的 CIA/VIC 中断触发，所以
 | 普通 PSID | `--engine native`（默认仍是 `lsfp`，两者都试一遍最稳） |
 | digi 鼓 / 真 RSID（`play=0000`） | `--engine lsfp` |
 
+**digi 鼓的时间精度**和 `sidtest` 是同一份代码（`src/spfm_pad.c`），所以
+`--pad` 那一整套在这里同样能用，参数和默认值一字不差：
+
+```cmd
+spfmplayer.exe sidvgm\rsid\turboutrun\turboutrun_s01.sidvgm ^
+    --pad 1 --pad-window 50 --pad-local 50 --pad-scope digi
+
+:: 活体 .sid 必须先给 --seconds：先录这一段，再按缓冲流回放
+spfmplayer.exe sid\rsid\turboutrun.sid --seconds 180 ^
+    --pad 1 --pad-window 50 --pad-local 50 --pad-scope digi
+```
+
+不带 `--seconds` 的活体 `.sid` 是边渲染边发的，下一处间隔还不知道，所以那种情况
+下会明确提示并忽略 `--pad`。参数表见
+[docs/播放器_spfmplayer.md §4.1](docs/播放器_spfmplayer.md) 与
+[README 的 `--pad` 一节](#数字鼓digi音质pad-系列)。
+
 旧的 `sidtest.exe sidplay` 仍然保留，走的就是 `native` 那条路。详见
 [docs/播放器_spfmplayer.md](docs/播放器_spfmplayer.md)。
 

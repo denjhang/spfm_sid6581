@@ -121,6 +121,54 @@ cd E:\working\zcode-projects\spfm_sid6581
 | `--list` | — | 只列目录里的 `.sid` |
 | `--help` | — | 完整帮助 |
 
+### 4.1 digi 鼓的时间精度（`--pad` 系列）
+
+和 `sidtest.exe` 是**同一份引擎**（`src/spfm_pad.c`），参数、默认值、行为完全
+一致，所以两边的调法可以互相照抄。只有一点不同：`spfmplayer` 播活体 `.sid`
+（不带 `--seconds`）时拿不到"下一个间隔"，会明确提示并忽略 `--pad`；给上
+`--seconds N` 就变成先录后放，`--pad` 就能用了。
+
+```powershell
+# 推荐起手式
+.\build\spfmplayer.exe "sidvgm\rsid\turboutrun\turboutrun_s01.sidvgm" `
+    --pad 1 --pad-window 50 --pad-local 50 --pad-scope digi
+
+# .sid 想用 --pad，必须给 --seconds（先录制那一段再回放）
+.\build\spfmplayer.exe sid\rsid\turboutrun.sid --seconds 180 `
+    --pad 1 --pad-window 50 --pad-local 50 --pad-scope digi
+```
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--pad MS` | 关 | 填充 ≤MS 的间隔；**越大鼓越好，也越吃带宽**。隐含 `--dedup-vol` |
+| `--pad-scope all\|digi` | `all` | `digi` 只填与 `$D418` 相邻的间隔 |
+| `--pad-window MS` | 0（关） | 局部滑动窗口；配 `--pad-local` 治"速度不均匀" |
+| `--pad-local PCT` | 100 | 窗口内允许的线速上限 |
+| `--pad-duty PCT` | 75 | 全局平均上限（漏桶） |
+| `--pad-lead MS` | 25 | 主机领先音乐多少 = 延迟 |
+| `--pad-chunk KB` | 2 | 每次 USB 传输的块大小 |
+| `--pad-burst MS` | 200 | 漏桶能攒多少 |
+| `--pad-min MS` | 0 | 短于此的间隔不填 |
+| `--pad-lag MS` | 0（关） | 线上时间领先音乐过多时暂停填充 |
+| `--pad-partial` | 关 | 允许半填（默认全填或全不填） |
+| `--pad-rate HZ` | 200 | `$D418` 密度达到多少才算鼓段落 |
+| `--pad-hold MS` | 60 | 鼓停下后还继续填多久 |
+| `--pad-always` | 关 | 忽略密度闸门，整首无条件填 |
+| `--digi HZ` | 0（关） | 只把 `$D418` 按 1/HZ 重采样；**只会降低音质** |
+
+**密度闸门默认开着**，这是它存在的意义：填充把"主机按截止时间发"换成"缓冲填满
+就发"，只有 `$D418` 写得够密时才成立。PSID 曲目、或者 digi 曲目的前奏（Giana
+RSID 开头约 4 秒）每秒只写几十次，照填会让芯片饿着等再成团吐出，听感是卡顿加
+节奏不对。所以只有密度过 `--pad-rate` 的段落才切换成填充节拍，其余部分走原来
+的主机截止时间，与不加参数完全一样。播完会打印实际生效的区间：
+
+```
+  pad: 77230 ms filler, 392126 gaps refused, gated on 4.0-159.0 s
+```
+
+整首都不够密时会打印 `(no dense $D418 passage: nothing padded)`，那就是按普通
+路径播完了，参数等于没加——这是正确行为，不是故障。
+
 ## 5. 写入协议：默认 `1step`
 
 | 值 | 线上字节 | 什么时候用 |
@@ -161,8 +209,9 @@ cd E:\working\zcode-projects\spfm_sid6581
 | 定位 | 上机调试、寄存器试探、自检 | 听音乐 |
 | 依赖 | 只有驱动 + FTDI | 驱动 + libsidplayfp + sidvgm |
 | `.sid` 录制器 | fake6502（`sidplay`） | 默认 libsidplayfp，可切回 fake6502 |
-| `.sidvgm` | 不认 | 认，可 `--loop` |
-| 体积 | 237 KB | 3.5 MB（静态链接） |
+| `.sidvgm` | 认 | 认，可 `--loop` |
+| digi 鼓调参 | `--pad` 全套 | 同一份引擎（`spfm_pad.c`），参数完全一致 |
+| 体积 | 258 KB | 3.5 MB（静态链接） |
 
 调试一条通道、量一个引脚、扫一个时序，用 `sidtest`；只想听，用
 `spfmplayer`。
