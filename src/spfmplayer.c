@@ -337,6 +337,7 @@ static int replay_buffer(const sid_event_t *ev_in, size_t n_in, int paced, int *
                 if (k) {
                     sid_set_deferred_flush(false);
                     sid_flush();
+                    s_interrupt = k;
                     *key = k;
                     free(gate);
                     free(decimated);
@@ -354,6 +355,7 @@ static int replay_buffer(const sid_event_t *ev_in, size_t n_in, int paced, int *
             if (k) {
                 sid_set_deferred_flush(false);
                 sid_flush();
+                s_interrupt = k;
                 *key = k;
                 free(gate);
                 free(decimated);
@@ -378,6 +380,7 @@ static int replay_buffer(const sid_event_t *ev_in, size_t n_in, int paced, int *
         if (k) {
             sid_set_deferred_flush(false);
             sid_flush();
+            s_interrupt = k;
             *key = k;
             free(gate);
             free(decimated);
@@ -486,6 +489,7 @@ static int play_live_lsfp(const char *path, int subsong, sid_song_info_t *out,
                         sid_set_deferred_flush(false);
                         sid_flush();
                         sid_lsfp_stream_close(s);
+                        s_interrupt = k;
                         *key = k;
                         free(gate);
                         spfm_pad_report();
@@ -503,6 +507,7 @@ static int play_live_lsfp(const char *path, int subsong, sid_song_info_t *out,
                     sid_set_deferred_flush(false);
                     sid_flush();
                     sid_lsfp_stream_close(s);
+                    s_interrupt = k;
                     *key = k;
                     free(gate);
                     spfm_pad_report();
@@ -534,6 +539,7 @@ static int play_live_lsfp(const char *path, int subsong, sid_song_info_t *out,
             sid_set_deferred_flush(false);
             sid_flush();
             sid_lsfp_stream_close(s);
+            s_interrupt = k;
             *key = k;
             spfm_pad_report();
             if (pad_cfg) printf("\n");
@@ -614,6 +620,7 @@ static int play_live_native(const char *path, int subsong, sid_song_info_t *out,
                     sid_set_deferred_flush(false);
                     sid_flush();
                     sid_stream_close();
+                    s_interrupt = k;
                     *key = k;
                     return k == 'q' ? -1 : 1;
                 }
@@ -630,6 +637,7 @@ static int play_live_native(const char *path, int subsong, sid_song_info_t *out,
             sid_set_deferred_flush(false);
             sid_flush();
             sid_stream_close();
+            s_interrupt = k;
             *key = k;
             return k == 'q' ? -1 : 1;
         }
@@ -901,7 +909,14 @@ static int run_playlist(const char *dir, int start_idx)
     printf("keys: [n] next  [b] back  [,] prev subsong  [.] next subsong  [q] quit\n\n");
 
     int idx = start_idx < 0 ? 0 : (start_idx >= nfiles ? nfiles - 1 : start_idx);
-    int subsong = (opt.subsong < 0) ? 0 : opt.subsong;
+
+    /* The subsong follows the tune, not the playlist: after pressing '.' on a
+     * 9-subsong file, the next tune must start at its own default again. That
+     * was the "period jumps to the next track" report - the key *did* switch
+     * subsong, but the tune after it was then opened at the carried-over
+     * index, which for most files is a different (often near-silent) tune. */
+    const int base_sub = (opt.subsong < 0) ? 0 : opt.subsong;
+    int subsong = base_sub;
 
     while (idx >= 0 && idx < nfiles) {
         char path[768];
@@ -937,11 +952,18 @@ static int run_playlist(const char *dir, int start_idx)
         if (action == 'q') break;
 
         switch (action) {
-        case 'b': idx = idx > 0 ? idx - 1 : 0; printf("\n[BACK]\n\n"); break;
+        case 'b':
+            idx = idx > 0 ? idx - 1 : 0;
+            subsong = base_sub;
+            printf("\n[BACK]\n\n");
+            break;
         case ',': subsong = subsong > 0 ? subsong - 1 : 0;
                   printf("\n[SUBSONG %d]\n\n", subsong); break;
         case '.': subsong++; printf("\n[SUBSONG %d]\n\n", subsong); break;
-        default:  idx++; break;
+        default:
+            idx++;
+            subsong = base_sub;    /* a new tune starts at its own default */
+            break;
         }
         spfm_delay_ms(200);
     }

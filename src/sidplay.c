@@ -1464,8 +1464,15 @@ static int cmd_playlist(int argc, char **argv)
 
     /* `subsong` is the CLI request and applies to a .sid. For a recording the
      * subsong is a file inside the tune's own folder, so the selected index
-     * there is the play position instead. */
-    int sid_sub = subsong;
+     * there is the play position instead.
+     *
+     * base_sub exists so a subsong change cannot leak into the next file:
+     * pressing '.' on a 16-subsong tune used to leave sid_sub pointing at 1,
+     * and the following tune then opened at subsong 1 (usually a different,
+     * often near-silent one) - which the listener hears as "the key skipped
+     * to the next track". */
+    const int base_sub = subsong;
+    int sid_sub = base_sub;
 
     while (idx >= 0 && idx < nfiles) {
         char path[768];
@@ -1543,6 +1550,7 @@ static int cmd_playlist(int argc, char **argv)
                 group_bounds(files, nfiles, idx - 1, &pf, &pl);
                 idx = pf;
             }
+            sid_sub = base_sub;
             printf("\n[BACK]\n\n");
             break;
 
@@ -1572,10 +1580,12 @@ static int cmd_playlist(int argc, char **argv)
          * subsongs, otherwise one file. */
         case 'n':
             idx = (rendered && gn > 1) ? last + 1 : idx + 1;
+            if (!(rendered && gn > 1)) sid_sub = base_sub;
             break;
 
         default:
             idx++;
+            sid_sub = base_sub;    /* a new tune starts at its own default */
             break;
         }
         (void)rc;
