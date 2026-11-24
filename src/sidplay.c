@@ -1114,14 +1114,17 @@ static int cmd_play(int argc, char **argv)
 
     printf("song: %s / %s\n", probe.name, probe.author);
     if (spfm_pad.pad_us >= 0 && seconds <= 0) {
-        /* Only a *live* .sid is out of reach: it is generated a frame at a
-         * time, so the next gap is not known yet. With --seconds the whole
-         * span is rendered first and replayed from a finished buffer, which is
-         * exactly what padding needs, so leave it alone in that case. */
-        fprintf(stderr, "note: --pad needs a finished stream; either play a "
-                        ".sidvgm/.sidreg or give --seconds N (the first N "
-                        "seconds are rendered, then padded). "
-                        "Ignoring --pad for this live .sid\n");
+        /* sidtest's live path runs the built-in fake6502, which only calls
+         * play() once per frame and therefore never produces an in-frame $D418
+         * write. There is literally no gap to fill, so --pad would only switch
+         * the pacing for nothing. With --seconds the span is rendered by the
+         * same core but replayed from a finished buffer, so it is honest to
+         * accept the option there. spfmplayer.exe does support a live .sid
+         * with --pad because libsidplayfp gives it in-frame writes. */
+        fprintf(stderr, "note: sidtest's live .sid path uses the built-in 6502, "
+                        "which sees no in-frame $D418 writes, so --pad has "
+                        "nothing to fill. Give --seconds N to record first, or "
+                        "use spfmplayer.exe for a live digi tune.\n");
         spfm_pad.pad_us = -1;
         spfm_pad.dedup_vol = 0;
     }

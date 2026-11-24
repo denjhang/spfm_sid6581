@@ -64,6 +64,18 @@ void spfm_pad_reset(void);
  * it. */
 unsigned char *spfm_pad_gate_marks(const sid_event_t *ev, size_t n);
 
+/* Streaming variant, for a .sid that has no end and is therefore never handed
+ * over as one array: libsidplayfp produces it one frame at a time, and frame N
+ * is complete before frame N plays. Keeping the density history and the
+ * hold-off across calls makes the gate marks continuous across frame
+ * boundaries, so a live tune gets the same padding a recording does.
+ *
+ * The one gap a live stream cannot pad is the frame boundary itself: the next
+ * frame does not exist yet. That gap is ~20 ms of silence, far longer than
+ * --pad, so it would not be filled anyway. */
+void          spfm_pad_stream_begin(void);
+unsigned char *spfm_pad_stream_marks(const sid_event_t *ev, size_t n);
+
 /* 1 while the filler owns the pacing. Set by the replay loop at every gated
  * boundary; also read by the transport flush rule, which must not try to hit
  * deadlines inside a padded passage. */

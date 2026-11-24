@@ -124,19 +124,28 @@ cd E:\working\zcode-projects\spfm_sid6581
 ### 4.1 digi 鼓的时间精度（`--pad` 系列）
 
 和 `sidtest.exe` 是**同一份引擎**（`src/spfm_pad.c`），参数、默认值、行为完全
-一致，所以两边的调法可以互相照抄。只有一点不同：`spfmplayer` 播活体 `.sid`
-（不带 `--seconds`）时拿不到"下一个间隔"，会明确提示并忽略 `--pad`；给上
-`--seconds N` 就变成先录后放，`--pad` 就能用了。
+一致，所以两边的调法可以互相照抄。三种输入都能用，`.sid` 不需要 `--seconds`：
+libsidplayfp 是"渲染好一帧再播这一帧"，帧内每处间隔在播放前就知道了，填充照常
+生效。唯一够不到的是帧边界（下一帧还不存在），而那是 ~20 ms 的静音，远大于
+`--pad`，本来也不会被填。
 
 ```powershell
-# 推荐起手式
+# 录好的流
 .\build\spfmplayer.exe "sidvgm\rsid\turboutrun\turboutrun_s01.sidvgm" `
     --pad 1 --pad-window 50 --pad-local 50 --pad-scope digi
 
-# .sid 想用 --pad，必须给 --seconds（先录制那一段再回放）
-.\build\spfmplayer.exe sid\rsid\turboutrun.sid --seconds 180 `
+# 活体 .sid，一直播到按键
+.\build\spfmplayer.exe sid\rsid\turboutrun.sid `
+    --pad 1 --pad-window 50 --pad-local 50 --pad-scope digi
+
+# 整个目录连播（每首一直播到按键，或给 --seconds 自动切）
+.\build\spfmplayer.exe sid\games `
     --pad 1 --pad-window 50 --pad-local 50 --pad-scope digi
 ```
+
+**唯一的限制在录制器**：`--engine native`（内置 6502）只看得到每帧一次的
+`play()`，帧内的 `$D418` 写入全部丢失，那种情况下密度闸门永远打不开、`--pad`
+等于没加。digi 曲目保持默认的 `--engine lsfp` 就行。
 
 | 参数 | 默认 | 说明 |
 |---|---|---|

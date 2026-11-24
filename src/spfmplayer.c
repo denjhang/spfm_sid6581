@@ -436,6 +436,18 @@ static int play_live_lsfp(const char *path, int subsong, sid_song_info_t *out,
 
     sid_set_deferred_flush(!opt.flush_register);
 
+    /* The filler works here too: frame N is complete before frame N plays, so
+     * every gap inside it is known. Only the frame boundary is out of reach
+     * (frame N+1 does not exist yet), and that gap is ~20 ms of silence - far
+     * longer than --pad - so nothing is lost. The density gate keeps its
+     * history across frames, which is why it needs the streaming entry point
+     * rather than a per-frame marks array. */
+    const int pad_cfg = (spfm_pad.pad_us >= 0);
+    const int pad_all = pad_cfg && !spfm_pad.gate;
+    spfm_pad_reset();
+    spfm_pad_stream_begin();
+    if (pad_cfg) spfm_set_flush_bytes((size_t)spfm_pad.chunk);
+
     /* First call also returns the init writes, all stamped 0. */
     const sid_event_t *ev = NULL;
     size_t n = 0;
@@ -449,9 +461,41 @@ static int play_live_lsfp(const char *path, int subsong, sid_song_info_t *out,
     for (;;) {
         if (sid_lsfp_stream_next(s, &ev, &n) != 0) break;
 
+        unsigned char *gate = pad_cfg ? spfm_pad_stream_marks(ev, n) : NULL;
+        int64_t batch_first = -1;
+
         for (size_t i = 0; i < n; i++) {
             int64_t due = start + (int64_t)(ev[i].t_ms * us_per_ms);
-            if (due > spfm_now_us()) {
+
+            {
+                const int pad_on = gate ? gate[i] : pad_all;
+                if (pad_on != spfm_pad_active()) {
+                    sid_flush();
+                    spfm_pad_set_active(pad_on);
+                    spfm_set_flush_bytes(pad_on ? (size_t)spfm_pad.chunk
+                                                : SPFM_BUF_SIZE);
+                }
+                if (pad_on) spfm_pad_mark_on(ev[i].t_ms);
+            }
+
+            if (spfm_pad_active()) {
+                const int64_t target = due - (int64_t)spfm_pad.lead_us;
+                while (spfm_now_us() < target) {
+                    int k = kb_take();
+                    if (k) {
+                        sid_set_deferred_flush(false);
+                        sid_flush();
+                        sid_lsfp_stream_close(s);
+                        *key = k;
+                        free(gate);
+                        spfm_pad_report();
+                        if (pad_cfg) printf("\n");
+                        return k == 'q' ? -1 : 1;
+                    }
+                    int64_t left = target - spfm_now_us();
+                    spfm_wait_until_us(spfm_now_us() + (left > 5000 ? 5000 : left));
+                }
+            } else if (due > spfm_now_us()) {
                 if (spfm_now_us() + (int64_t)FLUSH_THRESHOLD_TICKS * 1000000 / 44100 <= due)
                     sid_flush();
                 int k = wait_due(due);
@@ -460,14 +504,29 @@ static int play_live_lsfp(const char *path, int subsong, sid_song_info_t *out,
                     sid_flush();
                     sid_lsfp_stream_close(s);
                     *key = k;
+                    free(gate);
+                    spfm_pad_report();
+                    if (pad_cfg) printf("\n");
                     return k == 'q' ? -1 : 1;
                 }
             } else {
                 int64_t lag = spfm_now_us() - due;
                 if (lag > worst_lag_us) worst_lag_us = lag;
             }
-            emit(&ev[i]);
+
+            if (!spfm_pad_vol_is_dup(&ev[i])) emit(&ev[i]);
+
+            /* Filler between this write and the next one in the same frame.
+             * Across the frame boundary the gap is the rest of the frame,
+             * which --pad never touches. */
+            if (i + 1 < n)
+                spfm_pad_gap((int64_t)((ev[i + 1].t_ms - ev[i].t_ms) * 1000.0),
+                             ev[i].reg == SID_REG_MODE_VOL,
+                             ev[i + 1].reg == SID_REG_MODE_VOL,
+                             (int64_t)(ev[i + 1].t_ms * 1000.0));
+            (void)batch_first;
         }
+        free(gate);
         sid_flush();
 
         int k = kb_take();
@@ -476,6 +535,8 @@ static int play_live_lsfp(const char *path, int subsong, sid_song_info_t *out,
             sid_flush();
             sid_lsfp_stream_close(s);
             *key = k;
+            spfm_pad_report();
+            if (pad_cfg) printf("\n");
             return k == 'q' ? -1 : 1;
         }
 
@@ -486,6 +547,8 @@ static int play_live_lsfp(const char *path, int subsong, sid_song_info_t *out,
             sid_flush();
             sid_lsfp_stream_close(s);
             printf("\r  %5.1f s  reached --seconds limit        \n", played_ms / 1000.0);
+            spfm_pad_report();
+            if (pad_cfg) printf("\n");
             return 0;
         }
 
@@ -497,9 +560,12 @@ static int play_live_lsfp(const char *path, int subsong, sid_song_info_t *out,
         }
     }
 
+    if (pad_cfg) spfm_set_flush_bytes(SPFM_BUF_SIZE);
     sid_flush();
     sid_set_deferred_flush(false);
     sid_lsfp_stream_close(s);
+    spfm_pad_report();
+    if (pad_cfg) printf("\n");
     return 0;
 }
 
@@ -701,15 +767,14 @@ static int play_file(const char *path, int *key)
         sid_song_free(ev);        return rc;
     }
 
-    /* A live .sid is generated one frame at a time, so the next gap is not
-     * known yet and the filler has nothing to fill. Say so rather than
-     * accepting the options and silently doing nothing. */
-    if (spfm_pad.pad_us >= 0) {
-        fprintf(stderr, "note: --pad needs a finished stream; for a .sid give "
-                        "--seconds N so the span is recorded first. "
-                        "Ignoring --pad for this live .sid\n");
-        spfm_pad.pad_us = -1;
-        spfm_pad.dedup_vol = 0;
+    /* A live .sid is generated one frame at a time, but frame N is complete
+     * before frame N plays, so the filler works here too (see play_live_lsfp).
+     * The built-in 6502 recorder sees no intra-frame writes at all, so the
+     * density gate simply never opens there and the tune plays normally. */
+    if (spfm_pad.pad_us >= 0 && !opt.use_lsfp) {
+        fprintf(stderr, "note: --engine native sees no in-frame $D418 writes, "
+                        "so --pad has nothing to fill. Use the default lsfp "
+                        "engine for digi drums.\n");
     }
 
     return opt.use_lsfp ? play_live_lsfp(path, subsong, NULL, key)
@@ -922,8 +987,9 @@ static void usage(void)
     printf("  --dry-run       no hardware, just walk the byte stream\n");
     printf("  --list          list the .sid files in a directory\n");
     printf("\n");
-    printf("digital-drum timing (buffered playback only: .sidvgm/.sidreg, or a\n");
-    printf(".sid with --seconds; a live --seconds 0 .sid cannot use these):\n");
+    printf("digital-drum timing (works for .sidvgm/.sidreg, a bounded .sid and a\n");
+    printf("live endless .sid alike; the built-in 6502 recorder sees no in-frame\n");
+    printf("$D418 writes, so keep --engine lsfp for digi drums):\n");
     printf("  --pad MS        fill gaps up to MS with NOP bytes so the 1.5 Mbaud\n");
     printf("                  UART clock carries the timing instead of host sleeps.\n");
     printf("                  This is what makes digi drums sound like the original.\n");

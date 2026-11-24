@@ -156,13 +156,16 @@ CIA：`play()` 由曲目真正的 CIA/VIC 中断触发，所以
 spfmplayer.exe sidvgm\rsid\turboutrun\turboutrun_s01.sidvgm ^
     --pad 1 --pad-window 50 --pad-local 50 --pad-scope digi
 
-:: 活体 .sid 必须先给 --seconds：先录这一段，再按缓冲流回放
-spfmplayer.exe sid\rsid\turboutrun.sid --seconds 180 ^
+:: 活体 .sid 也一样，不用 --seconds：一帧一帧地录、一帧一帧地放
+spfmplayer.exe sid\rsid\turboutrun.sid ^
     --pad 1 --pad-window 50 --pad-local 50 --pad-scope digi
 ```
 
-不带 `--seconds` 的活体 `.sid` 是边渲染边发的，下一处间隔还不知道，所以那种情况
-下会明确提示并忽略 `--pad`。参数表见
+活体 `.sid` 每帧在播放之前就已经渲染完，所以帧内的每一处间隔都是已知的，填充照常
+生效；只有帧边界跨不过去（下一帧还不存在），而那是 ~20 ms 的静音，远大于
+`--pad`，本来也不会被填。唯一要注意的是录制器：`--engine native`（内置 6502）
+看不到帧内 `$D418` 写入，那种情况下闸门永远打不开，鼓也就没了——digi 曲目保持默认
+的 `lsfp` 即可。参数表见
 [docs/播放器_spfmplayer.md §4.1](docs/播放器_spfmplayer.md) 与
 [README 的 `--pad` 一节](#数字鼓digi音质pad-系列)。
 

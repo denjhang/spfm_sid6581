@@ -122,7 +122,6 @@ void spfm_pad_mark_on(double t_ms)
 unsigned char *spfm_pad_gate_marks(const sid_event_t *ev, size_t n)
 {
     if (spfm_pad.pad_us < 0 || !spfm_pad.gate || n == 0) return NULL;
-
     unsigned char *m = (unsigned char *)calloc(n, 1);
     if (!m) return NULL;
 
@@ -153,6 +152,72 @@ unsigned char *spfm_pad_gate_marks(const sid_event_t *ev, size_t n)
 
     /* Nothing dense anywhere: return NULL instead of an all-zero array the
      * caller cannot tell apart from "gate broken". */
+    for (size_t i = 0; i < n; i++)
+        if (m[i]) return m;
+
+    free(m);
+    return NULL;
+}
+
+/* Streaming gate: the same decision, but the density history and the hold-off
+ * survive between calls because a live .sid arrives one frame at a time.
+ *
+ * History is a fixed ring of the last PAD_GATE_WIN_US worth of $D418 stamps.
+ * A frame is ~20 ms and the window is 250 ms, so the ring only has to hold a
+ * few thousand entries even for a tune that writes $D418 every 136 us. */
+#define PAD_GATE_RING 8192
+static int64_t s_gate_ring[PAD_GATE_RING];
+static size_t  s_gate_ring_n, s_gate_ring_head;
+static int64_t s_gate_keep_until;
+
+void spfm_pad_stream_begin(void)
+{
+    s_gate_ring_n = s_gate_ring_head = 0;
+    s_gate_keep_until = -1;
+}
+
+unsigned char *spfm_pad_stream_marks(const sid_event_t *ev, size_t n)
+{
+    if (spfm_pad.pad_us < 0 || !spfm_pad.gate || n == 0) return NULL;
+
+    unsigned char *m = (unsigned char *)calloc(n, 1);
+    if (!m) return NULL;
+
+    const int64_t hold_us = (int64_t)spfm_pad.hold_ms * 1000;
+    int64_t keep_until = s_gate_keep_until;
+
+    for (size_t i = 0; i < n; i++) {
+        const int64_t t = (int64_t)(ev[i].t_ms * 1000.0);
+
+        if (ev[i].reg == SID_REG_MODE_VOL) {
+            /* Drop stamps that fell out of the window, then add this one. The
+             * ring is ordered by time, so the oldest entry is the head. */
+            while (s_gate_ring_n > 0 &&
+                   s_gate_ring[s_gate_ring_head] < t - PAD_GATE_WIN_US) {
+                s_gate_ring_head = (s_gate_ring_head + 1) % PAD_GATE_RING;
+                s_gate_ring_n--;
+            }
+            if (s_gate_ring_n < PAD_GATE_RING) {
+                const size_t tail = (s_gate_ring_head + s_gate_ring_n) % PAD_GATE_RING;
+                s_gate_ring[tail] = t;
+                s_gate_ring_n++;
+            } else {
+                /* Full: the window is smaller than the write rate can fill it,
+                 * i.e. far denser than --pad-rate needs. 8192 entries in
+                 * 250 ms is 32768 writes/s; treat it as saturated. */
+                s_gate_ring[s_gate_ring_head] = t;
+                s_gate_ring_head = (s_gate_ring_head + 1) % PAD_GATE_RING;
+            }
+        }
+
+        if ((int64_t)s_gate_ring_n * 1000000 / PAD_GATE_WIN_US >= spfm_pad.rate)
+            keep_until = t + hold_us;
+
+        m[i] = (keep_until >= 0 && t <= keep_until) ? 1 : 0;
+    }
+
+    s_gate_keep_until = keep_until;
+
     for (size_t i = 0; i < n; i++)
         if (m[i]) return m;
 
