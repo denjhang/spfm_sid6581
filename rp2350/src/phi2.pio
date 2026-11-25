@@ -1,0 +1,43 @@
+;
+; phi2.pio - SID PHI2 clock generator
+;
+; Copied from USBSID-Pico's src/pio/clock.pio, which runs on the same chip
+; (RP2350) against a real SID. Their program drives the clock with `set pins`
+; instead of a sideset nop pair; that is the difference that matters, because
+; `set pins` latches the pin state in the SM's own output register, while an
+; optional sideset on a `nop` depends on the instruction encoding being right.
+;
+; Two instructions per period, so the divider is clk_sys / (2 * f). At 150 MHz
+; for PAL 985248 Hz that is 76.123, which PIO's 16.8 fractional divider lands
+; on 985272 Hz: +24.6 ppm (0.04 cents). NTSC 1022727 Hz is +18 ppm.
+;
+; Using the emulator's clock (985248) rather than a 1 MHz can is what keeps PAL
+; tunes from playing 26 cents sharp.
+
+.program phi2_gen
+
+.wrap_target
+    set pins, 1       ; drive high
+    set pins, 0       ; drive low
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+#define PHI2_HZ_PAL   985248.0f
+#define PHI2_HZ_NTSC  1022727.0f
+
+static inline void phi2_program_init(PIO pio, uint sm, uint offset,
+                                     uint pin, float hz) {
+    pio_sm_config c = phi2_gen_program_get_default_config(offset);
+
+    sm_config_set_set_pins(&c, pin, 1);
+    sm_config_set_clkdiv(&c, (float)clock_get_hz(clk_sys) / (2.0f * hz));
+
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

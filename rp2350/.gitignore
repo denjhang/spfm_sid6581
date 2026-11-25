@@ -1,0 +1,9 @@
+# build output
+build/
+
+# host tools built with the system gcc
+tools/*.exe
+
+# Pico SDK 2.2.0 (~63 MB). Not committed: it is a stock upstream download.
+# fetch_sdk.sh puts it here.
+pico-sdk-2.2.0/

@@ -1,0 +1,34 @@
+; pio_cs.pio - Chip select PIO driver (2-bit)
+;
+; GPIO mapping (2 consecutive pins starting at base_pin=13):
+;   GPIO13: CS0# (active low)
+;   GPIO14: CS1# (active low)
+;
+; 2-bit word: bit[0]=CS0#, bit[1]=CS1#
+; 1=idle (high), 0=selected (low)
+
+.program cs_out
+
+    pull block
+    out pins, 2
+
+% c-sdk {
+static inline void cs_out_program_init(PIO pio, uint sm, uint offset, uint base_pin) {
+    pio_sm_config c = pio_get_default_sm_config();
+
+    sm_config_set_out_pins(&c, base_pin, 2);
+    sm_config_set_out_shift(&c, true, false, 32);  /* autopull OFF: the program does an explicit `pull block`; leaving autopull on made the SM swallow the next FIFO word right after `out pins`, so every other word was dropped */
+    sm_config_set_wrap(&c, offset, offset + 1);
+
+    for (int i = 0; i < 2; i++) {
+        pio_gpio_init(pio, base_pin + i);
+    }
+    pio_sm_set_consecutive_pindirs(pio, sm, base_pin, 2, true);
+    pio_sm_set_pins_with_mask(pio, sm,
+        (uint32_t)0x03 << base_pin,
+        0x03u << base_pin);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
