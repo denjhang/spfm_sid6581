@@ -42,11 +42,9 @@ static uint s_ws_sm = 0;
 static PIO s_phi_pio = pio0;
 static uint s_phi_sm = 0;
 static bool s_ws_ready = false;
-static absolute_time_t s_ws_off_time = {0};
 static uint32_t s_ws_leds[NUM_WS_LEDS] = {0};
-static const uint32_t cs_colors[NUM_WS_LEDS] = {
-    0x006600, 0x000066, 0x666600, 0x660000,
-};
+static bool s_led_state = false;
+static absolute_time_t s_led_next = {0};
 
 // ========== Command Buffer ==========
 static cmd_buf_t s_cmd;
@@ -121,7 +119,102 @@ static inline void cs_select(uint8_t slot) {
     pio_cs_put(s_cs_pio, s_cs_sm, cs_pack(slot));
 }
 
-// ========== WS2812 ==========
+// ========== WS2812: SID activity meter ==========
+//
+// Four LEDs, one per thing a listener can hear:
+//
+//     LED0 voice 1    LED1 voice 2    LED2 voice 3    LED3 $D418
+//
+// A voice's hue is its waveform, so the bass channel on pulse reads yellow and
+// an arpeggio on saw reads blue; its brightness is the gate, so a note looks
+// like a blink and a rest looks dark. $D418 tracks the volume nibble and
+// flashes on every write to it - the nibble barely moves during a digi drum,
+// the write rate is what moves, so the flash is what makes the drum visible.
+//
+// Everything is composed in led_update() on a 20 ms tick rather than inside
+// write_reg_sid(). That function runs at up to ~800 writes/s and each
+// ws2812_update() blocks the PIO for ~120 us, so pushing a frame per write
+// would eat the timing budget the whole design exists to protect.
+
+#define WS_TICK_MS 20
+
+/* SID register bits the LED layer needs. The firmware does not link
+ * src/sid6581.c (that is the SPFM host driver), so the handful of constants it
+ * shares are repeated here rather than pulling in the whole header. */
+#define SID_REG_MODE_VOL   0x18
+#define SID_VOLUME_MASK    0x0F
+#define SID_CTL_GATE       0x01
+#define SID_CTL_TRI        0x10
+#define SID_CTL_SAW        0x20
+#define SID_CTL_PULSE      0x40
+#define SID_CTL_NOISE      0x80
+
+/* Max 0x28 per channel: the 0x66 the RPFM defaults used was described as
+ * blinding on this board, and 0x18 was accepted. */
+#define WS_LEVEL 0x28u
+
+/* Waveform -> hue. Index order matches wave_index() below. */
+static const uint32_t WAVE_RGB[4] = {
+    0x002800,   /* triangle: green  */
+    0x000028,   /* sawtooth: blue   */
+    0x282800,   /* pulse:    yellow */
+    0x280000,   /* noise:    red    */
+};
+
+#define WS_FLASH_VOICE 0x101010u
+#define WS_FLASH_VOL   0x303030u
+
+static uint8_t  s_voice_ctl[3];      /* last CONTROL write per voice */
+static uint32_t s_voice_flash[3];    /* addend that decays after each write */
+static uint8_t  s_vol_val;           /* last $D418 volume nibble */
+static uint32_t s_vol_flash;
+static absolute_time_t s_ws_tick = {0};
+
+static uint32_t ws_scale(uint32_t rgb, uint32_t num, uint32_t den)
+{
+    uint32_t r = ((rgb >> 16) & 0xFF) * num / den;
+    uint32_t g = ((rgb >>  8) & 0xFF) * num / den;
+    uint32_t b = ( rgb        & 0xFF) * num / den;
+    return (r << 16) | (g << 8) | b;
+}
+
+static uint32_t ws_add(uint32_t a, uint32_t b)
+{
+    uint32_t r = ((a >> 16) & 0xFF) + ((b >> 16) & 0xFF);
+    uint32_t g = ((a >>  8) & 0xFF) + ((b >>  8) & 0xFF);
+    uint32_t bl = (a        & 0xFF) + (b        & 0xFF);
+    if (r > 0xFF) r = 0xFF;
+    if (g > 0xFF) g = 0xFF;
+    if (bl > 0xFF) bl = 0xFF;
+    return (r << 16) | (g << 8) | bl;
+}
+
+/* SID waveform bits are not exclusive; when two are set the chip combines
+ * them, and visually the brighter one wins. Noise and pulse are the two that
+ * carry a drum, so they get priority over saw/triangle. */
+static int wave_index(uint8_t ctl)
+{
+    if (ctl & SID_CTL_NOISE) return 3;
+    if (ctl & SID_CTL_PULSE) return 2;
+    if (ctl & SID_CTL_SAW)   return 1;
+    return 0;
+}
+
+/* Called by write_reg_sid() for every write that reached the chip. */
+static void ws_sid_activity(uint8_t addr, uint8_t data)
+{
+    if (addr == SID_REG_MODE_VOL) {
+        s_vol_val = (uint8_t)(data & SID_VOLUME_MASK);
+        s_vol_flash = WS_FLASH_VOL;
+        return;
+    }
+    /* Voice n's CONTROL register is n*7 + 4 -> 0x04, 0x0B, 0x12. */
+    if ((addr & 0x07) == 0x04 && (addr >> 3) < 3) {
+        int v = addr >> 3;
+        s_voice_ctl[v] = data;
+        s_voice_flash[v] = WS_FLASH_VOICE;
+    }
+}
 
 static void ws2812_update(void) {
     for (int i = 0; i < NUM_WS_LEDS; i++)
@@ -136,6 +229,7 @@ static void ws2812_init(void) {
     ws2812_program_init(s_ws_pio, s_ws_sm, offset, PIN_WS2812, 800000, false);
     for (int i = 0; i < NUM_WS_LEDS; i++) s_ws_leds[i] = 0;
     ws2812_update();
+    s_ws_tick = make_timeout_time_ms(WS_TICK_MS);
 }
 
 /* PHI2 source: PIO on GPIO14, 985248 Hz (PAL) / 1022727 Hz (NTSC).
@@ -175,11 +269,62 @@ static void phi2_init(void) {
     s_phi_ready = true;
 }
 
-static inline void ws_led_on(uint8_t slot) {
-    if (s_ws_leds[slot] == cs_colors[slot]) return;
-    s_ws_leds[slot] = cs_colors[slot];
-    ws2812_update();
-    s_ws_off_time = make_timeout_time_ms(50);
+/* SID register bits the LED layer needs. The firmware does not link
+ * src/sid6581.c (that is the SPFM host driver), so the handful of constants it
+ * shares are repeated here rather than pulling in the whole header. */
+#define SID_REG_MODE_VOL   0x18
+#define SID_VOLUME_MASK    0x0F
+#define SID_CTL_GATE       0x01
+#define SID_CTL_TRI        0x10
+#define SID_CTL_SAW        0x20
+#define SID_CTL_PULSE      0x40
+#define SID_CTL_NOISE      0x80
+
+/* Nothing to light when the tune is silent; decay the write flashes instead. */
+static void ws_decay(void)
+{
+    for (int i = 0; i < 3; i++)
+        if (s_voice_flash[i]) s_voice_flash[i] -= s_voice_flash[i] / 3 + 1;
+    if (s_vol_flash) s_vol_flash -= s_vol_flash / 3 + 1;
+}
+
+static void led_update(void)
+{
+    /* Heartbeat on the plain LED, unchanged. */
+    if (time_reached(s_led_next)) {
+        s_led_state = !s_led_state;
+        gpio_put(PIN_LED, s_led_state);
+        s_led_next = make_timeout_time_ms(500);
+    }
+
+    if (!time_reached(s_ws_tick)) return;
+    s_ws_tick = make_timeout_time_ms(WS_TICK_MS);
+
+    ws_decay();
+
+    uint32_t want[NUM_WS_LEDS];
+
+    for (int v = 0; v < 3; v++) {
+        uint8_t ctl = s_voice_ctl[v];
+        uint32_t c = WAVE_RGB[wave_index(ctl)];
+        /* Gate off = dark: a release tail is inaudible on an LED, and a
+         * constant glow would make every channel look permanently on. */
+        uint32_t body = (ctl & SID_CTL_GATE)
+                      ? ws_scale(c, WS_LEVEL, WS_LEVEL)
+                      : 0;
+        want[v] = ws_add(body, s_voice_flash[v]);
+    }
+
+    /* $D418: brightness follows the volume nibble, flashes on each write. The
+     * drum barely moves this nibble, so without the flash a digi passage looks
+     * like a steady dim light. */
+    want[3] = ws_add(ws_scale(0xFFFFFFu, (uint32_t)s_vol_val, 15u), s_vol_flash);
+
+    int changed = 0;
+    for (int i = 0; i < NUM_WS_LEDS; i++) {
+        if (s_ws_leds[i] != want[i]) { s_ws_leds[i] = want[i]; changed = 1; }
+    }
+    if (changed && s_ws_ready) ws2812_update();
 }
 
 static inline void ws_led_off_all(void) {
@@ -187,17 +332,16 @@ static inline void ws_led_off_all(void) {
     ws2812_update();
 }
 
+
 // ========== Chip Writes ==========
 
 static inline void write_reg_ym(uint8_t slot, uint8_t addr, uint8_t data) {
     cs_select(slot);
-    if (s_ws_ready) ws_led_on(slot);
     ym2413_pio_write_reg(s_bus_pio, s_bus_sm, addr, data);
 }
 
 static inline void write_reg_ay(uint8_t slot, uint8_t addr, uint8_t data) {
     cs_select(slot);
-    if (s_ws_ready) ws_led_on(slot);
     ay8910_pio_write_reg(s_bus_pio, s_ay_sm, addr, data);
 }
 
@@ -220,7 +364,6 @@ static inline void write_reg_sid(uint8_t addr, uint8_t data) {
     uint8_t a = (uint8_t)(addr & 0x1F);
 
     cs_select(0);
-    if (s_ws_ready) ws_led_on(0);
 
     pio_bus_put(s_bus_pio, s_bus_sm, pack_bus(a, 0, true, true));
     busy_wait_us_32(SID_STEP_US);
@@ -238,6 +381,11 @@ static inline void write_reg_sid(uint8_t addr, uint8_t data) {
 
     pio_bus_put(s_bus_pio, s_bus_sm, BUS_IDLE);
     busy_wait_us_32(SID_STEP_US);
+
+    /* Only record, never drive the LEDs here: this runs up to ~800 times a
+     * second and each frame costs ~120 us of PIO time. led_update() composes
+     * the picture on its own tick. */
+    if (s_ws_ready) ws_sid_activity(a, data);
 }
 
 /* 肉眼可见的自检：用同一条 PIO 通路，把两次写间隔拉到 250 ms。
@@ -597,19 +745,6 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
     return RPFM_FRAME_SIZE;
 }
 
-// ========== LED ==========
-
-static bool s_led_state = false;
-static absolute_time_t s_led_next = {0};
-
-static void led_update(void) {
-    if (time_reached(s_led_next)) {
-        s_led_state = !s_led_state;
-        gpio_put(PIN_LED, s_led_state);
-        s_led_next = make_timeout_time_ms(500);
-    }
-}
-
 // ========== Main ==========
 
 int main() {
@@ -685,12 +820,6 @@ int main() {
                 write_reg_ay(slot, addr, data);
             else
                 write_reg_ym(slot, addr, data);
-        }
-
-        // WS2812 auto-off after timeout
-        if (s_ws_off_time && time_reached(s_ws_off_time)) {
-            s_ws_off_time = (absolute_time_t){0};
-            ws_led_off_all();
         }
     }
 
