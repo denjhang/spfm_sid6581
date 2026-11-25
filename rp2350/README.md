@@ -14,7 +14,7 @@
 | 自动烧录（HID `CMD_BOOTSEL`） | ✅ 每次都用，不用按按钮 |
 | 上电自检（密集琶音+和弦+噪声鼓） | ✅ |
 | `.sidreg` 事件流播放（`tools/sid_stream.exe`） | ✅ 已跑通 8079 事件 / 10 秒 |
-| 完整 `.sid` 播放 | ⬜ 下一步 |
+| **`.sidvgm` / `.sid` 播放（`rpfm_sid.exe`）** | ✅ **已上机确认声音正常** |
 
 ## 硬件
 
@@ -46,6 +46,12 @@ cmake --build build -j8
 
 产物：`build/rpfm_sid_player.uf2`（SID 播放器）、`build/led_test.uf2`（流水灯自检）。
 
+主机侧播放器（在仓库根目录跑，复用 `build/*.o`）：
+
+```bash
+bash rp2350/scripts/build_host.sh     # -> build/rpfm_sid.exe
+```
+
 依赖：ARM GCC 16.2 + picotool 2.3.1（在 `/d/msys64/ucrt64`），Pico SDK 2.2.0 已随仓库带在 `pico-sdk-2.2.0/`。
 
 ## 自动烧录
@@ -59,15 +65,29 @@ Copy-Item .\build\rpfm_sid_player.uf2 G:\
 
 固件里 `CMD_BOOTSEL (0x20)` 调 `reset_usb_boot()`，所以永远不用按按钮。
 
-## 播放 .sidreg
+## 播放 .sidvgm / .sid
+
+`tools\sid_stream.exe` 是上一轮的临时工具（只认 `.sidreg`）。正式播放器是
+`build\rpfm_sid.exe`，它是 `..\src\spfmplayer.c` 换传输层改出来的：
+播放列表、键盘、libsidplayfp 录制、`.sidvgm`/`.sidreg` 回放都沿用，
+只把 SPFM 总线换成 RPFM HID 帧。
 
 ```powershell
-.\tools\sid_stream.exe ..\build\cmp\R-Type_nat.sidreg
+cd E:\working\zcode-projects\spfm_sid6581
+.\build\rpfm_sid.exe sidvgm\turboutrun              # 整个文件夹连播
+.\build\rpfm_sid.exe "sidvgm\atmos.sidvgm" --seconds 60
+.\build\rpfm_sid.exe sid\games                      # .sid 直接用 libsidplayfp 跑
 ```
 
-`.sidreg` 是本仓库 `sidextract.exe` 输出的文本格式（`时间ms 寄存器hex 值hex`），
-工具把它转成 µs 增量、按 `CMD_SID_EVENTS (0x30)` 每帧 15 条推给板子。
-板子按绝对 deadline 执行，所以 USB 抖动不影响时序。
+关键部分：
+
+- **`.sid` 走 libsidplayfp**（它自己的 6502/VIC/CIA），不是内置 fake6502。
+  CIA 定时器和 `$D418` 数字鼓在帧内写寄存器，只有 libsidplayfp 会如实报告。
+- **时钟由曲子的 region 决定**：板子收到 `CMD_PHI2` 后切 985248 / 1022727 Hz。
+- **时间戳在事件里**：主机把每个写连同 µs 增量一起推给板子，板子按绝对
+  deadline 执行。主机只负责把队列保持在 400 ms 以内，所以 USB 抖动不影响发声时刻。
+- `--pad` / `--digi` / `--proto` 全部**不存在**——它们是为 1.5 Mbaud UART 补时序的，
+  这里每个事件自带微秒时间戳，没有线速问题。
 
 ## 协议
 
@@ -75,15 +95,15 @@ Copy-Item .\build\rpfm_sid_player.uf2 G:\
 
 | CMD | 内容 |
 |---|---|
-| `0x30` | `CMD_SID_EVENTS` `[dt_lo,dt_hi,addr,data] × N` 带时间戳 |
+| `0x30` | `CMD_SID_EVENTS` `[dt_lo,dt_hi,addr,data] × N` 带时间戳；`addr=0xFF` = 只等待不写 |
 | `0x32` | `CMD_SID_WRITE` `[addr,data] × N` 立即写 |
 | `0x31` | `CMD_PHI2` `[0=PAL/1=NTSC]` |
-| `0x03` | `CMD_RESET` 复位 IC# 并清寄存器 |
+| `0x03` | `CMD_RESET` 清事件队列 + 复位 IC# |
 | `0x20` | `CMD_BOOTSEL` |
 
 ## 源码结构
 
-从 RPFM（`E:\working\vscode-projects\YM2163-Midi\RPFM`）原样复制后小改。
+固件从 RPFM（`E:\working\vscode-projects\YM2163-Midi\RPFM`）原样复制后小改。
 共 16 个文件 1688 行，**只动了三处**：
 
 | 文件 | 改动 |
@@ -93,6 +113,14 @@ Copy-Item .\build\rpfm_sid_player.uf2 G:\
 | `src/main.c` | 引脚号（CS 12 / DIR 11 / PHI2 14 / WS2812 16）、`phi2_init()`、`write_reg_sid()`、琶音自检、SID 事件队列 |
 
 `src/phi2.pio` 是新增的，抄自 USBSID-Pico 的 `src/pio/clock.pio`（用 `set pins` 而不是 sideset）。
+
+主机侧：
+
+| 文件 | 来源 |
+|---|---|
+| `tools/rpfm_link.[ch]` | `RPFM_Player/src/rpfm_hid.cpp` 改 C，增加 SID 事件批处理 |
+| `tools/rpfm_sid.c` | `../src/spfmplayer.c` 换传输层（骨架、播放列表、键盘、libsidplayfp 录制全部沿用） |
+| `scripts/build_host.sh` | 复用仓库 `build/*.o` 与 `third_party/local/lib` 静态库 |
 
 ## 踩过的坑
 

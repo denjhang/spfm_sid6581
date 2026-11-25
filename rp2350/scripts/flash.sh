@@ -1,16 +1,16 @@
 #!/bin/bash
-# flash.sh - 一键烧录 sid_rp2350，不需要按 BOOTSEL 按钮。
+# flash.sh - 一键烧录 rpfm_sid_player，不需要按 BOOTSEL 按钮。
 #
 # 固件在 src/main.c 里处理 CMD_BOOTSEL (0x20) 时调 reset_usb_boot()，
 # 所以主机发一帧 HID 就能让板子自己进烧录模式。
 #
 # 用法: bash scripts/flash.sh [uf2文件]
-#   默认 build/sid_rp2350.uf2
+#   默认 build/rpfm_sid_player.uf2
 
 set -e
 cd "$(dirname "$0")/.."
 
-UF2="${1:-build/sid_rp2350.uf2}"
+UF2="${1:-build/rpfm_sid_player.uf2}"
 [ -f "$UF2" ] || { echo "找不到 UF2: $UF2"; exit 1; }
 [ -f tools/rpfm_bootsel.exe ] || { echo "缺 tools/rpfm_bootsel.exe"; exit 1; }
 

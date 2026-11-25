@@ -138,45 +138,41 @@ static void ws2812_init(void) {
     ws2812_update();
 }
 
-/* PHI2 source. GPIO14 would not drive the SID clock on this board, so the
- * 1 MHz active crystal can drives pin 8 directly and PIO stays out of it.
- * Set USE_PIO_PHI2 to 1 only after GPIO14 is proven to output. */
+/* PHI2 source: PIO on GPIO14, 985248 Hz (PAL) / 1022727 Hz (NTSC).
+ *
+ * The clock comes from the emulator's own master clock, not from a 1 MHz can.
+ * A 1 MHz crystal would put every PAL tune 25.7 cents sharp; a PIO divider of
+ * 150e6/(2*985248) = 76.123 lands on 985272 Hz, which is +0.04 cents. */
 #define USE_PIO_PHI2 1
 
+/* Switch the clock without re-adding the program.
+ *
+ * pio_add_program() appends to the PIO's instruction memory and has no
+ * counterpart that frees it while an SM is running, so calling it on every
+ * CMD_PHI2 would exhaust the 32-instruction space after a dozen track changes
+ * and then hand back a garbage offset. Re-initialising the same offset only
+ * reloads the divider and the pin mapping. */
 static uint s_phi_off = 0;
+static bool s_phi_ready = false;
 
 static void phi2_set(float hz) {
+    if (!s_phi_ready) return;
     pio_sm_set_enabled(s_phi_pio, s_phi_sm, false);
-    pio_sm_unclaim(s_phi_pio, s_phi_sm);
-    s_phi_sm = pio_claim_unused_sm(s_phi_pio, true);
     phi2_program_init(s_phi_pio, s_phi_sm, s_phi_off, PIN_PHI2, hz);
 }
 
-/* 自检 + 启动。
- *
- * PIO 的 clkdiv 上限是 65535.9999，两条指令一个周期，所以 PIO 最慢只能到
- * 150e6/(2*65536) ≈ 1144 Hz —— 低于这个频率用 PIO 做不到，"慢速闪烁"
- * 必须用纯 GPIO。先用 GPIO 让 GPIO14 以 2 Hz 翻 6 次，确认这个脚本身会动；
- * 再交给 PIO 出 985248 Hz。这样"脚坏了"和"PIO 配错了"能分开。 */
+/* Start the clock. The GPIO-first blink that used to live here has been
+ * removed: it ran for six seconds before tud_init(), so USB never enumerated
+ * until it finished and the host player could not find the board. The pin is
+ * proven; the blink belongs in the bring-up notes, not in the boot path. */
 static void phi2_init(void) {
 #if !USE_PIO_PHI2
     return;
 #endif
-
-    /* 1) 纯 GPIO 慢闪，肉眼可见 */
-    gpio_init(PIN_PHI2);
-    gpio_set_dir(PIN_PHI2, GPIO_OUT);
-    for (int i = 0; i < 6; i++) {
-        gpio_put(PIN_PHI2, 1);
-        sleep_ms(500);
-        gpio_put(PIN_PHI2, 0);
-        sleep_ms(500);
-    }
-
-    /* 2) 交给 PIO，跑真实时钟 */
     s_phi_off = pio_add_program(s_phi_pio, &phi2_gen_program);
     s_phi_sm = pio_claim_unused_sm(s_phi_pio, true);
     phi2_program_init(s_phi_pio, s_phi_sm, s_phi_off, PIN_PHI2, PHI2_HZ_PAL);
+    s_phi_ready = true;
 }
 
 static inline void ws_led_on(uint8_t slot) {
@@ -369,6 +365,12 @@ static volatile uint32_t s_sid_q_head = 0;
 static volatile uint32_t s_sid_q_tail = 0;
 static bool     s_sid_host_mode = false;   // true once the host streamed events
 static uint64_t s_sid_deadline  = 0;
+static bool     s_sid_need_anchor = true;  // next event becomes the clock origin
+
+/* addr 0xFF is a wait-only event: the host could not express a gap longer than
+ * the 16-bit delta field, so it splits it into a chain of these. They advance
+ * the deadline and write nothing. */
+#define SID_EV_WAIT_ONLY 0xFF
 
 static inline bool sid_q_push(uint16_t dt, uint8_t addr, uint8_t data) {
     uint32_t next = (s_sid_q_head + 1) & (SID_Q_SIZE - 1);
@@ -389,6 +391,14 @@ static inline bool sid_q_pop(sid_ev_t *out) {
 
 static inline uint32_t sid_q_used(void) {
     return (s_sid_q_head - s_sid_q_tail) & (SID_Q_SIZE - 1);
+}
+
+/* Drop everything queued. A track change must not replay the previous tune's
+ * backlog, and a reset must not leave the deadline pointing at stale time. */
+static void sid_q_clear(void) {
+    s_sid_q_tail = s_sid_q_head;
+    s_sid_need_anchor = true;
+    s_sid_deadline = time_us_64();
 }
 
 // ========== IC# Reset ==========
@@ -470,6 +480,9 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
     }
     case CMD_RESET: {
         if (len >= 1) {
+            /* Clear the event queue first: the host is changing tunes, and a
+             * backlog from the old one must not replay into the new one. */
+            sid_q_clear();
             bus_ic_reset();
         }
         break;
@@ -546,12 +559,8 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
     }
     case CMD_PHI2: {
 #if USE_PIO_PHI2
-        if (len >= 1) {
-            pio_sm_set_enabled(s_phi_pio, s_phi_sm, false);
-            phi2_program_init(s_phi_pio, s_phi_sm,
-                              pio_add_program(s_phi_pio, &phi2_gen_program),
-                              PIN_PHI2, payload[0] ? PHI2_HZ_NTSC : PHI2_HZ_PAL);
-        }
+        if (len >= 1)
+            phi2_set(payload[0] ? PHI2_HZ_NTSC : PHI2_HZ_PAL);
 #endif
         break;
     }
@@ -647,15 +656,26 @@ int main() {
         if (s_sid_host_mode) {
             sid_ev_t ev;
             while (sid_q_pop(&ev)) {
+                /* The first event after a reset anchors the clock: the host's
+                 * deltas are relative to its start stamp, which is whenever it
+                 * began pushing. Anchoring once per stream - not per drained
+                 * batch - is what keeps the board's clock monotonic; the old
+                 * code reset the anchor whenever the queue happened to run dry,
+                 * so any underrun shortened the tune by the wait that followed. */
+                if (s_sid_need_anchor) {
+                    s_sid_deadline = time_us_64();
+                    s_sid_need_anchor = false;
+                }
+
                 if (ev.dt_us) {
                     s_sid_deadline += ev.dt_us;
                     while (time_us_64() < s_sid_deadline) {
                         tud_task();
                     }
                 }
-                write_reg_sid(ev.addr, ev.data);
+                if (ev.addr != SID_EV_WAIT_ONLY)
+                    write_reg_sid(ev.addr, ev.data);
             }
-            s_sid_deadline = time_us_64();
         }
 
         // Execute deferred register writes
