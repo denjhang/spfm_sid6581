@@ -58,7 +58,7 @@
 #endif
 
 #define PLAYER_NAME    "SPFM SIDVGM Player"
-#define PLAYER_VERSION "1.0"
+#define PLAYER_VERSION "1.3"
 
 /* ------------------------------------------------------------------ */
 /* options                                                             */
