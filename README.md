@@ -22,6 +22,7 @@ SID 6581 / 8580 挂到 SPFM 并行总线的驱动 + 控制台冒烟测试。
 | [docs/sidvgm录制与离线播放.md](docs/sidvgm录制与离线播放.md) | **录制 + 离线播放**：默认 libsidplayfp + reSIDfp（与标杆逐字节一致）；`--engine` / `--model` 可切回 websid / native |
 | [docs/libsidplayfp构建.md](docs/libsidplayfp构建.md) | **音质标杆**：原版 libsidplayfp 3.1.2 + reSIDfp 1.3.0 的构建方法，以及为什么 WebSid 不能当标准 |
 | [docs/SPFM链路预算与降速分析.md](docs/SPFM链路预算与降速分析.md) | **要不要降速**：链路 37500 条/s（37.5 kB/s 数据），116 首实测最重只用 17.9%、最忙一帧 38% —— **不需要降速** |
+| [docs/SPFM时序精度上限.md](docs/SPFM时序精度上限.md) | **开发到此为止的依据**：协议只给主机"写入数据流"、没有引脚控制和 PHI2 概念，普通 PSID 的帧内抖动在 SPFM 上无解；digi 靠 `--pad` 已够用；继续前进只能换控制器 |
 | [docs/RSID判定与体积对比.md](docs/RSID判定与体积对比.md) | **123 首实测**：RSID 的真正标志是 `play=0000`（不是头 magic），以及新引擎相对旧引擎的体积膨胀（常规 1.45×，digi 曲 6–22×） |
 | [third_party/upstream/README.md](third_party/upstream/README.md) | 上游 WebSid / libsidplayfp / libresidfp 原样源码 + 压缩包（换版本时从这里重取） |
 
@@ -52,6 +53,14 @@ SID 6581 / 8580 挂到 SPFM 并行总线的驱动 + 控制台冒烟测试。
 4. `PHI2` 由 1 MHz 晶振独立供给（pin8）。
 
 **三颗 IC：74LS374 + 74HCT02 + 74HCT32。** 不需要 74HC74，不需要移位寄存器，不需要单稳态。
+
+> **时序精度已到协议上限，开发到此为止。** SPFM 是给雅马哈 YM 系列设计的写入
+> 数据流协议：主机只能发"哪个槽哪个寄存器写什么值"和 NOP，`/WR`、`/CS`、`A0`
+> 全由固件自己产生，没有引脚控制，也没有 PHI2 概念。所以 digi 的 `$D418`
+> 可以用 `--pad` 把间隔钉在 6.667 µs 的字节刻度上（误差约 5%，听觉成立），
+> 但**普通 PSID 的帧内时序抖动（微秒级、且要求相序）在 SPFM 上无解**——
+> 不是参数不够，是刻度比信号还粗。详见
+> [docs/SPFM时序精度上限.md](docs/SPFM时序精度上限.md)。
 
 > 早期版本用过 74HC74 整形，还把 `TRIG_n` 同时接到 `/CS` 和 `R/W`。2026-11-20 实测
 > 拆掉 74HC74、把 `/WR` 单独接 `R/W` 后**无任何副作用**，同时写入更稳定。
