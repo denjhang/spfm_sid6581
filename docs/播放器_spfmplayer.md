@@ -101,6 +101,17 @@ cd E:\working\zcode-projects\spfm_sid6581
 
 按键读取是独立的阻塞线程，所以帧中间按也立刻生效，不用等下一个音符。
 
+**单曲也能换子曲**：`--subsong N` 只是起点，播起来之后 `,` / `.` 照样在同一个
+文件里前后走。走到第一个 / 最后一个会打印 `first subsong` / `last subsong` 并
+停在原地，不会越界退出。
+
+```powershell
+:: 从子曲 10 开始，然后按 '.' / ',' 在 11 个子曲之间走
+.\build\spfmplayer.exe sid\games\Greenrunner.sid --subsong 10
+```
+
+`.sidvgm` / `.sidreg` 是录好的单条流，没有子曲概念，`n` / `b` 之外的键不起作用。
+
 ## 4. 常用参数
 
 | 参数 | 默认 | 说明 |
