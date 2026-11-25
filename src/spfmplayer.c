@@ -1039,6 +1039,9 @@ static void usage(void)
     printf("                  0 = off, 8000 near-lossless, 4000/2000 grittier\n");
     printf("  --help          this text\n\n");
     printf("while playing: [n] next  [b] back  [,] [.] subsong  [q] quit\n");
+    printf("  ',' and '.' work in a single file too, so --subsong N is only a\n");
+    printf("  starting point; '.' on the last subsong and ',' on the first say so\n");
+    printf("  and stay put.\n");
 }
 
 /* Walk the whole argv so options can sit before or after the file name. The
@@ -1225,8 +1228,64 @@ int main(int argc, char **argv)
            spfm_timer_name(),
            opt.flush_register ? "register" : "command");
 
-    int key = 0;
-    int rc = play_file(path, &key);
+    /* One file is still a playlist of one: ',' and '.' must walk its subsongs
+     * instead of doing nothing. Without this loop the single-file path returned
+     * from play_file() and exited, so a listener who opened subsong 10 of an
+     * 11-subsong tune had no way to reach the others. */
+    int rc = 0;
+    if (!has_suffix(path, ".sidvgm") && !has_suffix(path, ".sidreg")) {
+        sid_song_info_t probe;
+        int nsongs = 1, cur = opt.subsong;
+        if (sid_song_probe(path, &probe) == 0) {
+            nsongs = probe.n_songs ? probe.n_songs : 1;
+            if (cur < 0) cur = probe.start_song ? probe.start_song - 1 : 0;
+        } else if (cur < 0) {
+            cur = 0;
+        }
+        if (cur >= nsongs) cur = nsongs - 1;
+
+        for (;;) {
+            s_action = 0;
+            s_interrupt = 0;
+
+            sid_clear_all_regs(opt.slot);
+            sid_flush();
+
+            opt.subsong = cur;
+            int key = 0;
+            rc = play_file(path, &key);
+            hw_mute();
+            if (rc == 2) break;          /* unloadable: nothing to advance to */
+
+            int action = s_interrupt ? s_interrupt : kb_take();
+            if (action == 'q') break;
+
+            /* Printed 0-based, matching play_file's own "subsong N/M" line, so
+             * the same tune cannot appear as two different numbers. */
+            if (action == '.') {
+                if (cur + 1 < nsongs) {
+                    cur++;
+                    printf("\n[SUBSONG %d/%d]\n\n", cur, nsongs);
+                } else {
+                    printf("\n[SUBSONG %d/%d]  last subsong\n\n", cur, nsongs);
+                }
+                continue;
+            }
+            if (action == ',') {
+                if (cur > 0) {
+                    cur--;
+                    printf("\n[SUBSONG %d/%d]\n\n", cur, nsongs);
+                } else {
+                    printf("\n[SUBSONG 0/%d]  first subsong\n\n", nsongs);
+                }
+                continue;
+            }
+            break;                        /* 'n', or the tune simply ended */
+        }
+    } else {
+        int key = 0;
+        rc = play_file(path, &key);
+    }
 
     spfm_thread_boost_end();
     hw_mute();
