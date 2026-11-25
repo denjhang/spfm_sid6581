@@ -45,6 +45,9 @@ SID 那侧的逻辑和 SPFM 时代**一个字没改**（`LE = NOR(A0,/WR)`、`TR
 `tools/sid_stream.exe` 把 `.sidreg`（本仓库 `sidextract.exe` 的输出格式）
 转成事件流推给板子，已跑通 R-Type 8079 事件 / 10 秒。
 
+> **踩过的坑单独整理成 [踩坑记录_RP2350移植.md](踩坑记录_RP2350移植.md)**，
+> 那里有完整代码、症状和为什么会死机。下面只留摘要。
+
 ## 三个必须记住的坑
 
 **1. 同一组引脚只能有一个 PIO 状态机。**
@@ -62,6 +65,13 @@ OSR，下一轮 `pull block` 又把它覆盖——**每两个推送的字丢一�
 **3. `nop side 1` / `nop side 0` 那套 sideset 写法在本板上不出时钟。**
 改用 USBSID-Pico 的 `set pins, 1` / `set pins, 0`，引脚状态由 SM 自己的
 输出寄存器锁存，不依赖 sideset 编码。生成的机器码就是 `0xe001 / 0xe000`。
+配套自检：先用纯 GPIO 让 GPIO14 以 2 Hz 闪 6 秒（PIO 最低只能到约 1144 Hz，
+做不到 2 Hz），确认脚本身能驱动，再交给 PIO。
+
+**另外两个死机级错误**（详见踩坑记录 §1）：
+- `pio_sm_put_blocking` 打向还没使能的 SM 会**永久阻塞**，卡死在 `main()` 里，
+  USB 从未枚举 → BOOTSEL 发不进去。所有 WS2812 输出前要加 `s_ws_ready` 闸门。
+- 播放循环里不调 `tud_task()`，USB 协议栈停摆，HID 从主机视角消失。
 
 ## 时序参数
 

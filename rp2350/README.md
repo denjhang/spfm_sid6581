@@ -94,13 +94,20 @@ Copy-Item .\build\rpfm_sid_player.uf2 G:\
 
 `src/phi2.pio` 是新增的，抄自 USBSID-Pico 的 `src/pio/clock.pio`（用 `set pins` 而不是 sideset）。
 
-## 两个必须记住的坑
+## 踩过的坑
+
+**完整清单见 [../docs/踩坑记录_RP2350移植.md](../docs/踩坑记录_RP2350移植.md)**，含代码、症状和成因。
+
+摘要：
 
 1. **同一组引脚只能有一个 PIO 状态机。** RPFM 原文会在总线 SM 之外再启动一个 AY8910 SM，
    同一个程序抢同一组 GPIO0–10，A0 被盖成 0，整个芯片像死了一样。已删除。
-2. **`out pins, N` 配 autopull 时阈值必须等于 N。** 否则 autopull 会在每次 out 之后
-   多取一个字进 OSR，和显式的 `pull block` 打架，每两个推送的字丢一个。
-   现在 `autopull=false`，只靠 `pull block`。
+2. **`out pins, N` 配 autopull 时阈值必须等于 N。** 否则和显式的 `pull block` 打架，
+   每两个推送的字丢一个。现在 `autopull=false`。
+3. **`pio_sm_put_blocking` 打向未使能的 SM 会永久阻塞**，卡死在 `main()`，
+   USB 从不枚举 → BOOTSEL 发不进去。WS2812 输出前有 `s_ws_ready` 闸门。
+4. **播放循环里必须调 `tud_task()`**，否则 USB 协议栈停摆。
+5. **PHI2 用 `set pins` 不用 sideset。** 抄 USBSID-Pico 的 `clock.pio`。
 
 ## 时序参数
 
