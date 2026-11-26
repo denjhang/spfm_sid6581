@@ -1,6 +1,6 @@
-; spfm_bus.pio - SPFM 13-bit parallel bus driver (YM2413/AY8910/SN76489)
+; spfm_bus.pio - SPFM 11-bit parallel bus driver (SID 6581)
 ;
-; GPIO mapping (13 consecutive pins starting at base_pin=0):
+; GPIO mapping (11 consecutive pins starting at base_pin=0):
 ;   GPIO0-7:  D0-D7  (data bus)
 ;   GPIO8:    WR#    (write strobe, active low)
 ;   GPIO9:    RD#    (read strobe, active low)
@@ -9,9 +9,6 @@
 ; GPIO11 is the 74LVC245 direction pin and GPIO12 is CS0#, both CPU controlled,
 ; so the PIO word is 11 bits wide and stops at A0.
 ;
-; CS0-CS1: GPIO12-13 (CPU controlled by pio_cs)
-; IC#: GPIO21 (CPU controlled, power-on reset only)
-;
 ; 32-bit word format (11-bit bus):
 ;   bits [7:0]   = D0-D7
 ;   bit  [8]     = WR# (1=idle, 0=pulse)
@@ -19,23 +16,67 @@
 ;   bit  [10]    = A0
 ;
 ; Idle state: D=0xFF, WR#=1, RD#=1, A0=0 = 0x03FF
+;
+; ---- why every word is paced by PHI2 ----
+;
+; Taken from USBSID-Pico (src/pio/bus_control.pio, src/pio/data_bus.pio). Their
+; bus machines never sleep for a fixed number of microseconds; each bus word is
+; released against the SID clock, so a word costs a whole number of clock
+; periods and the bus is phase-locked to the chip by construction. The old
+; busy_wait_us_32(20) per word was 20x coarser than the chip's own clock and
+; could not be made uniform.
+;
+; USBSID also has to guarantee at least one edge per word, and it does that by
+; ordering the waits: wait for the clock to be LOW, drive the pins there, then
+; wait for HIGH. The first version here did it the other way round -
+;
+;     wait 1 pin 0        <-- WRONG
+;     wait 0 pin 0
+;     out pins, 11
+;
+; - and that is broken, because `wait` does not wait for an edge, it proceeds
+; when the level is as asked. Arriving at `wait 1` while PHI2 is already high
+; falls straight through, and `wait 0` then falls through the moment PHI2 drops,
+; so two words could land tens of nanoseconds apart with a /CS pulse to match.
+;
+; That was the digi regression: a drum is 591227 $D418 writes at a 181 us median
+; spacing and the sound IS those spacings, so the sub-microsecond /CS windows
+; that fell out of it turned the drum into noise, while an ordinary PSID (whose
+; average spacing only got tighter) sounded better.
+;
+; The order below is USBSID's. After `wait 0` the line is known low, so the
+; following `wait 1` really blocks on a rising edge, and every word costs at
+; least one full PHI2 period.
+;
+; The /CS assertion *window* is set one level up, in sid_pio_write_reg(): the
+; data-phase word is pushed N times in a row, and since the bus only changes on
+; a clock period boundary, N identical words hold /CS low for exactly N periods.
+; That keeps the window clock-derived while still being long enough to latch -
+; the same job USBSID's delay_timer does with its cycle count.
 
 .program spfm_bus_write
 
-    pull block                  ; get 32-bit word
-    out pins, 11                ; bits[10:0] -> D0-D7, WR#, RD#, A0
+.wrap_target
+    pull block                  ; block until a word is available
+    wait 0 pin 0                ; known low: block if PHI2 is still high
+    out pins, 11                ; change the bus while the clock is low
+    wait 1 pin 0                ; guaranteed wait for the rising edge
+.wrap
 
 % c-sdk {
-static inline void spfm_bus_write_program_init(PIO pio, uint sm, uint offset, uint base_pin) {
+static inline void spfm_bus_write_program_init(PIO pio, uint sm, uint offset,
+                                               uint base_pin, uint phi2_pin) {
     pio_sm_config c = pio_get_default_sm_config();
 
     sm_config_set_out_pins(&c, base_pin, 11);
+    sm_config_set_in_pins(&c, phi2_pin);   /* `wait ... pin 0` reads the PHI2 pin */
     sm_config_set_out_shift(&c, true, false, 32);  /* autopull OFF: the program does an explicit `pull block`; leaving autopull on made the SM swallow the next FIFO word right after `out pins`, so every other word was dropped */
-    sm_config_set_wrap(&c, offset, offset + 1);
+    sm_config_set_wrap(&c, offset, offset + 3);
 
     for (int i = 0; i < 11; i++) {
         pio_gpio_init(pio, base_pin + i);
     }
+    pio_gpio_init(pio, phi2_pin);
     pio_sm_set_consecutive_pindirs(pio, sm, base_pin, 11, true);
     pio_sm_set_pins_with_mask(pio, sm,
         ((1u << 8) | (1u << 9) | 0xFF) << base_pin,
@@ -46,7 +87,7 @@ static inline void spfm_bus_write_program_init(PIO pio, uint sm, uint offset, ui
 }
 
 // 11-bit word: [10:A0][9:RD#][8:WR#][7:0:D0-D7]
-// Idle: 0x03FF (D=0xFF, WR#=1, RD#=1, A0-A2=0)
+// Idle: 0x03FF (D=0xFF, WR#=1, RD#=1, A0=0)
 #define BUS_IDLE 0x03FFu
 
 static inline uint32_t pack_bus(uint8_t data, uint8_t addr, bool wr_n, bool rd_n) {
@@ -56,40 +97,64 @@ static inline uint32_t pack_bus(uint8_t data, uint8_t addr, bool wr_n, bool rd_n
          | (uint32_t)data;
 }
 
+/* Now that the state machine paces itself off PHI2, putting a word is just
+ * "hand it to the FIFO". The old version also spun until the FIFO was empty,
+ * which serialised every step on the bus and is what made the cost 140 us. */
 static inline void pio_bus_put(PIO pio, uint sm, uint32_t val) {
     pio_sm_put_blocking(pio, sm, val);
-    while (!pio_sm_is_tx_fifo_empty(pio, sm)) {}
+}
+
+/* One SID register write: address phase on A0=0 (the 374 latches on LE), then
+ * data phase on A0=1 (/CS and R/W both low, so the chip stores it).
+ *
+ * The data phase is pushed `hold` times. The PIO only changes the bus on a PHI2
+ * edge, so N identical words hold /CS low for exactly N clock periods - the
+ * write window is then clock-derived rather than a host guess, and it is as long
+ * as the chip needs.
+ *
+ * Why this matters, measured: a digi drum is 591227 $D418 writes at a median
+ * spacing of 8 sidvgm ticks = 181 us, and the sound IS those spacings. With a
+ * one-period window the chip misses or half-takes writes inside a dense passage
+ * and the drum degenerates into noise. Twelve periods is 12.2 us at PAL, which
+ * is the same order as the 20 us the old busy_wait version spent - and that
+ * version's drums were perfect.
+ *
+ * Total cost: 3 address words + `hold` + 2 data words + idle. At hold=12 that is
+ * 17 words = ~17 us per register write, against 140 us before. */
+static inline void sid_pio_write_reg(PIO pio, uint sm, uint8_t addr, uint8_t data,
+                                     uint hold) {
+    uint8_t a = (uint8_t)(addr & 0x1F);
+
+    pio_bus_put(pio, sm, pack_bus(a, 0, true, true));    /* address setup      */
+    pio_bus_put(pio, sm, pack_bus(a, 0, false, true));   /* LE rises           */
+    pio_bus_put(pio, sm, pack_bus(a, 0, true, true));    /* LE falls, latched  */
+
+    pio_bus_put(pio, sm, pack_bus(data, 1, true, true)); /* data setup         */
+    for (uint32_t i = 0; i < hold; i++)
+        pio_bus_put(pio, sm, pack_bus(data, 1, false, true)); /* /CS + R/W low */
+    pio_bus_put(pio, sm, pack_bus(data, 1, true, true)); /* release            */
+    pio_bus_put(pio, sm, BUS_IDLE);
 }
 
 // YM2413 OPLL: 20µs per step (ref: MegaGRRL Driver_FmOutopll)
 static inline void ym2413_pio_write_reg(PIO pio, uint sm,
                                          uint8_t reg, uint8_t data) {
     pio_bus_put(pio, sm, pack_bus(reg, 0, true, true));
-    busy_wait_us_32(20);
     pio_bus_put(pio, sm, pack_bus(reg, 0, false, true));
-    busy_wait_us_32(20);
     pio_bus_put(pio, sm, pack_bus(reg, 0, true, true));
-    busy_wait_us_32(20);
-
     pio_bus_put(pio, sm, pack_bus(data, 1, true, true));
-    busy_wait_us_32(20);
     pio_bus_put(pio, sm, pack_bus(data, 1, false, true));
-    busy_wait_us_32(20);
     pio_bus_put(pio, sm, pack_bus(data, 1, true, true));
-    busy_wait_us_32(20);
-
     pio_bus_put(pio, sm, BUS_IDLE);
 }
 
-// AY8910: blocking write with software delay, runs on Core 1
-// Core 1 is dedicated to VGM playback, blocking is fine
-// Timing controlled by busy_wait_us_32 or NOP spin loop
+// AY8910: same six-word shape; the AY has no PHI2 to gate on here
 extern volatile uint8_t s_ay_delay_100ns;  // units of 100ns
 
 static inline void ay_delay_100ns(uint8_t d) {
     if (d == 0) return;
-    // 125MHz = 8ns/cycle. 100ns ≈ 12 cycles.
-    uint32_t cycles = (uint32_t)d * 12;
+    // 150MHz = 6.67ns/cycle. 100ns ~ 15 cycles.
+    uint32_t cycles = (uint32_t)d * 15;
     while (cycles >= 4) { __nop(); __nop(); __nop(); __nop(); cycles -= 4; }
     while (cycles--) { __nop(); }
 }
@@ -106,25 +171,5 @@ static inline void ay8910_pio_write_reg(PIO pio, uint sm,
     ay_delay_100ns(d);
     pio_bus_put(pio, sm, pack_bus(data, 1, true, true));
     pio_bus_put(pio, sm, BUS_IDLE);
-}
-
-// Init AY8910 dedicated SM — full speed, timing via software delay on Core 1
-static inline void ay8910_sm_init(PIO pio, uint sm, uint offset, uint base_pin) {
-    pio_sm_config c = pio_get_default_sm_config();
-
-    sm_config_set_out_pins(&c, base_pin, 11);
-    sm_config_set_out_shift(&c, true, false, 32);  /* autopull OFF: the program does an explicit `pull block`; leaving autopull on made the SM swallow the next FIFO word right after `out pins`, so every other word was dropped */
-    sm_config_set_wrap(&c, offset, offset + 1);
-
-    for (int i = 0; i < 11; i++) {
-        pio_gpio_init(pio, base_pin + i);
-    }
-    pio_sm_set_consecutive_pindirs(pio, sm, base_pin, 11, true);
-    pio_sm_set_pins_with_mask(pio, sm,
-        ((1u << 8) | (1u << 9) | 0xFF) << base_pin,
-        ((1u << 11) - 1) << base_pin);
-
-    pio_sm_init(pio, sm, offset, &c);
-    pio_sm_set_enabled(pio, sm, true);
 }
 %}

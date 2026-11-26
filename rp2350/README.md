@@ -161,7 +161,8 @@ Core 0，互不影响。
 | `0x30` | `CMD_SID_EVENTS` `[dt_lo,dt_hi,addr,data] × N` 带时间戳；`addr=0xFF` = 只等待不写 |
 | `0x32` | `CMD_SID_WRITE` `[addr,data] × N` 立即写 |
 | `0x31` | `CMD_PHI2` `[0=PAL/1=NTSC]` |
-| `0x33` | `CMD_SID_STEP` `[1..20]` 总线每步 µs |
+| `0x33` | `CMD_SID_STEP` `[1..32]` 数据相保持几个 PHI2 周期（默认 12） |
+| `0x34` | `CMD_SID_START` 释放播放闸门（预填完成后发） |
 | `0x03` | `CMD_RESET` 清事件队列 + 复位 IC# |
 | `0x20` | `CMD_BOOTSEL` |
 
@@ -206,6 +207,15 @@ Core 0，互不影响。
    必然饿死 `tud_task()`。分核之后才实时——这是最后才找对的一条。
 7. **队列满了是静默丢事件。** `sid_q_push()` 返回 false 但没人看，听起来就是
    "拖慢 + 掉音"。水位线必须当反压用。
+8. **`wait` 不是"等边沿"。** 写成 `wait 1 pin` → `wait 0 pin` 时，若 SM 到达
+   时 PHI2 已经高，第一句直接穿过，第二句也几乎立刻穿，两个字之间只剩几十纳秒。
+   必须 `wait 0` → `out` → `wait 1`（USBSID 的顺序），才能保证每字至少一个周期。
+   这一条把 digi 鼓从噪音救回来了。
+9. **`/CS` 窗口不能跟着节拍一起缩。** 节拍变快是对的（1 周期/字），但数据相
+   必须保持 N 个周期（默认 12），否则密集的 `$D418` 写会有一批锁存失败。
+   两件事必须分开调。
+10. **没有预填就开始播 = 开头赶拍子。** RPFM 的 Phase 1 先填 1/4 buffer 再发
+    START，Phase 2 才边推边播。不做这一步，头几百个事件按 USB 到达速度执行。
 
 ## 双核与流控
 
@@ -223,18 +233,50 @@ Turbo Outrun 是 733634 写 / 162.6 s ≈ **4500 写/秒**，也就是单核 63%
 来源。Core 1 本来空闲，把播放循环搬过去之后 Core 0 只剩 USB，和 RPFM
 保 FM 播放流畅的做法完全一样。
 
-**水位线是反压，不只是标志位。** 板子在 `get_report_cb` 里已经报了队列
-填充度，主机现在每 20 帧读一次（`HidD_GetInputReport`），超过 6000 条就
-等到降到 2000 条再继续推。没有这一层的话队列满了 `sid_q_push()` 会直接
-返回 false，事件**静默丢失**——听起来就是"拖慢 + 掉音"。
+**水位线是反压，不只是标志位。** 阈值 `Q_HIGH 4096` / `Q_LOW 2048`，
+就是 RPFM 的"buffer > 50% 就等，排空到 25% 再继续"。没有这一层的话队列满了
+`sid_q_push()` 会直接返回 false，事件**静默丢失**——听起来就是"拖慢 + 掉音"。
+
+**预填 + START 闸门，照 RPFM 的 Phase 1 / Phase 2**
+（`RPFM_Player/src/ay8910_window.cpp`）：
+
+```
+Phase 1: 推满 bufTargetBytes/4，此时设备还不消费
+         然后发 CMD_VGM_START
+Phase 2: 继续推，buffer > 50% 就等
+```
+
+这里对应的是 `CMD_SID_START (0x34)`：固件有 `s_sid_running` 闸门，
+没收到 START 前 Core 1 一个事件都不消费；主机先灌 `PRE_FILL = 1500` 条
+（8192 的不到 1/5），再发 START，音乐时钟也在这时锚定。
+**没有这个预填，第一个 audio 块就是"按 USB 到达速度执行"**——听感就是开头
+一两秒赶拍子。这是 RPFM 早就解决的问题。
 
 单写者约定照 RPFM 的 `ring_buf.h`：head 只在 Core 0 写，tail 只在 Core 1 写，
 所以不需要锁。`CMD_RESET` 也因此只置一个请求位，由 Core 1 自己清队列。
 
 ## 时序参数
 
-`write_reg_sid()` 一次写 7 个 PIO 字（6 步 + 1 个 idle）。每步时间可用
-`--step N`（`CMD_SID_STEP 0x33`）在 1–20 µs 之间调，默认 20 µs（140 µs/写）。
+**总线是 PHI2 时钟驱动的，没有主机延时。** 抄 USBSID-Pico 的
+`src/pio/bus_control.pio`。
 
-20 µs 是从 `ym2413_pio_write_reg()` 抄的保守值，不是 SID 实测值。锁存边沿
-只需要几 µs，所以这个值大概率可以往下压——压下去写密度上限就直接提高。
+```asm
+.wrap_target
+    pull block
+    wait 0 pin 0     ; 先确认在时钟低位（若为高就阻塞）
+    out pins, 11     ; 在低电平期间换总线
+    wait 1 pin 0     ; 真的等上升沿
+.wrap
+```
+
+`wait` 不是"等边沿"，是"电平符合就通过"。写成 `wait 1` → `wait 0` 会让两个字
+之间只剩几十纳秒，`/CS` 窗口不够锁存——这就是 digi 鼓退化成噪音的根因。
+先等低、再等高，才能保证每个字至少占一个完整 PHI2 周期。
+
+**`/CS` 窗口 = `SID_HOLD` 个 PHI2 周期**，默认 **12**（PAL 12.2 µs）。
+做法是把数据相那个字连推 N 次，PIO 每周期才换一次总线，所以低电平时长正好
+是 N 个时钟周期——等价于 USBSID 的 `delay_timer.pio` 周期计数器。
+`CMD_SID_STEP (0x33)` 可改，范围 1..32。
+
+一次寄存器写 = 3 个地址字 + 12 个数据字 + 2 + 1 个 idle ≈ **18 µs**，
+原来 `busy_wait_us_32(20)` 的版本是 140 µs。digi 鼓（4500 写/秒）已上机确认正常。

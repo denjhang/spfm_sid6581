@@ -90,7 +90,7 @@ static inline bool deferred_pop(uint8_t *slot, uint8_t *addr, uint8_t *data, uin
 static void pio_bus_init(void) {
     uint offset = pio_add_program(s_bus_pio, &spfm_bus_write_program);
     s_bus_sm = pio_claim_unused_sm(s_bus_pio, true);
-    spfm_bus_write_program_init(s_bus_pio, s_bus_sm, offset, PIN_BUS_BASE);
+    spfm_bus_write_program_init(s_bus_pio, s_bus_sm, offset, PIN_BUS_BASE, PIN_PHI2);
 
     // The AY8910 state machine is deliberately NOT started: it runs the same
     // program on the same 11 pins, so a second enabled SM would fight this one
@@ -164,7 +164,11 @@ static inline void cs_select(uint8_t slot) {
 
 #define WS_TICK_MS      20      /* meter refresh = frame gap */
 #define LED_MAX         0x10    /* hard per-channel ceiling, all four lit at once */
-#define LED_FULL_HITS   6       /* writes per tick that mean "full brightness" */
+/* Writes per 20 ms tick that mean "full brightness". The bus is PHI2-clocked
+ * now, so a tick can carry hundreds of writes where it used to carry a handful;
+ * 24 = 1200 writes/s for one voice is a hard-driven channel, and the densest
+ * tune (4500/s across all four) pins the busiest LED at full. */
+#define LED_FULL_HITS   24
 
 /* SID register bits the LED layer needs. The firmware does not link
  * src/sid6581.c (that is the SPFM host driver), so the handful of constants it
@@ -332,53 +336,49 @@ static inline void write_reg_ay(uint8_t slot, uint8_t addr, uint8_t data) {
     ay8910_pio_write_reg(s_bus_pio, s_ay_sm, addr, data);
 }
 
-/* SID 6581 register write, modelled exactly on ym2413_pio_write_reg() which is
- * verified on hardware: six PIO words, a 20 us gap after each, idle word last.
+/* How many PHI2 periods the data phase is held low. This is the /CS (and R/W)
+ * assertion window, and the SID needs it long enough to actually latch.
+ *
+ * 12 periods = 12.2 us at PAL. The number to beat is the old 20 us busy_wait,
+ * whose digi drums were perfect; 12 is the same order and is expressed in chip
+ * clock cycles instead of a host constant, so it scales with PAL/NTSC and lands
+ * on a whole number of clock periods.
+ *
+ * The reason this knob exists at all: with a one-period window (the first
+ * USBSID-style version) ordinary PSID improved but digi drums degenerated into
+ * noise. A drum is 591227 $D418 writes at a median 181 us spacing and the sound
+ * is those spacings; every write has to land, so the window cannot be shortened
+ * just because the spacing got better. */
+#define SID_HOLD_CYCLES_DEFAULT 12
+#define SID_HOLD_CYCLES_MAX     32
+
+static volatile uint32_t s_sid_hold = SID_HOLD_CYCLES_DEFAULT;
+
+/* SID 6581 register write.
  *
  *   word 1  A0=0 D=addr WR#=1   address setup
  *   word 2  A0=0 D=addr WR#=0   LE = NOR(A0,/WR) rises -> 374 latches addr
  *   word 3  A0=0 D=addr WR#=1
  *   word 4  A0=1 D=data WR#=1   data setup
- *   word 5  A0=1 D=data WR#=0   TRIG_n low AND R/W low -> SID latches
- *   word 6  A0=1 D=data WR#=1
- *   idle    bus released
+ *   word 5..N  A0=1 D=data WR#=0  TRIG_n low AND R/W low -> SID latches,
+ *                                 held for s_sid_hold PHI2 periods
+ *   word     A0=1 D=data WR#=1   release
+ *   idle     bus released
  *
  * CS0# is held low for the whole session, so TRIG_n = !A0 | /WR | 0 needs both
- * A0 and /WR low, i.e. only the data-phase pulse writes the chip. */
-#define SID_STEP_US_DEFAULT 20
-
-/* Adjustable at run time (CMD_SID_STEP) because 20 us was copied from the
- * YM2413 path as a safe value, not measured for the SID. Six steps plus the idle
- * word means one register write costs 140 us here, which is what limits the
- * densest tunes; the latching edges only need a few us. Lower it and listen. */
-static volatile uint32_t s_sid_step_us = SID_STEP_US_DEFAULT;
-#define SID_STEP_US (s_sid_step_us)
-
+ * A0 and /WR low, i.e. only the data-phase pulse writes the chip.
+ *
+ * No host sleep anywhere: the state machine waits for a PHI2 edge before
+ * releasing each word (spfm_bus.pio), so every interval is a whole number of
+ * chip clock periods. */
 static inline void write_reg_sid(uint8_t addr, uint8_t data) {
     uint8_t a = (uint8_t)(addr & 0x1F);
 
     cs_select(0);
+    sid_pio_write_reg(s_bus_pio, s_bus_sm, a, data, s_sid_hold);
 
-    pio_bus_put(s_bus_pio, s_bus_sm, pack_bus(a, 0, true, true));
-    busy_wait_us_32(SID_STEP_US);
-    pio_bus_put(s_bus_pio, s_bus_sm, pack_bus(a, 0, false, true));
-    busy_wait_us_32(SID_STEP_US);
-    pio_bus_put(s_bus_pio, s_bus_sm, pack_bus(a, 0, true, true));
-    busy_wait_us_32(SID_STEP_US);
-
-    pio_bus_put(s_bus_pio, s_bus_sm, pack_bus(data, 1, true, true));
-    busy_wait_us_32(SID_STEP_US);
-    pio_bus_put(s_bus_pio, s_bus_sm, pack_bus(data, 1, false, true));
-    busy_wait_us_32(SID_STEP_US);
-    pio_bus_put(s_bus_pio, s_bus_sm, pack_bus(data, 1, true, true));
-    busy_wait_us_32(SID_STEP_US);
-
-    pio_bus_put(s_bus_pio, s_bus_sm, BUS_IDLE);
-    busy_wait_us_32(SID_STEP_US);
-
-    /* Only record, never drive the LEDs here: this runs up to ~800 times a
-     * second and each frame costs ~120 us of PIO time. led_update() composes
-     * the picture on its own tick. */
+    /* Counts only: this runs thousands of times a second and a WS2812 frame
+     * costs ~120 us of PIO time. led_update() composes the picture. */
     if (s_ws_ready) ws_sid_activity(a, data);
 }
 
@@ -422,7 +422,6 @@ typedef struct {
 static sid_ev_t s_sid_q[SID_Q_SIZE];
 static volatile uint32_t s_sid_q_head = 0;   // written by Core 0
 static volatile uint32_t s_sid_q_tail = 0;   // written by Core 1
-static volatile bool s_sid_host_mode = false;
 static uint64_t s_sid_deadline  = 0;
 static bool     s_sid_need_anchor = true;    // next event becomes the clock origin
 
@@ -452,9 +451,20 @@ static inline uint32_t sid_q_used(void) {
     return (s_sid_q_head - s_sid_q_tail) & (SID_Q_SIZE - 1);
 }
 
-/* Drop everything queued. Core 0 does not touch tail or the deadline: it only
- * raises a request, and Core 1 clears the queue at the top of its own loop.
- * That keeps head/tail single-writer as RPFM's ring_buf/cmd_buf are. */
+/* Playback gate. RPFM's host fills a quarter of the firmware buffer before it
+ * sends CMD_VGM_START, and only then does Core 1 begin consuming; the buffer is
+ * refilled before it can run dry. That prefill is why the original has no
+ * start-of-tune instability at all.
+ *
+ * Here the same idea, sized in events: the host pushes PREFILL events before
+ * CMD_SID_START, so when consumption begins there is already a full queue to
+ * play out and the host has a wide margin to keep refilling. Without it the
+ * board starts on an almost empty queue, plays the first burst at whatever rate
+ * events happen to arrive, and only settles once the queue is deep enough -
+ * heard as the first second or two running fast. */
+static volatile bool s_sid_running = false;
+
+/* Reset request, raised by the HID callback on Core 0 and serviced by Core 1. */
 static volatile bool s_sid_reset_req = false;
 
 static void sid_q_request_clear(void) {
@@ -608,7 +618,6 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
         // [addr,data] x N, written immediately, in order
         for (uint8_t i = 0; i + 1 < len; i += 2)
             sid_q_push(0, payload[i], payload[i + 1]);
-        s_sid_host_mode = true;
         break;
     }
     case CMD_SID_EVENTS: {
@@ -617,15 +626,24 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
             uint16_t dt = (uint16_t)(payload[i] | ((uint16_t)payload[i + 1] << 8));
             sid_q_push(dt, payload[i + 2], payload[i + 3]);
         }
-        s_sid_host_mode = true;
+        break;
+    }
+    case CMD_SID_START: {
+        /* Release the gate. RPFM's CMD_VGM_START equivalent: the host has filled
+         * part of the queue, so playback can begin with a full buffer behind it
+         * instead of racing the first few hundred events. */
+        s_sid_running = true;
         break;
     }
     case CMD_SID_STEP: {
+        /* The data-phase hold, in PHI2 periods (1..32). This is the /CS low
+         * window, so it is the knob that decides whether a write lands - see the
+         * comment at SID_HOLD_CYCLES_DEFAULT. */
         if (len >= 1) {
             uint32_t v = payload[0];
             if (v < 1) v = 1;
-            if (v > SID_STEP_US_DEFAULT) v = SID_STEP_US_DEFAULT;
-            s_sid_step_us = v;
+            if (v > SID_HOLD_CYCLES_MAX) v = SID_HOLD_CYCLES_MAX;
+            s_sid_hold = v;
         }
         break;
     }
@@ -689,12 +707,15 @@ static void core1_sid_main(void) {
             s_sid_reset_req = false;
             s_sid_q_tail = s_sid_q_head;
             s_sid_need_anchor = true;
+            s_sid_running = false;
             bus_ic_reset();
             sid_clear_all();
             continue;
         }
 
-        if (!s_sid_host_mode) {
+        /* Nothing is consumed until the host says the queue is prefilled. This
+         * is RPFM's CMD_VGM_START: fill first, then play. */
+        if (!s_sid_running) {
             tight_loop_contents();
             continue;
         }
@@ -704,12 +725,24 @@ static void core1_sid_main(void) {
             continue;
         }
 
-        /* The first event after a reset anchors the clock: the host's deltas are
-         * relative to its own start stamp, which is whenever it began pushing.
-         * Anchoring once per stream - not per drained batch - is what keeps the
-         * clock monotonic; resetting it whenever the queue ran dry would shorten
-         * the tune by the wait that followed. */
+        /* Anchor the clock on the first event that carries a non-zero delta,
+         * not on the first event at all.
+         *
+         * A tune's init burst is hundreds of writes all stamped t=0, and each
+         * one costs real bus time (~18 us here). Anchoring on the first of them
+         * starts the music clock before the init has finished executing, so by
+         * the time the first real note arrives the deadline is already that
+         * whole burst behind - and the board then rushes to catch up. That is
+         * the "first second or two is played too fast" report.
+         *
+         * Anchoring on the first non-zero delta makes "t=0" mean what the
+         * recorder meant by it: init complete. The init burst is free. */
         if (s_sid_need_anchor) {
+            if (ev.dt_us == 0) {
+                if (ev.addr != SID_EV_WAIT_ONLY)
+                    write_reg_sid(ev.addr, ev.data);
+                continue;
+            }
             s_sid_deadline = time_us_64();
             s_sid_need_anchor = false;
         }

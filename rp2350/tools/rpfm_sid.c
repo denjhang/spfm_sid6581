@@ -72,10 +72,25 @@
  * (main.c tud_hid_get_report_cb), just used as back-pressure instead of a flag. */
 #define LEAD_US 400000
 
-/* Stop pushing above this many queued events (of SID_Q_SIZE 8192 on the board)
- * and wait for it to drain to LOW. */
-#define Q_HIGH 6000
-#define Q_LOW  2000
+/* Prefill, copied from RPFM's AY8910 host (RPFM_Player/src/ay8910_window.cpp
+ * "Phase 1: Pre-fill firmware buffer before starting timer"). The original fills
+ * a quarter of the firmware buffer, then sends CMD_VGM_START, and only then
+ * does the device start consuming; it keeps the buffer topped up with
+ * backpressure above 50%. That is why the original has no start-of-tune
+ * instability.
+ *
+ * Same here, sized in events: push PRE_FILL events with no clock running, then
+ * CMD_SID_START, then continue with the normal paced loop. The board's queue is
+ * 8192 entries, so 1500 is under a fifth - the same proportion RPFM uses - and
+ * it is roughly what a digi tune emits in 150 ms, which is the window its own
+ * player runs ahead of the wire. */
+#define PRE_FILL 1500
+
+/* Backpressure, same proportion as RPFM's "wait if firmware buffer is > 50% of
+ * target": stop pushing above half the queue and resume once it has drained to
+ * a quarter. RPFM's exact numbers are bufTargetBytes/2 and bufTargetBytes/4. */
+#define Q_HIGH 4096
+#define Q_LOW  2048
 
 /* A .sid has no length field, so a bounded conversion needs a default. Same
  * number the SPFM player uses. */
@@ -91,10 +106,9 @@ static struct {
     double speed;
     int    subsong;        /* -1 = the file's default */
     int    use_lsfp;       /* 1 = libsidplayfp recorder, 0 = built-in 6502 */
-    int    loop;           /* buffer streams: 0 = once, N = N times, -1 = for ever */
-    int    step_us;        /* SID bus step time, 0 = leave the firmware default */
+    int    loop;           /* buffered streams: -1 = forever (the default) */
 } opt = {
-    0, 0.0, 1.0, -1, 1, 0, 0
+    0, 0.0, 1.0, -1, 1, -1
 };
 
 /* ------------------------------------------------------------------ */
@@ -139,7 +153,6 @@ static void hw_set_clock(const sid_song_info_t *info)
 {
     if (opt.dry_run) return;
     rpfm_set_phi2(info && !info->pal);
-    if (opt.step_us) rpfm_set_sid_step(opt.step_us);
 }
 
 /* ------------------------------------------------------------------ */
@@ -292,6 +305,25 @@ static int wait_for_queue_room(void)
     return 0;
 }
 
+/* Hand one event to the FIFO, with no clock pacing at all. Only the music
+ * timestamp is converted into the 16-bit delta the firmware wants. */
+static int push_raw(int64_t due_us, uint8_t reg, uint8_t val)
+{
+    int64_t dt = due_us - s_pushed_us;
+    if (dt < 0) dt = 0;
+
+    /* The delta field is 16 bits. A longer gap is split into wait-only events:
+     * addr 0xFF tells the firmware to advance the deadline without writing. */
+    while (dt > 65535) {
+        if (!rpfm_sid_push(65535, 0xFF, 0x00)) return 'q';
+        dt -= 65535;
+        s_pushed_us += 65535;
+    }
+    if (!rpfm_sid_push((uint16_t)dt, reg, val)) return 'q';
+    s_pushed_us = due_us;
+    return 0;
+}
+
 /* Hand one event over. `t_ms` is its position in the tune, so the delta is
  * computed against absolute music time and no rounding error accumulates.
  *
@@ -307,18 +339,8 @@ static int push_event(double t_ms, uint8_t reg, uint8_t val)
         if (k) return k;
     }
 
-    int64_t dt = due - s_pushed_us;
-    if (dt < 0) dt = 0;
-
-    /* The delta field is 16 bits. A longer gap is split into wait-only events:
-     * addr 0xFF tells the firmware to advance the deadline without writing. */
-    while (dt > 65535) {
-        if (!rpfm_sid_push(65535, 0xFF, 0x00)) return 'q';
-        dt -= 65535;
-        s_pushed_us += 65535;
-    }
-    if (!rpfm_sid_push((uint16_t)dt, reg, val)) return 'q';
-    s_pushed_us = due;
+    int rc = push_raw(due, reg, val);
+    if (rc) return rc;
 
     return wait_for_queue_room();
 }
@@ -360,15 +382,30 @@ static int replay_buffer(const sid_event_t *ev, size_t n, int *key)
 
     /* --seconds caps a longer stream; a shorter one ends at its last write. */
     double limit_ms = opt.seconds > 0.0 ? opt.seconds * 1000.0 : 1e18;
+    size_t total = 0;
+    while (total < n && ev[total].t_ms <= limit_ms) total++;
 
-    int64_t start = rpfm_now_us();
+    /* Prefill: hand the board PRE_FILL events with no clock of any kind, then
+     * release the gate. This is RPFM's "Phase 1: Pre-fill firmware buffer before
+     * starting timer" - the whole point is that playback never starts against an
+     * empty buffer, which is what made the first second of a tune run fast. */
+    size_t i = 0;
+    for (; i < total && i < PRE_FILL; i++) {
+        int rc = push_raw((int64_t)(ev[i].t_ms * 1000.0 / opt.speed + 0.5),
+                          ev[i].reg, ev[i].val);
+        if (rc) { *key = 'q'; s_interrupt = 'q'; return -1; }
+    }
+    rpfm_sid_flush();
+    rpfm_sid_start();
+
+    /* Music time starts when the board starts, not when we began filling. */
+    s_start_us = rpfm_now_us() - (int64_t)(i ? ev[i - 1].t_ms * 1000.0 / opt.speed : 0);
+
     size_t last_sec = (size_t)-1;
-    size_t sent = 0;
-    double last_ms = 0.0;
+    size_t sent = i;
+    double last_ms = i ? ev[i - 1].t_ms : 0.0;
 
-    for (size_t i = 0; i < n; i++) {
-        if (ev[i].t_ms > limit_ms) break;
-
+    for (; i < total; i++) {
         int k = push_event(ev[i].t_ms, ev[i].reg, ev[i].val);
         if (k) {
             *key = k;
@@ -383,10 +420,9 @@ static int replay_buffer(const sid_event_t *ev, size_t n, int *key)
             last_sec = sec;
             printf("\r  %5.1f s  %lu/%lu   ",
                    ev[i].t_ms / 1000.0, (unsigned long)(i + 1),
-                   (unsigned long)n);
+                   (unsigned long)total);
             fflush(stdout);
         }
-        (void)start;
     }
 
     rpfm_sid_flush();
@@ -444,6 +480,28 @@ static int play_live_lsfp(const char *path, int subsong, sid_song_info_t *out,
     double played_ms = 0.0;
     double next_report = 5000.0;
     double limit_ms = opt.seconds > 0.0 ? opt.seconds * 1000.0 : 1e18;
+
+    /* Prefill before starting, exactly as the buffer path does. For a live
+     * stream that means priming with the init writes plus enough frames to reach
+     * PRE_FILL events (or one second of music, whichever comes first) - the
+     * board must never begin a tune against an empty queue. */
+    size_t primed = 0;
+    double primed_ms = 0.0;
+    while (primed < PRE_FILL && primed_ms < 1000.0) {
+        if (sid_lsfp_stream_next(s, &ev, &n) != 0) break;
+        for (size_t i = 0; i < n && primed < PRE_FILL; i++) {
+            int rc = push_raw((int64_t)(ev[i].t_ms * 1000.0 / opt.speed + 0.5),
+                              ev[i].reg, ev[i].val);
+            if (rc) { sid_lsfp_stream_close(s); *key = 'q'; return -1; }
+            primed++;
+        }
+        rpfm_sid_flush();
+        primed_ms += frame_ms;
+    }
+    rpfm_sid_start();
+
+    /* Music time starts now, not when the fill began. */
+    s_start_us = rpfm_now_us() - (int64_t)(s_pushed_us);
 
     for (;;) {
         if (sid_lsfp_stream_next(s, &ev, &n) != 0) break;
@@ -520,6 +578,23 @@ static int play_live_native(const char *path, int subsong, sid_song_info_t *out,
     double played_ms = 0.0;
     double next_report = 5000.0;
     double limit_ms = opt.seconds > 0.0 ? opt.seconds * 1000.0 : 1e18;
+
+    /* Prefill before starting, same as the other two paths. */
+    size_t primed = 0;
+    double primed_ms = 0.0;
+    while (primed < PRE_FILL && primed_ms < 1000.0) {
+        if (sid_stream_next_frame(&ev, &n) != 0) break;
+        for (size_t i = 0; i < n && primed < PRE_FILL; i++) {
+            int rc = push_raw((int64_t)(ev[i].t_ms * 1000.0 / opt.speed + 0.5),
+                              ev[i].reg, ev[i].val);
+            if (rc) { sid_stream_close(); *key = 'q'; return -1; }
+            primed++;
+        }
+        rpfm_sid_flush();
+        primed_ms += frame_ms;
+    }
+    rpfm_sid_start();
+    s_start_us = rpfm_now_us() - (int64_t)(s_pushed_us);
 
     for (;;) {
         if (sid_stream_next_frame(&ev, &n) != 0) break;
@@ -615,7 +690,11 @@ static int play_file(const char *path, int *key)
         /* The header says which clock the tune was recorded for. */
         hw_set_clock(&info);
 
-        int loops = (opt.loop == 0) ? 1 : opt.loop;
+        /* A recorded stream is a finite thing, so the default is to repeat it
+         * for ever - the board has no other source of writes. --seconds is the
+         * one thing that means "stop": asking for the first N seconds and then
+         * looping those N seconds is never what a listener means. */
+        int loops = (opt.seconds > 0.0) ? 1 : opt.loop;
         for (int l = 0; loops < 0 || l < loops; l++) {
             if (loops != 1)
                 printf("  pass %d%s\n", l + 1, loops < 0 ? " (forever)" : "");
@@ -777,6 +856,56 @@ static int scan_dir(const char *dir, entry_t **out, int *count)
     return 0;
 }
 
+/* Directory part of an entry ("a/b/c.sidvgm" -> "a/b", "c.sid" -> ""). */
+static void entry_dir(const char *name, char *out, size_t len)
+{
+    const char *slash = NULL;
+    for (const char *p = name; *p; p++)
+        if (*p == '/' || *p == '\\') slash = p;
+    if (!slash) { out[0] = 0; return; }
+    size_t k = (size_t)(slash - name);
+    if (k >= len) k = len - 1;
+    memcpy(out, name, k);
+    out[k] = 0;
+}
+
+/* Bounds of the run of entries sharing this entry's directory.
+ *
+ * Copied from src/sidplay.c (group_bounds) because this player needs the same
+ * two-level model: one tune is a *folder* of files, and ',' / '.' walk inside
+ * that folder while 'n' / 'b' move between folders.
+ *
+ * The playlist is sorted by relative path, so every file of one folder is
+ * contiguous. A recording with subsongs lives in its own folder
+ * (Golden_Axe/Golden_Axe_s01.sidvgm ...), which makes ',' and '.' mean
+ * previous/next subsong for .sidvgm exactly as they do for .sid.
+ *
+ * A file at the playlist root is its own group. Without that every top-level
+ * file shares the empty directory string, so a flat folder like sid/games looks
+ * like one giant tune and 'b' rewinds to the first entry instead of stepping
+ * back one. */
+static void group_bounds(const entry_t *files, int n, int idx, int *first, int *last)
+{
+    char here[512], other[512];
+    entry_dir(files[idx].name, here, sizeof here);
+
+    if (!here[0]) { *first = idx; *last = idx; return; }
+
+    int f = idx, l = idx;
+    while (f > 0) {
+        entry_dir(files[f - 1].name, other, sizeof other);
+        if (other[0] == 0 || strcmp(here, other) != 0) break;
+        f--;
+    }
+    while (l + 1 < n) {
+        entry_dir(files[l + 1].name, other, sizeof other);
+        if (other[0] == 0 || strcmp(here, other) != 0) break;
+        l++;
+    }
+    *first = f;
+    *last  = l;
+}
+
 static int run_playlist(const char *dir, int start_idx)
 {
     entry_t *files = NULL;
@@ -792,12 +921,15 @@ static int run_playlist(const char *dir, int start_idx)
     kb_start();
 
     printf("%d files in %s\n", nfiles, dir);
-    printf("keys: [n] next  [b] back  [,] prev subsong  [.] next subsong  [q] quit\n\n");
+    printf("keys: [n] next tune  [b] previous tune  "
+           "[,] prev subsong  [.] next subsong  [q] quit\n");
+    printf("      a tune is one folder; ',' and '.' walk the files inside it,\n"
+           "      so a 23-subsong recording steps one subsong at a time.\n\n");
 
     int idx = start_idx < 0 ? 0 : (start_idx >= nfiles ? nfiles - 1 : start_idx);
 
     /* The subsong follows the tune, not the playlist: after pressing '.' on a
-     * 9-subsong file, the next tune must start at its own default again. */
+     * 9-subsong .sid, the next tune must start at its own default again. */
     const int base_sub = (opt.subsong < 0) ? 0 : opt.subsong;
     int subsong = base_sub;
 
@@ -805,19 +937,28 @@ static int run_playlist(const char *dir, int start_idx)
         char path[768];
         snprintf(path, sizeof path, "%s/%s", dir, files[idx].name);
 
-        sid_song_info_t probe;
-        /* Only a .sid has a PSID/RSID header. Probing a .sidvgm would make
-         * sid_song_probe print "not PSID/RSID" for every file in the folder. */
-        if (has_suffix(path, ".sid") && sid_song_probe(path, &probe) == 0) {
-            int nsongs = probe.n_songs ? probe.n_songs : 1;
-            if (subsong >= nsongs) subsong = nsongs - 1;
-            printf("[%d/%d] %s\n        %s / %s  %d subsong%s\n",
-                   idx + 1, nfiles, files[idx].name,
-                   probe.name[0] ? probe.name : "?",
-                   probe.author[0] ? probe.author : "?", nsongs,
-                   nsongs == 1 ? "" : "s");
+        int first, last;
+        group_bounds(files, nfiles, idx, &first, &last);
+        const int gn = last - first + 1;      /* files in this tune's folder */
+
+        if (gn > 1) {
+            printf("[%d/%d] %s\n        tune with %d subsongs, playing %d\n",
+                   idx + 1, nfiles, files[idx].name, gn, idx - first + 1);
         } else {
-            printf("[%d/%d] %s\n", idx + 1, nfiles, files[idx].name);
+            sid_song_info_t probe;
+            /* Only a .sid has a PSID/RSID header. Probing a .sidvgm would make
+             * sid_song_probe print "not PSID/RSID" for every file. */
+            if (has_suffix(path, ".sid") && sid_song_probe(path, &probe) == 0) {
+                int nsongs = probe.n_songs ? probe.n_songs : 1;
+                if (subsong >= nsongs) subsong = nsongs - 1;
+                printf("[%d/%d] %s\n        %s / %s  %d subsong%s\n",
+                       idx + 1, nfiles, files[idx].name,
+                       probe.name[0] ? probe.name : "?",
+                       probe.author[0] ? probe.author : "?", nsongs,
+                       nsongs == 1 ? "" : "s");
+            } else {
+                printf("[%d/%d] %s\n", idx + 1, nfiles, files[idx].name);
+            }
         }
         fflush(stdout);
 
@@ -826,8 +967,7 @@ static int run_playlist(const char *dir, int start_idx)
 
         hw_clear_regs();
 
-        int local = subsong;
-        opt.subsong = local;
+        opt.subsong = subsong;
         int key = 0;
         play_file(path, &key);
         hw_mute();
@@ -836,16 +976,52 @@ static int run_playlist(const char *dir, int start_idx)
         if (action == 'q') break;
 
         switch (action) {
+        /* b = the previous *tune*, not the previous subsong: stepping back one
+         * file inside a 23-subsong folder is never what a listener means. */
         case 'b':
-            idx = idx > 0 ? idx - 1 : 0;
+            if (idx <= 0) {
+                idx = 0;
+                printf("\n[BACK]  first tune\n\n");
+            } else {
+                int pf, pl;
+                group_bounds(files, nfiles, idx - 1, &pf, &pl);
+                idx = pf;
+                printf("\n[BACK]\n\n");
+            }
             subsong = base_sub;
-            printf("\n[BACK]\n\n");
             break;
-        case ',': subsong = subsong > 0 ? subsong - 1 : 0;
-                  printf("\n[SUBSONG %d]\n\n", subsong); break;
-        case '.': subsong++; printf("\n[SUBSONG %d]\n\n", subsong); break;
+
+        /* ',' / '.' step one subsong: inside a multi-file folder that is a file
+         * step, and for a .sid re-extracted with another subsong index. */
+        case ',':
+            if (gn > 1) {
+                idx = idx > first ? idx - 1 : first;
+                printf("\n[SUBSONG %d/%d]\n\n", idx - first + 1, gn);
+            } else {
+                subsong = subsong > 0 ? subsong - 1 : 0;
+                printf("\n[SUBSONG %d]\n\n", subsong);
+            }
+            break;
+
+        case '.':
+            if (gn > 1) {
+                idx = idx < last ? idx + 1 : last;
+                printf("\n[SUBSONG %d/%d]\n\n", idx - first + 1, gn);
+            } else {
+                subsong++;
+                printf("\n[SUBSONG %d]\n\n", subsong);
+            }
+            break;
+
+        /* n = leave this tune behind, i.e. skip what is left of its folder. */
+        case 'n':
+            idx = (gn > 1) ? last + 1 : idx + 1;
+            subsong = base_sub;
+            printf("\n[NEXT]\n\n");
+            break;
+
         default:
-            idx++;
+            idx = (gn > 1) ? last + 1 : idx + 1;
             subsong = base_sub;
             break;
         }
@@ -875,22 +1051,23 @@ static void usage(void)
     printf("  .sidreg   replay the old text stream\n");
     printf("  <dir>     playlist: every playable file, sorted by name\n\n");
     printf("options:\n");
-    printf("  --seconds N     play N seconds (default 0 = whole stream / for ever)\n");
+    printf("  (no options)    play for ever; a .sid is emulated live by\n");
+    printf("                  libsidplayfp, a .sidvgm repeats its stream\n");
+    printf("  --seconds N     stop after N seconds (the only way to end a track)\n");
     printf("  --subsong N     subsong, 0-based (default: the file's own)\n");
     printf("  --speed X       playback rate (default 1.0)\n");
-    printf("  --loop N        repeat a buffered stream N times (0 = once, -1 = for ever)\n");
+    printf("  --loop N        buffered stream repeats: -1 = for ever (default)\n");
     printf("  --engine E      .sid recorder: lsfp (default) | native\n");
     printf("                  lsfp   = libsidplayfp: digi drums and the real\n");
     printf("                           CIA/VIC cadence; needed for digi + RSID\n");
     printf("                  native = built-in 6502 (pure C). No in-frame\n");
     printf("                           $D418, but plain PSID sounds fine\n");
     printf("  --dry-run       no hardware, just count the writes\n");
-    printf("  --step US       SID bus step time, 1..20 (default 20). One write costs\n");
-    printf("                  7 steps, so 20 us is 140 us/write; lower is faster\n");
-    printf("                  but untested below 20 on hardware\n");
     printf("  --list          list the playable files in a directory\n");
     printf("  --help          this text\n\n");
-    printf("while playing: [n] next  [b] back  [,] [.] subsong  [q] quit\n");
+    printf("keys: [n] next tune  [b] previous tune  [,] [.] subsong  [q] quit\n");
+    printf("      n/b move between tunes (a tune = one folder);\n");
+    printf("      ,/. step one subsong inside the current tune.\n");
 }
 
 static int parse_args(int argc, char **argv, const char **path, int *list_only,
@@ -909,7 +1086,6 @@ static int parse_args(int argc, char **argv, const char **path, int *list_only,
             else if (!strcmp(e, "native")) opt.use_lsfp = 0;
             else { fprintf(stderr, "--engine must be lsfp or native\n"); return -1; }
         }
-        else if (!strcmp(a, "--step") && i + 1 < argc)  opt.step_us = atoi(argv[++i]);
         else if (!strcmp(a, "--dry-run")) opt.dry_run = 1;
         else if (!strcmp(a, "--list"))    *list_only = 1;
         else if (!strcmp(a, "--help") || !strcmp(a, "-h")) { usage(); exit(0); }
@@ -1036,11 +1212,34 @@ int main(int argc, char **argv)
                 }
                 continue;
             }
+            if (action == 'n' || action == 'b') {
+                /* One file on the command line has no neighbours, so say so
+                 * instead of quietly exiting - that is what made n/b look
+                 * broken on a single .sid. */
+                printf("\n[%s]  only one file open; ',' and '.' move subsongs\n\n",
+                       action == 'n' ? "NEXT" : "BACK");
+                continue;
+            }
             break;
         }
     } else {
-        int key = 0;
-        rc = play_file(path, &key);
+        for (;;) {
+            s_interrupt = 0;
+            hw_clear_regs();
+            int key = 0;
+            rc = play_file(path, &key);
+            hw_mute();
+            if (rc == 2) break;
+
+            int action = s_interrupt ? s_interrupt : kb_take();
+            if (action == 'q') break;
+            if (action == 'n' || action == 'b') {
+                printf("\n[%s]  only one file open\n\n",
+                       action == 'n' ? "NEXT" : "BACK");
+                continue;
+            }
+            break;
+        }
     }
 
     hw_mute();
