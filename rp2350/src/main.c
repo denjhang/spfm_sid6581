@@ -131,12 +131,27 @@ static inline void cs_select(uint8_t slot) {
 // flashes on every write to it - the nibble barely moves during a digi drum,
 // the write rate is what moves, so the flash is what makes the drum visible.
 //
+// Two rules come straight from the working led_test.c in this tree:
+//
+//   1. Colour order is GRB, not RGB: the 24-bit word shifts out green first.
+//      urgb_u32() is copied verbatim from there. Writing a "green" 0x00RR00
+//      without it lights RED instead, which is exactly the kind of thing that
+//      makes a meter look broken.
+//   2. Frames need a gap. The PIO shifts bits with no idle between words, so
+//      two frames pushed back-to-back merge and the strip latches garbage -
+//      the "cannot light one particular LED" symptom. WS_LATCH_US is >280 us
+//      (the reset time the datasheet asks for) and the whole update is rate
+//      limited so the main loop cannot outrun it.
+//
 // Everything is composed in led_update() on a 20 ms tick rather than inside
-// write_reg_sid(). That function runs at up to ~800 writes/s and each
-// ws2812_update() blocks the PIO for ~120 us, so pushing a frame per write
-// would eat the timing budget the whole design exists to protect.
+// write_reg_sid(). That function runs at up to ~800 writes/s and each frame
+// costs ~120 us of PIO time, so pushing one per write would eat the timing
+// budget the whole design exists to protect.
 
-#define WS_TICK_MS 20
+#define WS_TICK_MS      20      /* meter refresh */
+#define WS_LATCH_US    400      /* reset time between frames */
+#define WS_MAX_LEVEL   0x18     /* per-channel ceiling; 0x18 is the value that
+                                 * was accepted by eye, 0x28+ was too bright */
 
 /* SID register bits the LED layer needs. The firmware does not link
  * src/sid6581.c (that is the SPFM host driver), so the handful of constants it
@@ -149,20 +164,17 @@ static inline void cs_select(uint8_t slot) {
 #define SID_CTL_PULSE      0x40
 #define SID_CTL_NOISE      0x80
 
-/* Max 0x28 per channel: the 0x66 the RPFM defaults used was described as
- * blinding on this board, and 0x18 was accepted. */
-#define WS_LEVEL 0x28u
+/* GRB packing, copied from rp2350/src/led_test.c where it is verified on this
+ * board. Every colour below goes through this. */
+static uint32_t urgb_u32(uint8_t r, uint8_t g, uint8_t b) {
+    return ((uint32_t)g << 16) | ((uint32_t)r << 8) | (uint32_t)b;
+}
 
-/* Waveform -> hue. Index order matches wave_index() below. */
-static const uint32_t WAVE_RGB[4] = {
-    0x002800,   /* triangle: green  */
-    0x000028,   /* sawtooth: blue   */
-    0x282800,   /* pulse:    yellow */
-    0x280000,   /* noise:    red    */
-};
+/* Waveform -> colour word (GRB packed). Index order matches wave_index(). */
+static uint32_t s_wave_col[4];
 
-#define WS_FLASH_VOICE 0x101010u
-#define WS_FLASH_VOL   0x303030u
+#define WS_FLASH_VOICE 0x080808u
+#define WS_FLASH_VOL   0x0A0A0Au
 
 static uint8_t  s_voice_ctl[3];      /* last CONTROL write per voice */
 static uint32_t s_voice_flash[3];    /* addend that decays after each write */
@@ -183,9 +195,9 @@ static uint32_t ws_add(uint32_t a, uint32_t b)
     uint32_t r = ((a >> 16) & 0xFF) + ((b >> 16) & 0xFF);
     uint32_t g = ((a >>  8) & 0xFF) + ((b >>  8) & 0xFF);
     uint32_t bl = (a        & 0xFF) + (b        & 0xFF);
-    if (r > 0xFF) r = 0xFF;
-    if (g > 0xFF) g = 0xFF;
-    if (bl > 0xFF) bl = 0xFF;
+    if (r > WS_MAX_LEVEL) r = WS_MAX_LEVEL;
+    if (g > WS_MAX_LEVEL) g = WS_MAX_LEVEL;
+    if (bl > WS_MAX_LEVEL) bl = WS_MAX_LEVEL;
     return (r << 16) | (g << 8) | bl;
 }
 
@@ -208,17 +220,31 @@ static void ws_sid_activity(uint8_t addr, uint8_t data)
         s_vol_flash = WS_FLASH_VOL;
         return;
     }
-    /* Voice n's CONTROL register is n*7 + 4 -> 0x04, 0x0B, 0x12. */
-    if ((addr & 0x07) == 0x04 && (addr >> 3) < 3) {
-        int v = addr >> 3;
-        s_voice_ctl[v] = data;
-        s_voice_flash[v] = WS_FLASH_VOICE;
+    /* A voice's CONTROL register is base + 4 where base = voice * 7, so the
+     * three are 0x04, 0x0B, 0x12. These are NOT congruent mod 8 (0x0B & 7 == 3),
+     * which an earlier version assumed and which silently left voice 2 dead. */
+    for (int v = 0; v < 3; v++) {
+        if (addr == (uint8_t)(v * 7 + 4)) {
+            s_voice_ctl[v] = data;
+            s_voice_flash[v] = WS_FLASH_VOICE;
+            return;
+        }
     }
 }
 
+/* Push one frame and then hold the line idle long enough for the strip to
+ * latch it. Without the gap two frames blur together and individual LEDs
+ * appear to light at random.
+ *
+ * The order matters: pio_sm_put_blocking only waits for FIFO space, so the bits
+ * are still shifting when it returns. Waiting for the FIFO to empty and then
+ * for the reset period puts the 300 us where the datasheet wants it - after the
+ * last bit has actually gone out. */
 static void ws2812_update(void) {
     for (int i = 0; i < NUM_WS_LEDS; i++)
         pio_sm_put_blocking(s_ws_pio, s_ws_sm, s_ws_leds[i] << 8u);
+    while (!pio_sm_is_tx_fifo_empty(s_ws_pio, s_ws_sm)) {}
+    busy_wait_us_32(WS_LATCH_US);
 }
 
 static inline void ws_led_off_all(void);
@@ -227,6 +253,12 @@ static void ws2812_init(void) {
     uint offset = pio_add_program(s_ws_pio, &ws2812_program);
     s_ws_sm = pio_claim_unused_sm(s_ws_pio, true);
     ws2812_program_init(s_ws_pio, s_ws_sm, offset, PIN_WS2812, 800000, false);
+
+    s_wave_col[0] = urgb_u32(0, WS_MAX_LEVEL, 0);              /* triangle green  */
+    s_wave_col[1] = urgb_u32(0, 0, WS_MAX_LEVEL);              /* sawtooth blue   */
+    s_wave_col[2] = urgb_u32(WS_MAX_LEVEL, WS_MAX_LEVEL, 0);   /* pulse    yellow */
+    s_wave_col[3] = urgb_u32(WS_MAX_LEVEL, 0, 0);              /* noise    red    */
+
     for (int i = 0; i < NUM_WS_LEDS; i++) s_ws_leds[i] = 0;
     ws2812_update();
     s_ws_tick = make_timeout_time_ms(WS_TICK_MS);
@@ -306,19 +338,18 @@ static void led_update(void)
 
     for (int v = 0; v < 3; v++) {
         uint8_t ctl = s_voice_ctl[v];
-        uint32_t c = WAVE_RGB[wave_index(ctl)];
+        uint32_t c = s_wave_col[wave_index(ctl)];
         /* Gate off = dark: a release tail is inaudible on an LED, and a
          * constant glow would make every channel look permanently on. */
-        uint32_t body = (ctl & SID_CTL_GATE)
-                      ? ws_scale(c, WS_LEVEL, WS_LEVEL)
-                      : 0;
+        uint32_t body = (ctl & SID_CTL_GATE) ? c : 0;
         want[v] = ws_add(body, s_voice_flash[v]);
     }
 
     /* $D418: brightness follows the volume nibble, flashes on each write. The
      * drum barely moves this nibble, so without the flash a digi passage looks
      * like a steady dim light. */
-    want[3] = ws_add(ws_scale(0xFFFFFFu, (uint32_t)s_vol_val, 15u), s_vol_flash);
+    want[3] = ws_add(ws_scale(0xFFFFFFu, (uint32_t)s_vol_val * WS_MAX_LEVEL,
+                              15u), s_vol_flash);
 
     int changed = 0;
     for (int i = 0; i < NUM_WS_LEDS; i++) {
@@ -388,111 +419,17 @@ static inline void write_reg_sid(uint8_t addr, uint8_t data) {
     if (s_ws_ready) ws_sid_activity(a, data);
 }
 
-/* 肉眼可见的自检：用同一条 PIO 通路，把两次写间隔拉到 250 ms。
- * A0 变成 2 Hz 方波，CS0# 也跟着翻。如果这一段 A0 的灯不动，
- * 才是 PIO 真没到引脚；如果这一段动、播放时不动，那只是 1 µs 太短看不见。 */
-static void sid_visible_blink(void) {
-    for (int i = 0; i < 8; i++) {
-        cs_select(0);                                    /* CS0# 低 */
-        pio_bus_put(s_bus_pio, s_bus_sm, pack_bus(0x00, 0, true, true));  /* A0=0 */
-        sleep_ms(250);
-        pio_bus_put(s_bus_pio, s_bus_sm, pack_bus(0x00, 1, true, true));  /* A0=1 */
-        sleep_ms(250);
-        cs_select(1);                                    /* CS0# 高 */
-        sleep_ms(250);
-    }
-    pio_bus_put(s_bus_pio, s_bus_sm, pack_bus(0xFF, 0, true, true));
-    cs_select(0);
-}
-
-/* Reset leaves volume (0x18) at 0, so nothing is audible without this. */
+/* Reset leaves volume (0x18) at 0, so nothing is audible without a host write. */
 static void sid_clear_all(void) {
     for (uint8_t r = 0x00; r <= 0x18; r++) write_reg_sid(r, 0x00);
     write_reg_sid(0x18, 0x0F);
 }
 
-/* Four rising notes on voice 1: proves clock, address latch and data path. */
-/* 密集自检音序：不需要主机，上电后一直循环。
- *
- * 声部 1：16 分音符快速琶音（每音 60 ms，含 6 次寄存器写）
- * 声部 2 + 3：同时按住五度和八度，作为持续和弦底
- * 每 8 个音符插一次噪声打击，检验 $D418 附近与快速 gate 往返
- *
- * 这些数字是故意压紧的：一拍 60 ms 内要发 6 条命令，比普通 PSID 更密。
- * 如果这里能连续响几分钟不掉音、不跑调，总线时序就算过关。
- */
-static const uint16_t SEMI[12] = {
-    0x0D5D, 0x0E2B, 0x0F02, 0x0FE3, 0x10CF, 0x11C6,
-    0x12CA, 0x13DA, 0x14F8, 0x1625, 0x1760, 0x18AC
-};
-
-static int s_arp_n = 0;
-
-/* 主音下方五度，和 SEMI 一一对应 */
-static const uint16_t CHORD_FIFTH[12] = {
-    0x08B8, 0x093B, 0x09C5, 0x0A56, 0x0AEF, 0x0B90,
-    0x0C39, 0x0CEB, 0x0DA5, 0x0E68, 0x0F34, 0x1009
-};
-
-static void sid_arp_chord_test(void) {
-    /* 三个声部统一包络：起音快、decay 短、sustain 中等，能听清每个音 */
-    for (int v = 0; v < 3; v++) {
-        uint8_t b = (uint8_t)(v * 7);
-        write_reg_sid((uint8_t)(b + 2), 0x00);
-        write_reg_sid((uint8_t)(b + 3), 0x08);   /* 50% 占空比 */
-        write_reg_sid((uint8_t)(b + 5), 0x08);   /* attack 2ms, decay 300ms */
-        write_reg_sid((uint8_t)(b + 6), 0x66);   /* sustain 6, release 240ms */
-    }
-    write_reg_sid(0x04, 0x40);   /* 声部1 脉冲，gate 关 */
-    write_reg_sid(0x0B, 0x20);   /* 声部2 锯齿，gate 关 */
-    write_reg_sid(0x12, 0x10);   /* 声部3 三角，gate 关 */
-
-    s_arp_n = 0;
-}
-
-/* One note of the test sequence, called from the main loop so tud_task() keeps
- * running and BOOTSEL stays reachable. Returns the delay to wait afterwards. */
-static uint32_t sid_arp_step(void) {
-    {
-        int n = s_arp_n;
-        uint16_t f = SEMI[n % 12];
-
-        /* 声部 1：琶音主音 */
-        write_reg_sid(0x00, (uint8_t)(f & 0xFF));
-        write_reg_sid(0x01, (uint8_t)(f >> 8));
-        write_reg_sid(0x04, 0x41);            /* 脉冲 + gate on */
-
-        /* 声部 2：下方五度，跟着走 */
-        write_reg_sid(0x07, (uint8_t)(CHORD_FIFTH[n % 12] & 0xFF));
-        write_reg_sid(0x08, (uint8_t)(CHORD_FIFTH[n % 12] >> 8));
-        write_reg_sid(0x0B, 0x21);            /* 锯齿 + gate on */
-
-        /* 声部 3：每 4 个音换一次高八度根音 */
-        if ((n & 3) == 0) {
-            uint16_t o = (uint16_t)(f * 2);
-            write_reg_sid(0x0E, (uint8_t)(o & 0xFF));
-            write_reg_sid(0x0F, (uint8_t)(o >> 8));
-            write_reg_sid(0x12, 0x11);        /* 三角 + gate on */
-        }
-
-        /* 关 gate，保证下一个音有干净的 0->1 边沿 */
-        write_reg_sid(0x04, 0x40);
-
-        /* 每 8 个音给一次噪声打击 */
-        if ((n & 7) == 7) {
-            write_reg_sid(0x0E, 0x40);
-            write_reg_sid(0x0F, 0x24);        /* 高频嘶声 */
-            write_reg_sid(0x13, 0x08);        /* 快起音 */
-            write_reg_sid(0x14, 0x33);        /* 短促衰减 */
-            write_reg_sid(0x12, 0x81);        /* 噪声 + gate */
-            s_arp_n++;
-            return 30;
-        }
-
-        s_arp_n++;
-        return 55;
-    }
-}
+/* There used to be a boot-time arpeggio/chord self-test here. It is gone: the
+ * board now boots silent and waits for the host, because a board that starts
+ * playing the moment it is powered is unusable next to anything else. The SID
+ * still gets cleared so it cannot hold whatever the previous run left in the
+ * 374's latches. */
 
 // ========== SID event queue (host -> playback) ==========
 //
@@ -768,24 +705,18 @@ int main() {
     cs_select(0);
     bus_ic_reset();
 
-    /* 清寄存器 + 音量：这一步之后 SID 才可能出声 */
+    /* Clear the registers so the SID cannot hold whatever the previous run
+     * left latched. Volume stays at 0 here - the host sets it when a tune
+     * starts, so a bare board is silent. */
     sid_clear_all();
-    sid_arp_chord_test();
 
     s_led_next = make_timeout_time_ms(500);
-    absolute_time_t next_tune = make_timeout_time_ms(200);
 
     /* 每次主循环都跑 tud_task()，否则 USB/HID 会死，BOOTSEL 就发不进来。
-     * 没有主机事件时，自己循环跑密集琶音 + 和弦 + 噪声鼓。 */
+     * 板子自己不出声：所有寄存器写都来自主机事件。 */
     while (true) {
         tud_task();
         led_update();
-
-        // Host stream takes over as soon as events arrive; until then keep
-        // looping the chime so the board is audible on its own.
-        if (!s_sid_host_mode && time_reached(next_tune)) {
-            next_tune = make_timeout_time_ms(sid_arp_step());
-        }
 
         // Apply due host events against an absolute deadline.
         if (s_sid_host_mode) {
