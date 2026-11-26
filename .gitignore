@@ -43,3 +43,6 @@ refs/hvsc/
 spfm_sid6581-*.zip
 refs/*.zip
 refs/*.pdf
+
+# release zips are built, not tracked
+spfm_sid6581-rp2350-v*.zip
