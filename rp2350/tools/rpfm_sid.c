@@ -59,11 +59,23 @@
 #define PLAYER_VERSION "0.1"
 
 /* How far ahead of the wall clock the host may run. The board's event queue is
- * 8192 entries, and the densest SID tune in this collection peaks at about 800
- * writes/s, so 400 ms is ~320 queued events - a comfortable margin that also
- * absorbs a scheduling hiccup. Larger costs nothing but makes a skip feel
- * laggy. */
+ * 8192 entries, and the densest SID tune in this collection peaks at about
+ * 4500 writes/s, so 400 ms is ~1800 queued events - a comfortable margin that
+ * also absorbs a scheduling hiccup.
+ *
+ * This is a *soft* limit. The hard one is the watermark below: if the board is
+ * not draining fast enough the queue would fill, sid_q_push() would start
+ * returning false, and events would vanish silently - which is exactly what a
+ * "the tune drags / notes are missing" report looks like. So the host also polls
+ * the firmware's own fill level and waits when it gets high. That is the same
+ * head/tail watermark the firmware publishes in STATUS_BUF_HIGH
+ * (main.c tud_hid_get_report_cb), just used as back-pressure instead of a flag. */
 #define LEAD_US 400000
+
+/* Stop pushing above this many queued events (of SID_Q_SIZE 8192 on the board)
+ * and wait for it to drain to LOW. */
+#define Q_HIGH 6000
+#define Q_LOW  2000
 
 /* A .sid has no length field, so a bounded conversion needs a default. Same
  * number the SPFM player uses. */
@@ -80,8 +92,9 @@ static struct {
     int    subsong;        /* -1 = the file's default */
     int    use_lsfp;       /* 1 = libsidplayfp recorder, 0 = built-in 6502 */
     int    loop;           /* buffer streams: 0 = once, N = N times, -1 = for ever */
+    int    step_us;        /* SID bus step time, 0 = leave the firmware default */
 } opt = {
-    0, 0.0, 1.0, -1, 1, 0
+    0, 0.0, 1.0, -1, 1, 0, 0
 };
 
 /* ------------------------------------------------------------------ */
@@ -126,6 +139,7 @@ static void hw_set_clock(const sid_song_info_t *info)
 {
     if (opt.dry_run) return;
     rpfm_set_phi2(info && !info->pal);
+    if (opt.step_us) rpfm_set_sid_step(opt.step_us);
 }
 
 /* ------------------------------------------------------------------ */
@@ -222,11 +236,13 @@ static int kb_take(void)
 
 static int64_t s_start_us = 0;     /* wall clock at the first event */
 static int64_t s_pushed_us = 0;    /* music position already handed over */
+static unsigned s_frames_since_poll = 0;
 
 static void sched_reset(void)
 {
     s_start_us  = rpfm_now_us();
     s_pushed_us = 0;
+    s_frames_since_poll = 0;
     rpfm_sid_stream_begin();
 }
 
@@ -246,12 +262,41 @@ static int sched_sleep_us(int64_t us)
     return 0;
 }
 
+/* Back-pressure from the board's own fill level.
+ *
+ * LEAD_US bounds how far ahead the host runs in *music* time, which is correct
+ * for tempo but says nothing about how fast the board is actually draining. If
+ * the SID bus cannot keep up (a dense frame, or Core 1 falling behind), the
+ * queue fills, sid_q_push() returns false on the board and the events are
+ * dropped without a word - the tune then drags and loses notes.
+ *
+ * So every POLL_EVERY frames the host asks the firmware how full the queue is
+ * (HidD_GetInputReport, the same uplink the YM player used for its VGM buffer)
+ * and stalls above Q_HIGH until it drains to Q_LOW. Polling every frame would
+ * cost a control transfer per 15 events; this is 1 in 20. */
+#define POLL_EVERY 20
+
+static int wait_for_queue_room(void)
+{
+    if (++s_frames_since_poll < POLL_EVERY) return 0;
+    s_frames_since_poll = 0;
+
+    uint16_t used = rpfm_link_queue_level();
+    if (used < Q_HIGH) return 0;
+
+    while (used > Q_LOW) {
+        int k = sched_sleep_us(2000);
+        if (k) return k;
+        used = rpfm_link_queue_level();
+    }
+    return 0;
+}
+
 /* Hand one event over. `t_ms` is its position in the tune, so the delta is
  * computed against absolute music time and no rounding error accumulates.
  *
- * If the event is further ahead than LEAD_US the caller is early, so we wait:
- * that is the only flow control in the system, and it bounds the board's
- * queue by construction. */
+ * Two independent bounds keep the board's queue in range: music time
+ * (LEAD_US) and actual fill (wait_for_queue_room). */
 static int push_event(double t_ms, uint8_t reg, uint8_t val)
 {
     int64_t due = (int64_t)(t_ms * 1000.0 / opt.speed + 0.5);
@@ -274,7 +319,8 @@ static int push_event(double t_ms, uint8_t reg, uint8_t val)
     }
     if (!rpfm_sid_push((uint16_t)dt, reg, val)) return 'q';
     s_pushed_us = due;
-    return 0;
+
+    return wait_for_queue_room();
 }
 
 /* Wait for the board to consume what it already has. Called before leaving a
@@ -839,6 +885,9 @@ static void usage(void)
     printf("                  native = built-in 6502 (pure C). No in-frame\n");
     printf("                           $D418, but plain PSID sounds fine\n");
     printf("  --dry-run       no hardware, just count the writes\n");
+    printf("  --step US       SID bus step time, 1..20 (default 20). One write costs\n");
+    printf("                  7 steps, so 20 us is 140 us/write; lower is faster\n");
+    printf("                  but untested below 20 on hardware\n");
     printf("  --list          list the playable files in a directory\n");
     printf("  --help          this text\n\n");
     printf("while playing: [n] next  [b] back  [,] [.] subsong  [q] quit\n");
@@ -860,6 +909,7 @@ static int parse_args(int argc, char **argv, const char **path, int *list_only,
             else if (!strcmp(e, "native")) opt.use_lsfp = 0;
             else { fprintf(stderr, "--engine must be lsfp or native\n"); return -1; }
         }
+        else if (!strcmp(a, "--step") && i + 1 < argc)  opt.step_us = atoi(argv[++i]);
         else if (!strcmp(a, "--dry-run")) opt.dry_run = 1;
         else if (!strcmp(a, "--list"))    *list_only = 1;
         else if (!strcmp(a, "--help") || !strcmp(a, "-h")) { usage(); exit(0); }

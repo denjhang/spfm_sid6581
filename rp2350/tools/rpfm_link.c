@@ -162,6 +162,14 @@ bool rpfm_set_phi2(int ntsc)
     return rpfm_link_send(CMD_PHI2, &v, 1, NULL);
 }
 
+bool rpfm_set_sid_step(int us)
+{
+    if (us < 1) us = 1;
+    if (us > 20) us = 20;
+    uint8_t v = (uint8_t)us;
+    return rpfm_link_send(CMD_SID_STEP, &v, 1, NULL);
+}
+
 uint16_t rpfm_link_queue_level(void)
 {
     if (s_handle == INVALID_HANDLE_VALUE) return 0;

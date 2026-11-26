@@ -179,7 +179,11 @@ static uint32_t urgb_u32(uint8_t r, uint8_t g, uint8_t b) {
 
 /* Fixed hue per LED, RPFM's order: green, blue, yellow, red. */
 static uint32_t s_ws_col[4];
-static uint16_t s_ws_hits[4];        /* writes seen since the last tick */
+/* Incremented on Core 1 (write_reg_sid), read and cleared on Core 0
+ * (led_update). A counter that lands mid-clear can lose one count; for a
+ * brightness meter that is invisible, and making it exact would cost a lock on
+ * the hot path. Everything else in this block is Core 0 only. */
+static volatile uint16_t s_ws_hits[4];
 static uint8_t  s_ws_level[4];       /* level currently shown, 0..LED_MAX */
 static absolute_time_t s_ws_tick = {0};
 
@@ -197,8 +201,8 @@ static uint32_t ws_frame(uint32_t col, uint32_t level)
     return (g << 16) | (r << 8) | b;
 }
 
-/* Called by write_reg_sid() for every write that reached the chip. Only counts;
- * the picture is composed in led_update(). */
+/* Called by write_reg_sid() on Core 1 for every write that reached the chip.
+ * Only counts; the picture is composed on Core 0 in led_update(). */
 static void ws_sid_activity(uint8_t addr, uint8_t data)
 {
     (void)data;
@@ -211,7 +215,8 @@ static void ws_sid_activity(uint8_t addr, uint8_t data)
         led = addr / 7;            /* 0x00-0x06 v1, 0x07-0x0D v2, 0x0E-0x14 v3 */
         if (led > 2) led = 2;
     }
-    if (s_ws_hits[led] < 0xFFFF) s_ws_hits[led]++;
+    uint16_t h = s_ws_hits[led];
+    if (h < 0xFFFF) s_ws_hits[led] = (uint16_t)(h + 1);
 }
 
 /* Four words, then return - byte for byte RPFM's ws2812_update(). See rule 1
@@ -340,7 +345,14 @@ static inline void write_reg_ay(uint8_t slot, uint8_t addr, uint8_t data) {
  *
  * CS0# is held low for the whole session, so TRIG_n = !A0 | /WR | 0 needs both
  * A0 and /WR low, i.e. only the data-phase pulse writes the chip. */
-#define SID_STEP_US 20
+#define SID_STEP_US_DEFAULT 20
+
+/* Adjustable at run time (CMD_SID_STEP) because 20 us was copied from the
+ * YM2413 path as a safe value, not measured for the SID. Six steps plus the idle
+ * word means one register write costs 140 us here, which is what limits the
+ * densest tunes; the latching edges only need a few us. Lower it and listen. */
+static volatile uint32_t s_sid_step_us = SID_STEP_US_DEFAULT;
+#define SID_STEP_US (s_sid_step_us)
 
 static inline void write_reg_sid(uint8_t addr, uint8_t data) {
     uint8_t a = (uint8_t)(addr & 0x1F);
@@ -383,11 +395,21 @@ static void sid_clear_all(void) {
  * still gets cleared so it cannot hold whatever the previous run left in the
  * 374's latches. */
 
-// ========== SID event queue (host -> playback) ==========
+// ========== SID event queue: Core 0 produces, Core 1 consumes ==========
 //
-// The host sends .sid register writes already stamped with a microsecond delta.
-// Applying them against an absolute deadline on this side is what keeps the
-// timing independent of USB jitter.
+// This is RPFM's split, applied to SID events instead of VGM bytes
+// (src/rpfm/main.c: the HID callback writes into cmd_buf on Core 0, and
+// core1_vgm_main drains it). The reason is a hard number: write_reg_sid()
+// spends 7 * 20 us = 140 us on the bus, and the densest tune in this
+// collection issues ~4500 writes/s (Turbo Outrun: 733634 writes / 162.6 s).
+// That is 63% of one core, and the busy frames go well past 100% - so doing it
+// on Core 0 starves tud_task() and the tune drags. Core 1 has nothing else to
+// do; moving the playback loop there makes Core 0 purely a USB endpoint, which
+// is exactly how RPFM keeps its FM playback smooth.
+//
+// The queue is the same shape as cmd_buf_t: single producer, single consumer,
+// volatile head/tail, power-of-two mask. Head is only written on Core 0, tail
+// only on Core 1, so no lock is needed on this chip.
 
 #define SID_Q_SIZE 8192   // power of two; 4 bytes each = 32 KiB
 
@@ -398,11 +420,11 @@ typedef struct {
 } sid_ev_t;
 
 static sid_ev_t s_sid_q[SID_Q_SIZE];
-static volatile uint32_t s_sid_q_head = 0;
-static volatile uint32_t s_sid_q_tail = 0;
-static bool     s_sid_host_mode = false;   // true once the host streamed events
+static volatile uint32_t s_sid_q_head = 0;   // written by Core 0
+static volatile uint32_t s_sid_q_tail = 0;   // written by Core 1
+static volatile bool s_sid_host_mode = false;
 static uint64_t s_sid_deadline  = 0;
-static bool     s_sid_need_anchor = true;  // next event becomes the clock origin
+static bool     s_sid_need_anchor = true;    // next event becomes the clock origin
 
 /* addr 0xFF is a wait-only event: the host could not express a gap longer than
  * the 16-bit delta field, so it splits it into a chain of these. They advance
@@ -430,23 +452,26 @@ static inline uint32_t sid_q_used(void) {
     return (s_sid_q_head - s_sid_q_tail) & (SID_Q_SIZE - 1);
 }
 
-/* Drop everything queued. A track change must not replay the previous tune's
- * backlog, and a reset must not leave the deadline pointing at stale time. */
-static void sid_q_clear(void) {
-    s_sid_q_tail = s_sid_q_head;
-    s_sid_need_anchor = true;
-    s_sid_deadline = time_us_64();
+/* Drop everything queued. Core 0 does not touch tail or the deadline: it only
+ * raises a request, and Core 1 clears the queue at the top of its own loop.
+ * That keeps head/tail single-writer as RPFM's ring_buf/cmd_buf are. */
+static volatile bool s_sid_reset_req = false;
+
+static void sid_q_request_clear(void) {
+    s_sid_reset_req = true;
 }
 
 // ========== IC# Reset ==========
 
+/* Only Core 1 calls this: it is a 100 ms pulse and Core 1 is the core that owns
+ * the bus. Core 0 must keep running tud_task() meanwhile, which is exactly why
+ * this became a Core 1 job - the old version sat on Core 0 and stopped the USB
+ * stack for 100 ms on every track change. */
 static void bus_ic_reset(void) {
     gpio_put(PIN_IC, 0);
-    absolute_time_t t = make_timeout_time_ms(50);
-    while (!time_reached(t)) { tud_task(); tight_loop_contents(); }
+    sleep_ms(50);
     gpio_put(PIN_IC, 1);
-    t = make_timeout_time_ms(50);
-    while (!time_reached(t)) { tud_task(); tight_loop_contents(); }
+    sleep_ms(50);
 }
 
 // ========== GPIO Init ==========
@@ -517,10 +542,11 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
     }
     case CMD_RESET: {
         if (len >= 1) {
-            /* Clear the event queue first: the host is changing tunes, and a
-             * backlog from the old one must not replay into the new one. */
-            sid_q_clear();
-            bus_ic_reset();
+            /* The host is changing tunes. Hand the reset to Core 1, which owns
+             * the bus and the queue's tail; doing it here would touch state the
+             * other core is reading. Core 1 clears the backlog, pulses IC# and
+             * re-clears the registers. */
+            s_sid_reset_req = true;
         }
         break;
     }
@@ -594,6 +620,15 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
         s_sid_host_mode = true;
         break;
     }
+    case CMD_SID_STEP: {
+        if (len >= 1) {
+            uint32_t v = payload[0];
+            if (v < 1) v = 1;
+            if (v > SID_STEP_US_DEFAULT) v = SID_STEP_US_DEFAULT;
+            s_sid_step_us = v;
+        }
+        break;
+    }
     case CMD_PHI2: {
 #if USE_PIO_PHI2
         if (len >= 1)
@@ -634,6 +669,62 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
     return RPFM_FRAME_SIZE;
 }
 
+// ========== Core 1: SID playback ==========
+//
+// Same shape as RPFM's core1_vgm_main(): spin on the shared queue, do the
+// hardware work here, never call into the USB stack. Core 0 is left free to
+// service HID frames, which is what removes the drag.
+//
+// Idle is a tight spin, not a sleep: the queue is fed 400 ms ahead so there is
+// almost always something ready, and a sleep would have to be woken to gain
+// anything. RPFM spins the same way ("Tight idle — don't sleep, just spin").
+
+static void core1_sid_main(void) {
+    sid_ev_t ev;
+
+    for (;;) {
+        /* Reset requests are serviced here so head/tail stay single-writer. A
+         * track change must not replay the previous tune's backlog. */
+        if (s_sid_reset_req) {
+            s_sid_reset_req = false;
+            s_sid_q_tail = s_sid_q_head;
+            s_sid_need_anchor = true;
+            bus_ic_reset();
+            sid_clear_all();
+            continue;
+        }
+
+        if (!s_sid_host_mode) {
+            tight_loop_contents();
+            continue;
+        }
+
+        if (!sid_q_pop(&ev)) {
+            tight_loop_contents();
+            continue;
+        }
+
+        /* The first event after a reset anchors the clock: the host's deltas are
+         * relative to its own start stamp, which is whenever it began pushing.
+         * Anchoring once per stream - not per drained batch - is what keeps the
+         * clock monotonic; resetting it whenever the queue ran dry would shorten
+         * the tune by the wait that followed. */
+        if (s_sid_need_anchor) {
+            s_sid_deadline = time_us_64();
+            s_sid_need_anchor = false;
+        }
+
+        if (ev.dt_us) {
+            s_sid_deadline += ev.dt_us;
+            while (time_us_64() < s_sid_deadline) {
+                tight_loop_contents();
+            }
+        }
+        if (ev.addr != SID_EV_WAIT_ONLY)
+            write_reg_sid(ev.addr, ev.data);
+    }
+}
+
 // ========== Main ==========
 
 int main() {
@@ -650,60 +741,24 @@ int main() {
     // Init TinyUSB device stack
     tud_init(BOARD_TUD_RHPORT);
 
-    // Launch VGM player on Core 1 (MegaGRRL-style cycle counter loop)
-    multicore_launch_core1(core1_vgm_main);
-
     s_ws_ready = true;
     cs_select(0);
-    bus_ic_reset();
 
-    /* Clear the registers so the SID cannot hold whatever the previous run
-     * left latched. Volume stays at 0 here - the host sets it when a tune
-     * starts, so a bare board is silent. */
-    sid_clear_all();
+    /* Everything that touches the SID bus happens on Core 1 from here on, so the
+     * initial reset/clear goes with it. Core 0 starts the player and then only
+     * ever handles USB and the LEDs. */
+    multicore_launch_core1(core1_sid_main);
+    s_sid_reset_req = true;
 
     s_led_next = make_timeout_time_ms(500);
 
     /* 每次主循环都跑 tud_task()，否则 USB/HID 会死，BOOTSEL 就发不进来。
-     * 板子自己不出声：所有寄存器写都来自主机事件。 */
+     * 板子自己不出声：所有寄存器写都来自主机事件，由 Core 1 执行。 */
     while (true) {
         tud_task();
         led_update();
 
-        // Apply due host events against an absolute deadline.
-        if (s_sid_host_mode) {
-            sid_ev_t ev;
-            while (sid_q_pop(&ev)) {
-                /* The first event after a reset anchors the clock: the host's
-                 * deltas are relative to its start stamp, which is whenever it
-                 * began pushing. Anchoring once per stream - not per drained
-                 * batch - is what keeps the board's clock monotonic; the old
-                 * code reset the anchor whenever the queue happened to run dry,
-                 * so any underrun shortened the tune by the wait that followed. */
-                if (s_sid_need_anchor) {
-                    s_sid_deadline = time_us_64();
-                    s_sid_need_anchor = false;
-                }
-
-                if (ev.dt_us) {
-                    s_sid_deadline += ev.dt_us;
-                    while (time_us_64() < s_sid_deadline) {
-                        /* led_update() has to run here too. The queue is fed
-                         * hundreds of ms ahead, so this wait is where the loop
-                         * spends most of its time during playback; leaving it
-                         * out froze the LEDs on whatever picture was composed
-                         * before the first batch drained. That was the
-                         * "stuck on the first LED" report. */
-                        tud_task();
-                        led_update();
-                    }
-                }
-                if (ev.addr != SID_EV_WAIT_ONLY)
-                    write_reg_sid(ev.addr, ev.data);
-            }
-        }
-
-        // Execute deferred register writes
+        // Execute deferred register writes (still Core 0: they are YM paths)
         uint8_t slot, addr, data, flags;
         while (deferred_pop(&slot, &addr, &data, &flags)) {
             if (flags & DQF_AY)

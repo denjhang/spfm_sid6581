@@ -189,10 +189,34 @@ RPFM 原版其实**完全没有亮度控制**：`ws_led_on()` 直接把 `cs_colo
 4. **播放循环里必须调 `tud_task()`**，否则 USB 协议栈停摆。
 5. **PHI2 用 `set pins` 不用 sideset。** 抄 USBSID-Pico 的 `clock.pio`。
 
+## 双核与流控
+
+RPFM 高性能的三个部件在这里都用上了，结构照 `src/rpfm/main.c`：
+
+| 部件 | RPFM | 这里 |
+|---|---|---|
+| 环形缓冲 | `cmd_buf_t`（64 KB，VGM 字节） | `sid_ev_t` 队列（8192 条 = 32 KB） |
+| 水位线 | `STATUS_BUF_HIGH`（>75% 填满） | 同一个位，用在 `get_report_cb` |
+| 双核 | Core 0 = USB，Core 1 = VGM 播放 | Core 0 = USB + 灯，Core 1 = SID 总线 |
+
+**为什么必须双核**：`write_reg_sid()` 一次 7 步 × 20 µs = **140 µs**，
+Turbo Outrun 是 733634 写 / 162.6 s ≈ **4500 写/秒**，也就是单核 63%，
+密集帧远超 100%。放在 Core 0 上必然饿死 `tud_task()` —— 这就是"拖慢"的
+来源。Core 1 本来空闲，把播放循环搬过去之后 Core 0 只剩 USB，和 RPFM
+保 FM 播放流畅的做法完全一样。
+
+**水位线是反压，不只是标志位。** 板子在 `get_report_cb` 里已经报了队列
+填充度，主机现在每 20 帧读一次（`HidD_GetInputReport`），超过 6000 条就
+等到降到 2000 条再继续推。没有这一层的话队列满了 `sid_q_push()` 会直接
+返回 false，事件**静默丢失**——听起来就是"拖慢 + 掉音"。
+
+单写者约定照 RPFM 的 `ring_buf.h`：head 只在 Core 0 写，tail 只在 Core 1 写，
+所以不需要锁。`CMD_RESET` 也因此只置一个请求位，由 Core 1 自己清队列。
+
 ## 时序参数
 
-`write_reg_sid()` 一次写 7 个 PIO 字（6 步 + 1 个 idle），每步 `SID_STEP_US = 20` µs，
-合计约 140 µs/次寄存器写。R-Type 峰值约 800 次/秒，占 11%。
+`write_reg_sid()` 一次写 7 个 PIO 字（6 步 + 1 个 idle）。每步时间可用
+`--step N`（`CMD_SID_STEP 0x33`）在 1–20 µs 之间调，默认 20 µs（140 µs/写）。
 
-20 µs 是从 `ym2413_pio_write_reg()` 抄的保守值；知道 autopull 那个 bug 之后，1 µs
-可能也能用，但没再扫——能出声优先。
+20 µs 是从 `ym2413_pio_write_reg()` 抄的保守值，不是 SID 实测值。锁存边沿
+只需要几 µs，所以这个值大概率可以往下压——压下去写密度上限就直接提高。

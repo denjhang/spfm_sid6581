@@ -37,6 +37,7 @@
 #define CMD_SID_EVENTS  0x30  // [dt_lo,dt_hi,addr,data] x N — timed SID writes
 #define CMD_SID_WRITE   0x32  // [addr,data] x N — immediate SID writes
 #define CMD_PHI2        0x31  // [0=PAL 985248, 1=NTSC 1022727]
+#define CMD_SID_STEP    0x33  // [step_us] — SID bus step time, 1..20 us per phase
 #define CMD_NOP         0xFF
 
 // STATUS bits
