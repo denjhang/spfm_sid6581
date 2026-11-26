@@ -39,6 +39,7 @@
 #define CMD_PHI2        0x31  // [0=PAL 985248, 1=NTSC 1022727]
 #define CMD_SID_STEP    0x33  // [hold] — data phase held this many PHI2 periods (1..32)
 #define CMD_SID_START   0x34  // no payload — begin consuming queued events
+#define CMD_SID_STOP    0x35  // no payload — shut the gate, drop the queue, re-anchor
 #define CMD_NOP         0xFF
 
 // STATUS bits

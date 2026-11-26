@@ -2,6 +2,9 @@
 
 > 2026-11-26。**实时播放已达标**：双核 + 环形队列 + 水位线反压之后，
 > Turbo Outrun（4500 写/秒）连续播完全程不掉音、不拖慢。
+>
+> 同日修复三处时间轴缺陷（见"踩过的坑" 11–13）：播放列表第 2 首起开头赶拍子、
+> 队列见底后 digi 鼓退化成噪音、预填按条数算导致稀疏开头预填不足。
 
 这是 SPFM 方案的替代品。SPFM 协议的帧内时序上限（见 [../docs/SPFM时序精度上限.md](../docs/SPFM时序精度上限.md)）
 由 RP2350A 自己生成总线时序解决——主机只送带微秒时间戳的事件，抖动到不了芯片。
@@ -16,6 +19,8 @@
 | **`.sidvgm` / `.sid` 实时播放（`rpfm_sid.exe`）** | ✅ **4500 写/秒不掉音、不拖慢** |
 | 双核：Core 1 跑总线，Core 0 只剩 USB | ✅ |
 | 水位线反压（队列 >6000 条就等） | ✅ |
+| 换曲边界 `CMD_SID_STOP`：队列丢弃 + 时钟重锚 | ✅ 2026-11-26 |
+| 队列见底自动重锚（digi 稀疏开头不再退化成噪音） | ✅ 2026-11-26 |
 | 4 颗 WS2812 写入密度表 | ✅ 亮度已确认 |
 | `.sidreg` 事件流播放（`tools/sid_stream.exe`） | ✅ 早期工具，保留 |
 
@@ -162,8 +167,9 @@ Core 0，互不影响。
 | `0x32` | `CMD_SID_WRITE` `[addr,data] × N` 立即写 |
 | `0x31` | `CMD_PHI2` `[0=PAL/1=NTSC]` |
 | `0x33` | `CMD_SID_STEP` `[1..32]` 数据相保持几个 PHI2 周期（默认 12） |
-| `0x34` | `CMD_SID_START` 释放播放闸门（预填完成后发） |
-| `0x03` | `CMD_RESET` 清事件队列 + 复位 IC# |
+| `0x34` | `CMD_SID_START` 释放播放闸门 + 以"现在"为新原点重新锚定时钟（预填完成后发） |
+| `0x35` | `CMD_SID_STOP` 关闸门、丢掉队列里剩下的、忘掉时间轴。**换曲边界用它** |
+| `0x03` | `CMD_RESET` 清事件队列 + 复位 IC#（100 ms 脉冲，只在开程序时用一次） |
 | `0x20` | `CMD_BOOTSEL` |
 
 ## 源码结构
@@ -187,6 +193,27 @@ Core 0，互不影响。
 | `tools/rpfm_link.[ch]` | `RPFM_Player/src/rpfm_hid.cpp` 改 C，增加 SID 事件批处理 |
 | `tools/rpfm_sid.c` | `../src/spfmplayer.c` 换传输层（骨架、播放列表、键盘、libsidplayfp 录制全部沿用） |
 | `scripts/build_host.sh` | 复用仓库 `build/*.o` 与 `third_party/local/lib` 静态库 |
+
+### 诊断小工具（`rp2350/tools/`，都不发声、不改固件）
+
+计时类问题不能靠猜，这几个工具各自只量一个数：
+
+| 工具 | 量什么 | 用法 |
+|---|---|---|
+| `hidbench.c` | 主机这一端每秒能推多少 64 字节帧 | `hidbench.exe 1` → 本机 6846 帧/s = 10.2 万事件/s |
+| `wbench.c` | 板子连续写寄存器的极限 | `wbench.exe 4000` → 18.9 µs/写 = 5.3 万写/s |
+| `qprobe.c` | 固件上报的队列水位是不是真的 | `qprobe.exe`（推 2000 条应报 2000，推到 1.2 万应饱和在 8191） |
+| `drainprobe.c` | 一段真实事件的实际播放速率 vs 文件本身 | `drainprobe.exe <file.sidvgm> <起始ms> <条数>` |
+| `pairprobe.c` | 播放列表里"第 2 首"的开头是否赶拍子 | `pairprobe.exe <A.sidvgm> <B.sidvgm> 1200` |
+| `gapsprobe.c` | 静音后接密集段，鼓的间距是否保住 | `gapsprobe.exe` |
+| `liveprobe.c` | 走 libsidplayfp 实时路径时队列深度曲线 | `liveprobe.exe <file.sid> 0 12` |
+| `lsfpdump.c` | 把实时 `.sid` 的事件流导成文本，和 `.sidvgm` 逐条 diff | `lsfpdump.exe <file.sid> 0 6` |
+
+一次编译全部（先跑过 `scripts/build_host.sh`，它提供 `.o` 和静态库）：
+
+```bash
+bash rp2350/scripts/build_probes.sh
+```
 
 ## 踩过的坑
 
@@ -216,6 +243,21 @@ Core 0，互不影响。
    两件事必须分开调。
 10. **没有预填就开始播 = 开头赶拍子。** RPFM 的 Phase 1 先填 1/4 buffer 再发
     START，Phase 2 才边推边播。不做这一步，头几百个事件按 USB 到达速度执行。
+11. **`CMD_SID_START` 必须重开时间轴，否则只有第一首是对的。** 固件的 deadline
+    是绝对时间；第二首预填的事件在"上一首的 deadline"之后全是过期事件，于是
+    整段预填按总线速度灌出去。用 `build/pairprobe.exe` 量过：同一首开头 999 ms
+    的音乐，第一首用 1101 ms 播完，接着播第二首只用了 439 ms —— 这就是"只有
+    `turboutrun_s01` 这种单曲很完美、`sidvgm` 全目录开头赶拍子"的全部原因。
+12. **换曲要用 `CMD_SID_STOP (0x35)`，不能用 `CMD_RESET`。** RESET 是 100 ms 的
+    IC# 脉冲，每首之间来一次会卡；STOP 只关闸门 + 丢队列 + 重锚时钟。
+    主机的 `sched_reset()` 在预填之前发它，并补一遍清寄存器（播放列表原本发的
+    那次清寄存器会被 STOP 一起丢掉）。
+13. **队列空的时候不能让时钟继续跑。** 一首曲子里可以静音几秒再突然来一段
+    密集 `$D418`（Giana RSID 第一秒 79 次写，之后三秒几乎不写，然后每秒 7247
+    次）。队列空着时 deadline 追不上墙钟，等那批事件到了全都"过期"，板子就按
+    总线速度（15 条/285 µs）灌，而不是 137 µs 一条 —— 听感就是鼓声退化成噪音。
+    所以 `sid_q_pop()` 失败且墙钟已超过 deadline 20 ms 时，把 deadline 重锚到
+    "现在"。间距（音符本身）完全不变，只是原点移动，而那段是静音。
 
 ## 双核与流控
 
@@ -247,13 +289,22 @@ Phase 2: 继续推，buffer > 50% 就等
 ```
 
 这里对应的是 `CMD_SID_START (0x34)`：固件有 `s_sid_running` 闸门，
-没收到 START 前 Core 1 一个事件都不消费；主机先灌 `PRE_FILL = 1500` 条
-（8192 的不到 1/5），再发 START，音乐时钟也在这时锚定。
+没收到 START 前 Core 1 一个事件都不消费；主机先预填，再发 START，
+固件在这条命令里把时间轴原点重锚到"现在"。
+
+预填的判据是**音乐时间 + 事件数两个都要满足**（`prefill_more()`：
+≥800 ms 且 ≥1500 条，上限 6000 条 / 6 s）。只用事件数不够：Giana RSID
+第一秒只写 79 次，1500 条要到 4 秒以后，那时它的 digi 段正好开始，队列
+只剩 39 条——`build/liveprobe.exe` 实测。队列中途见底 = 后面那段鼓按总线
+速度播。两个都满足时，4 秒的 6502 模拟只花约 0.25 秒主机时间，而且板子的
+闸门还关着，听众不会等。
+
 **没有这个预填，第一个 audio 块就是"按 USB 到达速度执行"**——听感就是开头
 一两秒赶拍子。这是 RPFM 早就解决的问题。
 
 单写者约定照 RPFM 的 `ring_buf.h`：head 只在 Core 0 写，tail 只在 Core 1 写，
-所以不需要锁。`CMD_RESET` 也因此只置一个请求位，由 Core 1 自己清队列。
+所以不需要锁。`CMD_RESET` / `CMD_SID_STOP` 也因此只置一个请求位（外加一个
+队列截断位置），由 Core 1 自己清队列。
 
 ## 时序参数
 

@@ -48,6 +48,7 @@ bool rpfm_link_is_open(void);
 #define CMD_SID_WRITE  0x32
 #define CMD_SID_STEP   0x33
 #define CMD_SID_START  0x34
+#define CMD_SID_STOP   0x35
 
 /* Raw frame. `plen` is the payload length, at most 60. */
 bool rpfm_link_send(uint8_t cmd, const uint8_t *payload, uint8_t plen,
@@ -58,6 +59,12 @@ bool rpfm_link_bootsel(void);        /* CMD_BOOTSEL: hands-free flashing */
 bool rpfm_set_phi2(int ntsc);        /* CMD_PHI2 */
 bool rpfm_set_sid_step(int hold);    /* CMD_SID_STEP: data-phase hold, 1..32 PHI2 periods */
 bool rpfm_sid_start(void);           /* CMD_SID_START: release the playback gate */
+bool rpfm_sid_stop(void);            /* CMD_SID_STOP: shut the gate, drop the
+                                      * queue, forget the timeline. The track
+                                      * boundary command - no IC# pulse, so it
+                                      * is fast enough to use between two files
+                                      * of a playlist. Always follow it with a
+                                      * prefill and then rpfm_sid_start(). */
 
 /* Events queued in the firmware, read through the control endpoint. Returns
  * 0 when the board is not answering. */

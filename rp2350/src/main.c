@@ -430,6 +430,12 @@ static bool     s_sid_need_anchor = true;    // next event becomes the clock ori
  * the deadline and write nothing. */
 #define SID_EV_WAIT_ONLY 0xFF
 
+/* How far wall time may run past the deadline on an empty queue before the
+ * timeline is re-anchored onto the present. One PAL video frame is 19.95 ms and
+ * a digi burst is one write every ~137 us, so a gap of 20 ms is silence, never
+ * a note. See the starved branch in core1_sid_main(). */
+#define SID_STARVE_GRACE_US 20000
+
 static inline bool sid_q_push(uint16_t dt, uint8_t addr, uint8_t data) {
     uint32_t next = (s_sid_q_head + 1) & (SID_Q_SIZE - 1);
     if (next == s_sid_q_tail) return false;
@@ -466,6 +472,17 @@ static volatile bool s_sid_running = false;
 
 /* Reset request, raised by the HID callback on Core 0 and serviced by Core 1. */
 static volatile bool s_sid_reset_req = false;
+
+/* Stop request: shut the gate, drop what is still queued, forget the timeline.
+ * Lightweight - no IC# pulse - so it can run at every track boundary.
+ *
+ * The event head is written by Core 0 only, so Core 0 records where the queue
+ * ended at the moment the stop was parsed and Core 1 truncates *to that mark*.
+ * Core 1 must not simply cut to its own current head: the host starts pushing
+ * the next tune's prefill immediately after the stop frame, and cutting to the
+ * live head would throw that prefill away. */
+static volatile bool     s_sid_stop_req = false;
+static volatile uint32_t s_sid_stop_mark = 0;
 
 static void sid_q_request_clear(void) {
     s_sid_reset_req = true;
@@ -631,8 +648,30 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
     case CMD_SID_START: {
         /* Release the gate. RPFM's CMD_VGM_START equivalent: the host has filled
          * part of the queue, so playback can begin with a full buffer behind it
-         * instead of racing the first few hundred events. */
+         * instead of racing the first few hundred events.
+         *
+         * It also starts a NEW timeline, because the host only sends this after
+         * pre-filling the beginning of a tune (t=0). Without that, track 2 of a
+         * playlist inherits track 1's absolute deadline: by the time the new
+         * prefill is popped, wall time is already seconds past it, so not one
+         * of the ~1500 prefilled events waits - the opening 1.2 s of music gets
+         * dumped at bus speed in ~30 ms. That is the "first second or two is
+         * played too fast" report, and it only ever appeared in a playlist (a
+         * single file is preceded by CMD_RESET, which anchors for it).
+         *
+         * Anchoring works exactly as on a fresh tune: dt==0 events are init and
+         * run immediately, the first non-zero delta sets the origin to "now". */
+        s_sid_deadline = 0;
+        s_sid_need_anchor = true;
         s_sid_running = true;
+        break;
+    }
+    case CMD_SID_STOP: {
+        /* Track boundary: close the gate, drop whatever is still queued and
+         * forget the timeline. Core 1 owns the queue tail, so it does the
+         * work; the mark tells it how far to cut. */
+        s_sid_stop_mark = s_sid_q_head;
+        s_sid_stop_req = true;
         break;
     }
     case CMD_SID_STEP: {
@@ -713,6 +752,18 @@ static void core1_sid_main(void) {
             continue;
         }
 
+        /* Stop requests: drop the backlog and forget the timeline, but leave the
+         * chip alone. This is what a track boundary needs; CMD_RESET also
+         * pulses IC# and is far too slow to do between two files of a
+         * playlist. */
+        if (s_sid_stop_req) {
+            s_sid_stop_req = false;
+            s_sid_q_tail = s_sid_stop_mark;
+            s_sid_need_anchor = true;
+            s_sid_running = false;
+            continue;
+        }
+
         /* Nothing is consumed until the host says the queue is prefilled. This
          * is RPFM's CMD_VGM_START: fill first, then play. */
         if (!s_sid_running) {
@@ -721,6 +772,26 @@ static void core1_sid_main(void) {
         }
 
         if (!sid_q_pop(&ev)) {
+            /* Starved: nothing to play. Do not let the music clock run away.
+             *
+             * A tune can be silent for seconds and then fire a dense $D418 digi
+             * burst (Great Giana Sisters RSID writes 79 registers in its first
+             * second, nothing much for three more, then 7247 per second). While
+             * the queue is empty the deadline cannot advance, so wall time
+             * passes it. When the burst finally arrives every event's deadline
+             * is already in the past and the board writes each HID batch
+             * back-to-back at bus speed (15 writes in 285 us) instead of at the
+             * 137 us spacing that is the drum. That is the "digi turns to mush"
+             * report, and it is the same failure as a rushed opening.
+             *
+             * Re-anchor onto the present once the gap is real (> 20 ms, well
+             * over one video frame). The next event then gets its full delta
+             * measured from now, so the *spacing* the recorder intended is kept
+             * even though the absolute origin moved. Only the origin moves: a
+             * gap that long is silence, so nothing audible shifts. */
+            if (!s_sid_need_anchor &&
+                time_us_64() > s_sid_deadline + SID_STARVE_GRACE_US)
+                s_sid_deadline = time_us_64();
             tight_loop_contents();
             continue;
         }

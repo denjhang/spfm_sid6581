@@ -175,6 +175,12 @@ bool rpfm_sid_start(void)
     return rpfm_link_send(CMD_SID_START, NULL, 0, NULL);
 }
 
+bool rpfm_sid_stop(void)
+{
+    rpfm_sid_stream_begin();
+    return rpfm_link_send(CMD_SID_STOP, NULL, 0, NULL);
+}
+
 uint16_t rpfm_link_queue_level(void)
 {
     if (s_handle == INVALID_HANDLE_VALUE) return 0;

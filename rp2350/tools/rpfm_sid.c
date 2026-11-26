@@ -79,12 +79,43 @@
  * backpressure above 50%. That is why the original has no start-of-tune
  * instability.
  *
- * Same here, sized in events: push PRE_FILL events with no clock running, then
- * CMD_SID_START, then continue with the normal paced loop. The board's queue is
- * 8192 entries, so 1500 is under a fifth - the same proportion RPFM uses - and
- * it is roughly what a digi tune emits in 150 ms, which is the window its own
- * player runs ahead of the wire. */
-#define PRE_FILL 1500
+ * A count alone is not enough here. Several tunes open with seconds of near
+ * silence and only then start a $D418 digi burst (Great Giana Sisters RSID
+ * writes 79 registers in its first second, then 7247 in the next one), so
+ * "1500 events" would mean pre-filling 4 seconds of music for those and 1.2 s
+ * for others. Prefill therefore runs until BOTH a minimum span of music and a
+ * minimum number of events are queued, so whatever the opening looks like the
+ * board never meets a burst with an empty queue. The span cap keeps the wait
+ * bounded for a tune that is silent for a very long time.
+ *
+ * It costs almost nothing on the live path: six seconds of 6502 emulation is
+ * tens of milliseconds of host time, paid once per track. */
+#define PRE_FILL_MIN_MS  800.0
+#define PRE_FILL_EVENTS  1500
+#define PRE_FILL_MAX_MS  6000.0
+#define PRE_FILL_MAX_EV  6000    /* must stay well under the 8191 queue */
+
+/* Should the prefill stop here?
+ *
+ * Both bounds must be met, not "whichever comes first". Measured with
+ * build/liveprobe.exe, a count-only prefill hands the board 1.2 s of music for a
+ * normal tune but only 400 ms for one that opens with silence: Great Giana
+ * Sisters RSID writes 79 registers in its first second and 7247 in the next, so
+ * "1500 events" is four seconds of music there and the queue bottoms out at 39
+ * entries right where its digi burst starts. A queue that runs dry mid-tune
+ * makes the next burst play at bus speed instead of at its own spacing, which
+ * for a $D418 digi is the difference between drums and mush.
+ *
+ * The cost is host time only, and it happens while the board is still gated:
+ * 4 s of 6502 emulation is about a quarter of a second (30 s of music records
+ * in 1.2 s), and the board then starts at t=0, so nothing is played late. */
+static int prefill_more(double span_ms, size_t count)
+{
+    if (count >= PRE_FILL_MAX_EV) return 0;
+    if (span_ms >= PRE_FILL_MAX_MS) return 0;
+    if (span_ms >= PRE_FILL_MIN_MS && count >= PRE_FILL_EVENTS) return 0;
+    return 1;
+}
 
 /* Backpressure, same proportion as RPFM's "wait if firmware buffer is > 50% of
  * target": stop pushing above half the queue and resume once it has drained to
@@ -253,6 +284,28 @@ static unsigned s_frames_since_poll = 0;
 
 static void sched_reset(void)
 {
+    /* Close the previous track's gate before anything of the new one is queued.
+     *
+     * Without this, track 2 inherits track 1's absolute deadline in the
+     * firmware: the host only paces events against *its own* start stamp, and
+     * the board's deadline from the previous tune is already seconds in the
+     * past, so every prefill event fires back-to-back at bus speed. Measured
+     * with build/pairprobe.exe: track 1's opening 999 ms of music played in
+     * 1001 ms, track 2's in 439 ms. That is the "first second or two rushed"
+     * report and it is why a $D418 digi opening turns to mush.
+     *
+     * CMD_SID_STOP drops the old backlog and makes the board re-anchor its
+     * clock on the first event with a non-zero delta - the same rule a fresh
+     * tune has always used. CMD_RESET would do it too, but it pulses IC# for
+     * 100 ms, which is far too slow for a boundary between two files.
+     *
+     * The register clear goes out after the stop on purpose: the playlist sends
+     * one before calling us, and the stop discards it along with the rest of the
+     * backlog. Re-sending it here puts the clear at the head of the new tune's
+     * queue, so the chip is silent from the moment playback resumes. */
+    rpfm_sid_stop();
+    hw_clear_regs();
+
     s_start_us  = rpfm_now_us();
     s_pushed_us = 0;
     s_frames_since_poll = 0;
@@ -385,12 +438,14 @@ static int replay_buffer(const sid_event_t *ev, size_t n, int *key)
     size_t total = 0;
     while (total < n && ev[total].t_ms <= limit_ms) total++;
 
-    /* Prefill: hand the board PRE_FILL events with no clock of any kind, then
-     * release the gate. This is RPFM's "Phase 1: Pre-fill firmware buffer before
-     * starting timer" - the whole point is that playback never starts against an
-     * empty buffer, which is what made the first second of a tune run fast. */
+    /* Prefill: hand the board the opening of the tune with no clock of any kind,
+     * then release the gate. This is RPFM's "Phase 1: Pre-fill firmware buffer
+     * before starting timer" - the whole point is that playback never starts
+     * against an empty buffer, which is what made the first second of a tune
+     * run fast. See prefill_more() for why it is measured in music time as
+     * well as events. */
     size_t i = 0;
-    for (; i < total && i < PRE_FILL; i++) {
+    for (; i < total && prefill_more(ev[i].t_ms, i); i++) {
         int rc = push_raw((int64_t)(ev[i].t_ms * 1000.0 / opt.speed + 0.5),
                           ev[i].reg, ev[i].val);
         if (rc) { *key = 'q'; s_interrupt = 'q'; return -1; }
@@ -482,14 +537,15 @@ static int play_live_lsfp(const char *path, int subsong, sid_song_info_t *out,
     double limit_ms = opt.seconds > 0.0 ? opt.seconds * 1000.0 : 1e18;
 
     /* Prefill before starting, exactly as the buffer path does. For a live
-     * stream that means priming with the init writes plus enough frames to reach
-     * PRE_FILL events (or one second of music, whichever comes first) - the
-     * board must never begin a tune against an empty queue. */
+     * stream that means priming with the init writes plus enough frames to
+     * satisfy prefill_more() - the board must never begin a tune against an
+     * empty queue, and a tune that opens with silence then a digi burst needs
+     * the span bound rather than an event count. */
     size_t primed = 0;
     double primed_ms = 0.0;
-    while (primed < PRE_FILL && primed_ms < 1000.0) {
+    while (prefill_more(primed_ms, primed)) {
         if (sid_lsfp_stream_next(s, &ev, &n) != 0) break;
-        for (size_t i = 0; i < n && primed < PRE_FILL; i++) {
+        for (size_t i = 0; i < n; i++) {
             int rc = push_raw((int64_t)(ev[i].t_ms * 1000.0 / opt.speed + 0.5),
                               ev[i].reg, ev[i].val);
             if (rc) { sid_lsfp_stream_close(s); *key = 'q'; return -1; }
@@ -582,9 +638,9 @@ static int play_live_native(const char *path, int subsong, sid_song_info_t *out,
     /* Prefill before starting, same as the other two paths. */
     size_t primed = 0;
     double primed_ms = 0.0;
-    while (primed < PRE_FILL && primed_ms < 1000.0) {
+    while (prefill_more(primed_ms, primed)) {
         if (sid_stream_next_frame(&ev, &n) != 0) break;
-        for (size_t i = 0; i < n && primed < PRE_FILL; i++) {
+        for (size_t i = 0; i < n; i++) {
             int rc = push_raw((int64_t)(ev[i].t_ms * 1000.0 / opt.speed + 0.5),
                               ev[i].reg, ev[i].val);
             if (rc) { sid_stream_close(); *key = 'q'; return -1; }
