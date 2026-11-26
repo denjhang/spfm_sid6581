@@ -148,8 +148,8 @@ static inline void cs_select(uint8_t slot) {
 // costs ~120 us of PIO time, so pushing one per write would eat the timing
 // budget the whole design exists to protect.
 
-#define WS_TICK_MS      20      /* meter refresh */
-#define WS_LATCH_US    400      /* reset time between frames */
+#define WS_TICK_MS      20      /* meter refresh; also the frame gap, which is
+                                 * 60x the 280 us latch time the strip needs */
 #define WS_MAX_LEVEL   0x18     /* per-channel ceiling; 0x18 is the value that
                                  * was accepted by eye, 0x28+ was too bright */
 
@@ -232,19 +232,20 @@ static void ws_sid_activity(uint8_t addr, uint8_t data)
     }
 }
 
-/* Push one frame and then hold the line idle long enough for the strip to
- * latch it. Without the gap two frames blur together and individual LEDs
- * appear to light at random.
+/* Push one frame. This is byte-for-byte RPFM's ws2812_update() (src/rpfm/
+ * main.c:121) - no waiting, no latch delay, four words and return.
  *
- * The order matters: pio_sm_put_blocking only waits for FIFO space, so the bits
- * are still shifting when it returns. Waiting for the FIFO to empty and then
- * for the reset period puts the 300 us where the datasheet wants it - after the
- * last bit has actually gone out. */
+ * An earlier version added a busy_wait_us_32() busy loop here and that is the
+ * regression that made the strip sit on its first LED: the PIO is still
+ * shifting the last word when this returns, and stalling the *main loop* (which
+ * is also what feeds tud_task() and the SID event queue) buys nothing, because
+ * the reset gap the strip needs is already there - led_update() only calls this
+ * once every WS_TICK_MS, which is 20 ms, sixty times longer than the 280 us the
+ * datasheet asks for. Spacing the frames, not blocking inside one, is how RPFM
+ * and led_test.c both do it, and both work on this board. */
 static void ws2812_update(void) {
     for (int i = 0; i < NUM_WS_LEDS; i++)
         pio_sm_put_blocking(s_ws_pio, s_ws_sm, s_ws_leds[i] << 8u);
-    while (!pio_sm_is_tx_fifo_empty(s_ws_pio, s_ws_sm)) {}
-    busy_wait_us_32(WS_LATCH_US);
 }
 
 static inline void ws_led_off_all(void);
@@ -419,10 +420,11 @@ static inline void write_reg_sid(uint8_t addr, uint8_t data) {
     if (s_ws_ready) ws_sid_activity(a, data);
 }
 
-/* Reset leaves volume (0x18) at 0, so nothing is audible without a host write. */
+/* Reset leaves volume (0x18) at 0. Every C64 tune's init writes $D418, so the
+ * host stream supplies the volume; leaving it at 0 here is what keeps a bare
+ * board silent. */
 static void sid_clear_all(void) {
     for (uint8_t r = 0x00; r <= 0x18; r++) write_reg_sid(r, 0x00);
-    write_reg_sid(0x18, 0x0F);
 }
 
 /* There used to be a boot-time arpeggio/chord self-test here. It is gone: the
@@ -736,7 +738,14 @@ int main() {
                 if (ev.dt_us) {
                     s_sid_deadline += ev.dt_us;
                     while (time_us_64() < s_sid_deadline) {
+                        /* led_update() has to run here too. The queue is fed
+                         * hundreds of ms ahead, so this wait is where the loop
+                         * spends most of its time during playback; leaving it
+                         * out froze the LEDs on whatever picture was composed
+                         * before the first batch drained. That was the
+                         * "stuck on the first LED" report. */
                         tud_task();
+                        led_update();
                     }
                 }
                 if (ev.addr != SID_EV_WAIT_ONLY)
