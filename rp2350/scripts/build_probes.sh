@@ -44,3 +44,9 @@ $CC $CFLAGS -c -o build/lsfpdump.o rp2350/tools/lsfpdump.c
 $CXX -o build/lsfpdump.exe build/lsfpdump.o build/sid_rsid.o build/sid_lsfp.o \
     $LS_LIBS -static -lwinmm
 echo "built build/lsfpdump.exe"
+
+# Ground truth: the spacing libsidplayfp produces before any container.
+$CC $CFLAGS -c -o build/realprobe.o rp2350/tools/realprobe.c
+$CXX -o build/realprobe.exe build/realprobe.o build/sid_rsid.o build/sid_lsfp.o \
+    $LS_LIBS -static -lwinmm
+echo "built build/realprobe.exe"

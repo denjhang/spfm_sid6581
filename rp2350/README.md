@@ -103,21 +103,62 @@ cd E:\working\zcode-projects\spfm_sid6581
 .\build\rpfm_sid.exe sidvgm\turboutrun              # 整个文件夹连播
 .\build\rpfm_sid.exe "sidvgm\atmos.sidvgm" --seconds 60
 .\build\rpfm_sid.exe sid\games                      # .sid 直接用 libsidplayfp 跑
-.\build\rpfm_sid.exe sidvgm\turboutrun --step 10    # 扫总线步进时间
+.\build\rpfm_sid.exe "sid\rsid\RoboCop_3.sid" --hold 6   # 缩短写入窗口
 ```
 
 关键部分：
 
-- **`.sid` 走 libsidplayfp**（它自己的 6502/VIC/CIA），不是内置 fake6502。
-  CIA 定时器和 `$D418` 数字鼓在帧内写寄存器，只有 libsidplayfp 会如实报告。
+- **`.sid` 一律实时流式播放**，中间不经过 `.sidvgm`。libsidplayfp 给出的是
+  **PHI1 周期级**的时间戳，写进任何容器都要先量化到那个容器的时间基，
+  实时路径没有这一步，所以拿到的是引擎能给出的最细精度。
+  `--seconds` 在实时循环里生效（到了就停），不再先录完整段再回放。
+- **`.sidvgm` 是另一回事**：它借 VGM 的容器（44100 Hz tick），时间戳只能是
+  1/44100 s 的整数倍，**这是量化后的下限 22.676 µs，不是 SID 真实间隔的下限**。
+  实测真实间隔可以细到 4.06 µs（4 个 PHI2 周期）。所以同一个曲子用 `.sid`
+  播放比用 `.sidvgm` 播放时间精度更高。
 - **时钟由曲子的 region 决定**：板子收到 `CMD_PHI2` 后切 985248 / 1022727 Hz。
 - **时间戳在事件里**：主机把每个写连同 µs 增量一起推给板子，板子按绝对
   deadline 执行。所以 USB 抖动不影响发声时刻。
 - `--pad` / `--digi` / `--proto` 全部**不存在**——它们是为 1.5 Mbaud UART 补时序的，
   这里每个事件自带微秒时间戳，没有线速问题。
-- **`--step US`**（1–20，默认 20）改总线每步时间。一次写 7 步，所以 20 µs
-  = 140 µs/写。这个默认值是从 YM2413 抄的保守值，不是 SID 实测值，压下去
-  写密度上限直接提高。
+
+### `--hold N` —— 唯一能改写入间隔的参数
+
+一次寄存器写在总线上是 `hold + 5` 个 PHI2 周期（地址相 3 字 + 数据相 hold 字
++ 释放 1 字 + 空闲 1 字），所以
+
+```
+单写耗时 = 1.65 µs（固定开销）+ (hold + 5) × 1.015 µs（PAL 一个周期）
+```
+
+| `--hold` | 单写耗时 | 说明 |
+|---|---|---|
+| 1 | 7.73 µs | 窗口只有 1.015 µs，SID 来不及锁存，**digi 会变噪音** |
+| 4 | 10.78 µs | 接近 Edge of Disgrace / Arkanoid 的 4 周期真实间隔 |
+| 6 | 12.81 µs | ≈ Golden Axe / Turbo Outrun 的 6 周期（6.09 µs） |
+| 8 | 14.84 µs | |
+| **12** | **18.90 µs** | **默认，上机确认 digi 正常** |
+| 16 | 22.96 µs | 超过 22.676 µs，`.sidvgm` 的 1-tick 连发开始被压 |
+| 32 | 39.20 µs | 上限 |
+
+`hold` 越大，`/CS` 低电平窗口越长（越容易锁存成功），但单写越慢，
+密集段落就越容易被压成等距。**这是唯一一个"窗口长度"和"时间精度"直接
+对冲的旋钮**，也是 digi 音质的关键：上一版 hold=1 时鼓声退化成噪音，
+改成 12 就正常了。
+
+给硬件测试用的比对基准（真实 PHI2 周期数，由 libsidplayfp 原始流算出）：
+
+| 曲子 | 最小真实间隔 | 折合 PHI2 周期 |
+|---|---|---|
+| Edge of Disgrace | 4.060 µs | 4.00 |
+| Arkanoid | 4.060 µs | 4.00 |
+| Golden Axe | 6.090 µs | 6.00 |
+| Turbo Outrun | 6.090 µs | 6.00 |
+| RoboCop 3 | 9.135 µs | 9.00 |
+
+`hold=1` 时单写 7.73 µs，仍比 4.06 / 6.09 慢，所以**现有总线的理论下限
+就够不到最密的那些段落**。要真正复现 4 周期间隔，得取消地址相的 3 个字
+（即直驱，见审计文档）。
 
 ## 板载 WS2812：写入密度表
 
@@ -226,6 +267,7 @@ Core 0，互不影响。
 | `gapsprobe.c` | 静音后接密集段，鼓的间距是否保住 | `gapsprobe.exe` |
 | `liveprobe.c` | 走 libsidplayfp 实时路径时队列深度曲线 | `liveprobe.exe <file.sid> 0 12` |
 | `lsfpdump.c` | 把实时 `.sid` 的事件流导成文本，和 `.sidvgm` 逐条 diff | `lsfpdump.exe <file.sid> 0 6` |
+| `realprobe.c` | **libsidplayfp 原始写间隔**（未经 `.sidvgm` 量化），判断真实时间精度 | `realprobe.exe <file.sid> 20` |
 
 一次编译全部（先跑过 `scripts/build_host.sh`，它提供 `.o` 和静态库）：
 

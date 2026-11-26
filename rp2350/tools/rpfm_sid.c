@@ -138,8 +138,9 @@ static struct {
     int    subsong;        /* -1 = the file's default */
     int    use_lsfp;       /* 1 = libsidplayfp recorder, 0 = built-in 6502 */
     int    loop;           /* buffered streams: -1 = forever (the default) */
+    int    hold;           /* CMD_SID_STEP, 0 = leave the firmware default (12) */
 } opt = {
-    0, 0.0, 1.0, -1, 1, -1
+    0, 0.0, 1.0, -1, 1, -1, 0
 };
 
 /* ------------------------------------------------------------------ */
@@ -153,6 +154,10 @@ static int hw_connect(void)
         fprintf(stderr, "rpfm_sid_player not found (VID=2E8A PID=1090)\n");
         return -1;
     }
+    /* Apply --hold once, before the first write of the session. The firmware
+     * keeps the value across CMD_RESET and CMD_SID_STOP, so it survives every
+     * track change. */
+    if (opt.hold > 0) rpfm_set_sid_step(opt.hold);
     return 0;
 }
 
@@ -783,29 +788,14 @@ static int play_file(const char *path, int *key)
 
     hw_set_clock(&probe);
 
-    if (opt.seconds > 0.0) {
-        /* Bounded: record the whole span up front and replay it. */
-        sid_event_t *ev = NULL;
-        size_t n = 0;
-        char err[160];
-        int rc;
-        printf("  recording %.1f s...\n", opt.seconds);
-        fflush(stdout);
-        rc = opt.use_lsfp
-           ? sid_lsfp_extract(path, subsong, opt.seconds, &ev, &n, &probe,
-                              err, sizeof err)
-           : sid_song_extract(path, subsong, opt.seconds, &ev, &n, &probe,
-                              err, sizeof err);
-        if (rc != 0) {
-            fprintf(stderr, "  recording failed: %s\n", err);
-            return 2;
-        }
-        printf("  %lu writes, playing\n", (unsigned long)n);
-        rc = replay_buffer(ev, n, key);
-        sid_song_free(ev);
-        return rc;
-    }
-
+    /* Always stream live through libsidplayfp. There is no "record first, then
+     * replay" step for a .sid: the recorder gives timestamps in PHI1 cycles and
+     * a round trip through any container would quantise them, and the whole
+     * point of this path is the finest timing the engine can produce.
+     *
+     * --seconds is handled inside the live loop (it stops after N seconds of
+     * music), so a bounded listen no longer pays for recording the whole span
+     * before the first note. */
     return opt.use_lsfp ? play_live_lsfp(path, subsong, NULL, key)
                         : play_live_native(path, subsong, NULL, key);
 }
@@ -1112,6 +1102,13 @@ static void usage(void)
     printf("  --seconds N     stop after N seconds (the only way to end a track)\n");
     printf("  --subsong N     subsong, 0-based (default: the file's own)\n");
     printf("  --speed X       playback rate (default 1.0)\n");
+    printf("  --hold N        data-phase hold in PHI2 periods, 1..32 (default 12).\n");
+    printf("                  This is the knob that sets the cost of one write:\n");
+    printf("                    cost = 1.65 us + (N + 5) * 1.015 us\n");
+    printf("                    N=12 -> 18.9 us   N=6 -> 12.8 us   N=1 -> 7.7 us\n");
+    printf("                  Smaller N lets dense passages keep their real\n");
+    printf("                  spacing, but the /CS low window shrinks with it;\n");
+    printf("                  below ~6 the chip starts dropping writes.\n");
     printf("  --loop N        buffered stream repeats: -1 = for ever (default)\n");
     printf("  --engine E      .sid recorder: lsfp (default) | native\n");
     printf("                  lsfp   = libsidplayfp: digi drums and the real\n");
@@ -1135,6 +1132,13 @@ static int parse_args(int argc, char **argv, const char **path, int *list_only,
         else if (!strcmp(a, "--speed") && i + 1 < argc)   opt.speed = atof(argv[++i]);
         else if (!strcmp(a, "--subsong") && i + 1 < argc) opt.subsong = atoi(argv[++i]);
         else if (!strcmp(a, "--loop") && i + 1 < argc)    opt.loop = atoi(argv[++i]);
+        else if (!strcmp(a, "--hold") && i + 1 < argc) {
+            opt.hold = atoi(argv[++i]);
+            if (opt.hold < 1 || opt.hold > 32) {
+                fprintf(stderr, "--hold must be 1..32 PHI2 periods\n");
+                return -1;
+            }
+        }
         else if (!strcmp(a, "--from") && i + 1 < argc)    *from_idx = atoi(argv[++i]);
         else if (!strcmp(a, "--engine") && i + 1 < argc) {
             const char *e = argv[++i];
