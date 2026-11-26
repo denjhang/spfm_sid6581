@@ -1,6 +1,7 @@
 # rp2350 —— SID 6581 控制器固件（RP2350A）
 
-> 2026-11-25。**里程碑：RP2350A 直接驱动 SID 6581 出声成功。**
+> 2026-11-26。**实时播放已达标**：双核 + 环形队列 + 水位线反压之后，
+> Turbo Outrun（4500 写/秒）连续播完全程不掉音、不拖慢。
 
 这是 SPFM 方案的替代品。SPFM 协议的帧内时序上限（见 [../docs/SPFM时序精度上限.md](../docs/SPFM时序精度上限.md)）
 由 RP2350A 自己生成总线时序解决——主机只送带微秒时间戳的事件，抖动到不了芯片。
@@ -9,12 +10,14 @@
 
 | 项 | 状态 |
 |---|---|
-| RP2350A → 2× 74LVC245 → 374/02/32 → SID 6581 | ✅ **出声**（四音琶音已确认） |
-| PHI2 由 PIO 生成 985 248 Hz（PAL） | ✅ 已验证 |
+| RP2350A → 2× 74LVC245 → 374/02/32 → SID 6581 | ✅ 出声 |
+| PHI2 由 PIO 生成 985 248 Hz（PAL）/ 1 022 727（NTSC） | ✅ 已验证 |
 | 自动烧录（HID `CMD_BOOTSEL`） | ✅ 每次都用，不用按按钮 |
-| 上电自检（密集琶音+和弦+噪声鼓） | ✅ |
-| `.sidreg` 事件流播放（`tools/sid_stream.exe`） | ✅ 已跑通 8079 事件 / 10 秒 |
-| **`.sidvgm` / `.sid` 播放（`rpfm_sid.exe`）** | ✅ **已上机确认声音正常** |
+| **`.sidvgm` / `.sid` 实时播放（`rpfm_sid.exe`）** | ✅ **4500 写/秒不掉音、不拖慢** |
+| 双核：Core 1 跑总线，Core 0 只剩 USB | ✅ |
+| 水位线反压（队列 >6000 条就等） | ✅ |
+| 4 颗 WS2812 写入密度表 | ✅ 亮度已确认 |
+| `.sidreg` 事件流播放（`tools/sid_stream.exe`） | ✅ 早期工具，保留 |
 
 ## 硬件
 
@@ -77,6 +80,7 @@ cd E:\working\zcode-projects\spfm_sid6581
 .\build\rpfm_sid.exe sidvgm\turboutrun              # 整个文件夹连播
 .\build\rpfm_sid.exe "sidvgm\atmos.sidvgm" --seconds 60
 .\build\rpfm_sid.exe sid\games                      # .sid 直接用 libsidplayfp 跑
+.\build\rpfm_sid.exe sidvgm\turboutrun --step 10    # 扫总线步进时间
 ```
 
 关键部分：
@@ -85,9 +89,12 @@ cd E:\working\zcode-projects\spfm_sid6581
   CIA 定时器和 `$D418` 数字鼓在帧内写寄存器，只有 libsidplayfp 会如实报告。
 - **时钟由曲子的 region 决定**：板子收到 `CMD_PHI2` 后切 985248 / 1022727 Hz。
 - **时间戳在事件里**：主机把每个写连同 µs 增量一起推给板子，板子按绝对
-  deadline 执行。主机只负责把队列保持在 400 ms 以内，所以 USB 抖动不影响发声时刻。
+  deadline 执行。所以 USB 抖动不影响发声时刻。
 - `--pad` / `--digi` / `--proto` 全部**不存在**——它们是为 1.5 Mbaud UART 补时序的，
   这里每个事件自带微秒时间戳，没有线速问题。
+- **`--step US`**（1–20，默认 20）改总线每步时间。一次写 7 步，所以 20 µs
+  = 140 µs/写。这个默认值是从 YM2413 抄的保守值，不是 SID 实测值，压下去
+  写密度上限直接提高。
 
 ## 板载 WS2812：写入密度表
 
@@ -130,11 +137,15 @@ RPFM 原版其实**完全没有亮度控制**：`ws_led_on()` 直接把 `cs_colo
    往里面塞 `busy_wait_us_32()` 会卡住主循环，而主循环还要喂 `tud_task()`
    和 SID 事件队列。
 
-**等 deadline 的那个 `while` 里也必须调 `led_update()`。** 播放时主循环
-大半时间耗在那里，只调 `tud_task()` 的话灯会停在第一批事件合成出来的画面上。
+**灯和播放现在在不同核上，这条不再需要了。** 分核之前，播放的 deadline 等待
+就在 Core 0 主循环里，那个 `while` 必须顺带调 `led_update()`，否则灯会停在
+第一批事件的画面上。现在 `write_reg_sid()` 在 Core 1，`led_update()` 在
+Core 0，互不影响。
 
 灯的刷新在 `led_update()` 里 20 ms 一拍合成，**不在 `write_reg_sid()` 里**——
-后者最高约 800 次/秒，而一次 `ws2812_update()` 要占 PIO 约 120 µs。
+后者峰值 4500 次/秒，而一次 `ws2812_update()` 要占 PIO 约 120 µs。
+`write_reg_sid()` 只把计数加到 `s_ws_hits[]`（Core 1 写、Core 0 读，所以是
+`volatile`）。
 
 ## 上电行为
 
@@ -150,6 +161,7 @@ RPFM 原版其实**完全没有亮度控制**：`ws_led_on()` 直接把 `cs_colo
 | `0x30` | `CMD_SID_EVENTS` `[dt_lo,dt_hi,addr,data] × N` 带时间戳；`addr=0xFF` = 只等待不写 |
 | `0x32` | `CMD_SID_WRITE` `[addr,data] × N` 立即写 |
 | `0x31` | `CMD_PHI2` `[0=PAL/1=NTSC]` |
+| `0x33` | `CMD_SID_STEP` `[1..20]` 总线每步 µs |
 | `0x03` | `CMD_RESET` 清事件队列 + 复位 IC# |
 | `0x20` | `CMD_BOOTSEL` |
 
@@ -162,9 +174,10 @@ RPFM 原版其实**完全没有亮度控制**：`ws_led_on()` 直接把 `cs_colo
 |---|---|
 | `src/spfm_bus.pio` | 13 位 → 11 位（A1/A2 不用）；`autopull` 关掉 |
 | `src/pio_cs.pio` | `autopull` 关掉 |
-| `src/main.c` | 引脚号（CS 12 / DIR 11 / PHI2 14 / WS2812 16）、`phi2_init()`、`write_reg_sid()`、琶音自检、SID 事件队列 |
+| `src/main.c` | 引脚号（CS 12 / DIR 11 / PHI2 14 / WS2812 16）、`phi2_init()`、`write_reg_sid()`、SID 事件队列与 Core 1 播放循环、WS2812 密度表 |
 
 `src/phi2.pio` 是新增的，抄自 USBSID-Pico 的 `src/pio/clock.pio`（用 `set pins` 而不是 sideset）。
+`src/ring_buf.h`、`src/command_buffer.h`、`src/vgm_player.h` 与 RPFM 逐字节相同。
 
 主机侧：
 
@@ -186,8 +199,13 @@ RPFM 原版其实**完全没有亮度控制**：`ws_led_on()` 直接把 `cs_colo
    每两个推送的字丢一个。现在 `autopull=false`。
 3. **`pio_sm_put_blocking` 打向未使能的 SM 会永久阻塞**，卡死在 `main()`，
    USB 从不枚举 → BOOTSEL 发不进去。WS2812 输出前有 `s_ws_ready` 闸门。
-4. **播放循环里必须调 `tud_task()`**，否则 USB 协议栈停摆。
+4. **播放循环所在的那一核必须定期跑 `tud_task()`**，否则 USB 协议栈停摆。
+   现在播放搬到了 Core 1，Core 0 专职跑 `tud_task()`，这个约束自然满足。
 5. **PHI2 用 `set pins` 不用 sideset。** 抄 USBSID-Pico 的 `clock.pio`。
+6. **单核跑播放会拖慢。** 4500 写/秒 × 140 µs = 单核超过 60%，密集帧 100%+，
+   必然饿死 `tud_task()`。分核之后才实时——这是最后才找对的一条。
+7. **队列满了是静默丢事件。** `sid_q_push()` 返回 false 但没人看，听起来就是
+   "拖慢 + 掉音"。水位线必须当反压用。
 
 ## 双核与流控
 
