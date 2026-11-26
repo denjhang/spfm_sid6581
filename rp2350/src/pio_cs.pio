@@ -1,11 +1,17 @@
 ; pio_cs.pio - Chip select PIO driver (2-bit)
 ;
-; GPIO mapping (2 consecutive pins starting at base_pin=13):
-;   GPIO13: CS0# (active low)
-;   GPIO14: CS1# (active low)
+; GPIO mapping (2 consecutive pins starting at base_pin=12, see PIN_CS_BASE):
+;   GPIO12: CS0# (active low)
+;   GPIO13: CS1# (active low, spare)
 ;
 ; 2-bit word: bit[0]=CS0#, bit[1]=CS1#
 ; 1=idle (high), 0=selected (low)
+;
+; NOTE: write_reg_sid() calls cs_select(0) before every write and never returns
+; the line to CS_IDLE, so CS0# is a constant 0 for the whole session. In the
+; 374/02/32 logic TRIG_n = !A0 | /WR | CSn, so with CSn stuck low the CS term
+; drops out entirely. Harmless with one SID fitted, but it means this line is
+; not selecting anything - see docs/直驱还是锁存_RP2350接SID审计.md.
 
 .program cs_out
 

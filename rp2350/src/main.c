@@ -366,7 +366,10 @@ static volatile uint32_t s_sid_hold = SID_HOLD_CYCLES_DEFAULT;
  *   idle     bus released
  *
  * CS0# is held low for the whole session, so TRIG_n = !A0 | /WR | 0 needs both
- * A0 and /WR low, i.e. only the data-phase pulse writes the chip.
+ * A0 and /WR low, i.e. only the data-phase pulse writes the chip. That also
+ * means the CS term is doing no work: cs_select(0) is called but never undone,
+ * so this pin is a constant. Kept because the board is wired that way;
+ * docs/直驱还是锁存_RP2350接SID审计.md measures what removing it would buy.
  *
  * No host sleep anywhere: the state machine waits for a PHI2 edge before
  * releasing each word (spfm_bus.pio), so every interval is a whole number of
