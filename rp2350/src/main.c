@@ -119,130 +119,103 @@ static inline void cs_select(uint8_t slot) {
     pio_cs_put(s_cs_pio, s_cs_sm, cs_pack(slot));
 }
 
-// ========== WS2812: SID activity meter ==========
+// ========== WS2812: write-density meter ==========
 //
-// Four LEDs, one per thing a listener can hear:
+// Four LEDs, one per SID voice, each with a FIXED colour, brightness driven by
+// how many register writes that voice received in the last tick:
 //
-//     LED0 voice 1    LED1 voice 2    LED2 voice 3    LED3 $D418
+//     LED0 voice 1 green   LED1 voice 2 blue   LED2 voice 3 yellow   LED3 $D418 red
 //
-// A voice's hue is its waveform, so the bass channel on pulse reads yellow and
-// an arpeggio on saw reads blue; its brightness is the gate, so a note looks
-// like a blink and a rest looks dark. $D418 tracks the volume nibble and
-// flashes on every write to it - the nibble barely moves during a digi drum,
-// the write rate is what moves, so the flash is what makes the drum visible.
+// This is RPFM's own assignment (src/rpfm/main.c:42):
 //
-// Two rules come straight from the working led_test.c in this tree:
+//     0x006600  0x000066  0x666600  0x660000
 //
-//   1. Colour order is GRB, not RGB: the 24-bit word shifts out green first.
-//      urgb_u32() is copied verbatim from there. Writing a "green" 0x00RR00
-//      without it lights RED instead, which is exactly the kind of thing that
-//      makes a meter look broken.
-//   2. Frames need a gap. The PIO shifts bits with no idle between words, so
-//      two frames pushed back-to-back merge and the strip latches garbage -
-//      the "cannot light one particular LED" symptom. WS_LATCH_US is >280 us
-//      (the reset time the datasheet asks for) and the whole update is rate
-//      limited so the main loop cannot outrun it.
+// How to read those literals: the PIO shifts left / MSB-first with a 24-bit
+// autopull threshold (ws2812.pio, `sm_config_set_out_shift(&c, false, true, 24)`),
+// and every word is pushed as `value << 8`, so the FIRST byte on the wire is
+// bits 23:16 of the value. A WS2812 wants green first, therefore the literal is
+// 0x00GGRRBB - high byte green, middle red, low blue - and RPFM's four values
+// are green, blue, yellow, red in exactly that order. urgb_u32() below is
+// pico-examples' helper and makes the packing explicit.
 //
-// Everything is composed in led_update() on a 20 ms tick rather than inside
-// write_reg_sid(). That function runs at up to ~800 writes/s and each frame
-// costs ~120 us of PIO time, so pushing one per write would eat the timing
-// budget the whole design exists to protect.
+// How RPFM drives them (the thing to copy): ws_led_on(slot) writes
+// cs_colors[slot] verbatim and arms a 50 ms timer; ws_led_off_all() clears the
+// strip when it expires. So the original has NO brightness control at all - one
+// fixed literal per LED, on or off. What is added here is only the middle
+// ground: instead of on/off, the same fixed colour is shown at a level that
+// follows the write count. Nothing is ever mixed, so no LED can drift toward
+// white.
+//
+// Brightness ceiling: led_test.c in this tree uses 0x18 and says so ("流水灯压到
+// 0x18 左右不刺眼"), but that was with one or two LEDs lit at a time. Here all
+// four can be lit at once, so the ceiling is LED_MAX below and it is applied
+// unconditionally to every channel of every LED on every frame - there is no
+// path that can exceed it, and no addition that can stack past it.
+//
+// Two rules kept from RPFM and from led_test.c:
+//
+//   1. ws2812_update() pushes four words and returns. It does NOT wait. The
+//      frame gap the strip needs (>=280 us) comes from led_update() being called
+//      every WS_TICK_MS = 20 ms, sixty times longer than that. Blocking inside
+//      the function stalls the main loop, which feeds tud_task() and the SID
+//      event queue.
+//   2. led_update() must also be called from the deadline wait loop in main(),
+//      because during playback that loop is where the CPU actually sits.
 
-#define WS_TICK_MS      20      /* meter refresh; also the frame gap, which is
-                                 * 60x the 280 us latch time the strip needs */
-#define WS_MAX_LEVEL   0x18     /* per-channel ceiling; 0x18 is the value that
-                                 * was accepted by eye, 0x28+ was too bright */
+#define WS_TICK_MS      20      /* meter refresh = frame gap */
+#define LED_MAX         0x10    /* hard per-channel ceiling, all four lit at once */
+#define LED_FULL_HITS   6       /* writes per tick that mean "full brightness" */
 
 /* SID register bits the LED layer needs. The firmware does not link
  * src/sid6581.c (that is the SPFM host driver), so the handful of constants it
  * shares are repeated here rather than pulling in the whole header. */
-#define SID_REG_MODE_VOL   0x18
-#define SID_VOLUME_MASK    0x0F
-#define SID_CTL_GATE       0x01
-#define SID_CTL_TRI        0x10
-#define SID_CTL_SAW        0x20
-#define SID_CTL_PULSE      0x40
-#define SID_CTL_NOISE      0x80
+#define SID_REG_FILT_LO 0x15    /* 0x15..0x18 are the filter/volume block */
 
-/* GRB packing, copied from rp2350/src/led_test.c where it is verified on this
- * board. Every colour below goes through this. */
+/* 0x00GGRRBB, pico-examples' urgb_u32(): green in bits 23:16 because that byte
+ * goes out first. */
 static uint32_t urgb_u32(uint8_t r, uint8_t g, uint8_t b) {
     return ((uint32_t)g << 16) | ((uint32_t)r << 8) | (uint32_t)b;
 }
 
-/* Waveform -> colour word (GRB packed). Index order matches wave_index(). */
-static uint32_t s_wave_col[4];
-
-#define WS_FLASH_VOICE 0x080808u
-#define WS_FLASH_VOL   0x0A0A0Au
-
-static uint8_t  s_voice_ctl[3];      /* last CONTROL write per voice */
-static uint32_t s_voice_flash[3];    /* addend that decays after each write */
-static uint8_t  s_vol_val;           /* last $D418 volume nibble */
-static uint32_t s_vol_flash;
+/* Fixed hue per LED, RPFM's order: green, blue, yellow, red. */
+static uint32_t s_ws_col[4];
+static uint16_t s_ws_hits[4];        /* writes seen since the last tick */
+static uint8_t  s_ws_level[4];       /* level currently shown, 0..LED_MAX */
 static absolute_time_t s_ws_tick = {0};
 
-static uint32_t ws_scale(uint32_t rgb, uint32_t num, uint32_t den)
+/* The only place a level becomes a colour. Clamps each channel to LED_MAX, so
+ * the ceiling holds no matter what the caller computed. */
+static uint32_t ws_frame(uint32_t col, uint32_t level)
 {
-    uint32_t r = ((rgb >> 16) & 0xFF) * num / den;
-    uint32_t g = ((rgb >>  8) & 0xFF) * num / den;
-    uint32_t b = ( rgb        & 0xFF) * num / den;
-    return (r << 16) | (g << 8) | b;
+    if (level > LED_MAX) level = LED_MAX;
+    uint32_t g = ((col >> 16) & 0xFF) * level / LED_MAX;
+    uint32_t r = ((col >>  8) & 0xFF) * level / LED_MAX;
+    uint32_t b = ( col        & 0xFF) * level / LED_MAX;
+    if (g > LED_MAX) g = LED_MAX;
+    if (r > LED_MAX) r = LED_MAX;
+    if (b > LED_MAX) b = LED_MAX;
+    return (g << 16) | (r << 8) | b;
 }
 
-static uint32_t ws_add(uint32_t a, uint32_t b)
-{
-    uint32_t r = ((a >> 16) & 0xFF) + ((b >> 16) & 0xFF);
-    uint32_t g = ((a >>  8) & 0xFF) + ((b >>  8) & 0xFF);
-    uint32_t bl = (a        & 0xFF) + (b        & 0xFF);
-    if (r > WS_MAX_LEVEL) r = WS_MAX_LEVEL;
-    if (g > WS_MAX_LEVEL) g = WS_MAX_LEVEL;
-    if (bl > WS_MAX_LEVEL) bl = WS_MAX_LEVEL;
-    return (r << 16) | (g << 8) | bl;
-}
-
-/* SID waveform bits are not exclusive; when two are set the chip combines
- * them, and visually the brighter one wins. Noise and pulse are the two that
- * carry a drum, so they get priority over saw/triangle. */
-static int wave_index(uint8_t ctl)
-{
-    if (ctl & SID_CTL_NOISE) return 3;
-    if (ctl & SID_CTL_PULSE) return 2;
-    if (ctl & SID_CTL_SAW)   return 1;
-    return 0;
-}
-
-/* Called by write_reg_sid() for every write that reached the chip. */
+/* Called by write_reg_sid() for every write that reached the chip. Only counts;
+ * the picture is composed in led_update(). */
 static void ws_sid_activity(uint8_t addr, uint8_t data)
 {
-    if (addr == SID_REG_MODE_VOL) {
-        s_vol_val = (uint8_t)(data & SID_VOLUME_MASK);
-        s_vol_flash = WS_FLASH_VOL;
-        return;
+    (void)data;
+    if (addr > 0x18) return;
+
+    int led;
+    if (addr >= SID_REG_FILT_LO) {
+        led = 3;                   /* filter + volume block */
+    } else {
+        led = addr / 7;            /* 0x00-0x06 v1, 0x07-0x0D v2, 0x0E-0x14 v3 */
+        if (led > 2) led = 2;
     }
-    /* A voice's CONTROL register is base + 4 where base = voice * 7, so the
-     * three are 0x04, 0x0B, 0x12. These are NOT congruent mod 8 (0x0B & 7 == 3),
-     * which an earlier version assumed and which silently left voice 2 dead. */
-    for (int v = 0; v < 3; v++) {
-        if (addr == (uint8_t)(v * 7 + 4)) {
-            s_voice_ctl[v] = data;
-            s_voice_flash[v] = WS_FLASH_VOICE;
-            return;
-        }
-    }
+    if (s_ws_hits[led] < 0xFFFF) s_ws_hits[led]++;
 }
 
-/* Push one frame. This is byte-for-byte RPFM's ws2812_update() (src/rpfm/
- * main.c:121) - no waiting, no latch delay, four words and return.
- *
- * An earlier version added a busy_wait_us_32() busy loop here and that is the
- * regression that made the strip sit on its first LED: the PIO is still
- * shifting the last word when this returns, and stalling the *main loop* (which
- * is also what feeds tud_task() and the SID event queue) buys nothing, because
- * the reset gap the strip needs is already there - led_update() only calls this
- * once every WS_TICK_MS, which is 20 ms, sixty times longer than the 280 us the
- * datasheet asks for. Spacing the frames, not blocking inside one, is how RPFM
- * and led_test.c both do it, and both work on this board. */
+/* Four words, then return - byte for byte RPFM's ws2812_update(). See rule 1
+ * above for why nothing waits here. */
 static void ws2812_update(void) {
     for (int i = 0; i < NUM_WS_LEDS; i++)
         pio_sm_put_blocking(s_ws_pio, s_ws_sm, s_ws_leds[i] << 8u);
@@ -255,12 +228,16 @@ static void ws2812_init(void) {
     s_ws_sm = pio_claim_unused_sm(s_ws_pio, true);
     ws2812_program_init(s_ws_pio, s_ws_sm, offset, PIN_WS2812, 800000, false);
 
-    s_wave_col[0] = urgb_u32(0, WS_MAX_LEVEL, 0);              /* triangle green  */
-    s_wave_col[1] = urgb_u32(0, 0, WS_MAX_LEVEL);              /* sawtooth blue   */
-    s_wave_col[2] = urgb_u32(WS_MAX_LEVEL, WS_MAX_LEVEL, 0);   /* pulse    yellow */
-    s_wave_col[3] = urgb_u32(WS_MAX_LEVEL, 0, 0);              /* noise    red    */
+    s_ws_col[0] = urgb_u32(0, LED_MAX, 0);              /* green  */
+    s_ws_col[1] = urgb_u32(0, 0, LED_MAX);              /* blue   */
+    s_ws_col[2] = urgb_u32(LED_MAX, LED_MAX, 0);        /* yellow */
+    s_ws_col[3] = urgb_u32(LED_MAX, 0, 0);              /* red    */
 
-    for (int i = 0; i < NUM_WS_LEDS; i++) s_ws_leds[i] = 0;
+    for (int i = 0; i < NUM_WS_LEDS; i++) {
+        s_ws_leds[i] = 0;
+        s_ws_hits[i] = 0;
+        s_ws_level[i] = 0;
+    }
     ws2812_update();
     s_ws_tick = make_timeout_time_ms(WS_TICK_MS);
 }
@@ -302,25 +279,6 @@ static void phi2_init(void) {
     s_phi_ready = true;
 }
 
-/* SID register bits the LED layer needs. The firmware does not link
- * src/sid6581.c (that is the SPFM host driver), so the handful of constants it
- * shares are repeated here rather than pulling in the whole header. */
-#define SID_REG_MODE_VOL   0x18
-#define SID_VOLUME_MASK    0x0F
-#define SID_CTL_GATE       0x01
-#define SID_CTL_TRI        0x10
-#define SID_CTL_SAW        0x20
-#define SID_CTL_PULSE      0x40
-#define SID_CTL_NOISE      0x80
-
-/* Nothing to light when the tune is silent; decay the write flashes instead. */
-static void ws_decay(void)
-{
-    for (int i = 0; i < 3; i++)
-        if (s_voice_flash[i]) s_voice_flash[i] -= s_voice_flash[i] / 3 + 1;
-    if (s_vol_flash) s_vol_flash -= s_vol_flash / 3 + 1;
-}
-
 static void led_update(void)
 {
     /* Heartbeat on the plain LED, unchanged. */
@@ -333,28 +291,20 @@ static void led_update(void)
     if (!time_reached(s_ws_tick)) return;
     s_ws_tick = make_timeout_time_ms(WS_TICK_MS);
 
-    ws_decay();
-
-    uint32_t want[NUM_WS_LEDS];
-
-    for (int v = 0; v < 3; v++) {
-        uint8_t ctl = s_voice_ctl[v];
-        uint32_t c = s_wave_col[wave_index(ctl)];
-        /* Gate off = dark: a release tail is inaudible on an LED, and a
-         * constant glow would make every channel look permanently on. */
-        uint32_t body = (ctl & SID_CTL_GATE) ? c : 0;
-        want[v] = ws_add(body, s_voice_flash[v]);
-    }
-
-    /* $D418: brightness follows the volume nibble, flashes on each write. The
-     * drum barely moves this nibble, so without the flash a digi passage looks
-     * like a steady dim light. */
-    want[3] = ws_add(ws_scale(0xFFFFFFu, (uint32_t)s_vol_val * WS_MAX_LEVEL,
-                              15u), s_vol_flash);
-
+    /* Level is this tick's write count, scaled so LED_FULL_HITS writes means
+     * full. It holds for one tick and then drops: a note that is still being
+     * driven keeps its brightness because the voice keeps receiving writes,
+     * and an idle voice goes dark on the next tick. No accumulation, so there
+     * is nothing that can creep upward. */
     int changed = 0;
     for (int i = 0; i < NUM_WS_LEDS; i++) {
-        if (s_ws_leds[i] != want[i]) { s_ws_leds[i] = want[i]; changed = 1; }
+        uint32_t lvl = (uint32_t)s_ws_hits[i] * LED_MAX / LED_FULL_HITS;
+        if (lvl > LED_MAX) lvl = LED_MAX;
+        s_ws_hits[i] = 0;
+        s_ws_level[i] = (uint8_t)lvl;
+
+        uint32_t want = lvl ? ws_frame(s_ws_col[i], lvl) : 0;
+        if (s_ws_leds[i] != want) { s_ws_leds[i] = want; changed = 1; }
     }
     if (changed && s_ws_ready) ws2812_update();
 }
