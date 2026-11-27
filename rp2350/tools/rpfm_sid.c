@@ -56,7 +56,7 @@
 #endif
 
 #define PLAYER_NAME    "RPFM SID Player"
-#define PLAYER_VERSION "1.5"
+#define PLAYER_VERSION "1.6"
 
 /* How far ahead of the wall clock the host may run. The board's event queue is
  * 8192 entries, and the densest SID tune in this collection peaks at about
@@ -186,7 +186,11 @@ static void hw_clear_regs(void)
  * CMD_SID_STOP, and that drops the queue. So mute = STOP (drop the backlog,
  * close the gate), then queue the clear, then START so the board executes it.
  * The clear is all dt==0, so START's "first non-zero delta anchors the clock"
- * rule runs it immediately and leaves the chip silent with an empty queue. */
+ * rule runs it immediately and leaves the chip silent with an empty queue.
+ *
+ * The firmware services STOP and START on Core 1 in that order (both are
+ * requests), so a START can no longer overtake a STOP and leave the clear
+ * stranded. */
 static void hw_mute(void)
 {
     if (opt.dry_run) return;
@@ -194,6 +198,38 @@ static void hw_mute(void)
     rpfm_sid_stream_begin();
     hw_clear_regs();
     rpfm_sid_start();
+}
+
+/* Leaving the program: IC# pulse, queue cleared, every register zeroed.
+ *
+ * hw_mute() is enough to stop the sound, but it leaves the chip powered with
+ * its own state. On the way out there is nothing to be fast for, so ask for the
+ * real thing: CMD_RESET makes Core 1 drop the queue, pulse IC# for 100 ms and
+ * write all 25 registers to zero. Without this a board left connected after a
+ * quit could keep a stuck envelope or a DC offset on the output.
+ *
+ * The pulse happens on Core 1, so give it time to finish before the handle is
+ * closed - once the HID handle is gone the host would never learn whether the
+ * reset ran. */
+static void hw_shutdown(void)
+{
+    if (opt.dry_run) return;
+    rpfm_sid_stop();
+    rpfm_sid_stream_begin();
+    rpfm_link_reset();
+#ifdef _WIN32
+    Sleep(250);
+#else
+    usleep(250000);
+#endif
+    /* The reset zeroed the queue; make sure it really did. */
+    for (int i = 0; i < 20 && rpfm_link_queue_level() != 0; i++) {
+#ifdef _WIN32
+        Sleep(10);
+#else
+        usleep(10000);
+#endif
+    }
 }
 
 /* The tune's own region decides the clock the board generates. A PAL tune on a
@@ -1092,6 +1128,7 @@ static int run_playlist(const char *dir, int start_idx)
     }
 
     printf("\nplaylist end\n");
+    hw_shutdown();
     hw_disconnect();
     free(files);
     return 0;
@@ -1315,7 +1352,7 @@ int main(int argc, char **argv)
         }
     }
 
-    hw_mute();
+    hw_shutdown();
     hw_disconnect();
     return (rc == 2) ? 1 : 0;
 }

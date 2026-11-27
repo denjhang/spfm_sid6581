@@ -487,6 +487,26 @@ static volatile bool s_sid_reset_req = false;
 static volatile bool     s_sid_stop_req = false;
 static volatile uint32_t s_sid_stop_mark = 0;
 
+/* Start request. This used to be applied by Core 0 inside the HID callback,
+ * which was a race: STOP is only a flag that Core 1 services later, so if
+ * START ran first Core 1 would then take the stop branch and set
+ * s_sid_running back to false - closing the gate it had just opened and
+ * stranding whatever the host pushed after the stop. That is the "press q and
+ * the notes keep ringing" report: the host's mute is STOP, clear, START, and
+ * the clear is what got stranded.
+ *
+ * Making START a request too puts every control transition on Core 1, which
+ * services reset -> stop -> start in that order in a single pass. The host's
+ * frames always arrive in that order, so the end state is well defined. */
+static volatile bool s_sid_start_req = false;
+
+/* Is a control transition pending? Checked in the deadline wait so a stop is
+ * not delayed by a long inter-event gap (a tune can leave tens of ms between
+ * two writes, and Core 1 would otherwise sit in that spin loop). */
+static inline bool sid_ctrl_pending(void) {
+    return s_sid_reset_req || s_sid_stop_req || s_sid_start_req;
+}
+
 static void sid_q_request_clear(void) {
     s_sid_reset_req = true;
 }
@@ -663,10 +683,11 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
          * single file is preceded by CMD_RESET, which anchors for it).
          *
          * Anchoring works exactly as on a fresh tune: dt==0 events are init and
-         * run immediately, the first non-zero delta sets the origin to "now". */
-        s_sid_deadline = 0;
-        s_sid_need_anchor = true;
-        s_sid_running = true;
+         * run immediately, the first non-zero delta sets the origin to "now".
+         *
+         * Raised as a request rather than applied here so it cannot overtake a
+         * pending STOP (see s_sid_start_req). */
+        s_sid_start_req = true;
         break;
     }
     case CMD_SID_STOP: {
@@ -744,9 +765,15 @@ static void core1_sid_main(void) {
 
     for (;;) {
         /* Reset requests are serviced here so head/tail stay single-writer. A
-         * track change must not replay the previous tune's backlog. */
+         * track change must not replay the previous tune's backlog.
+         *
+         * A reset supersedes any stop or start still pending: the stop mark was
+         * recorded before the reset cleared the queue, so applying it afterwards
+         * would move the tail backwards and resurrect discarded events. */
         if (s_sid_reset_req) {
             s_sid_reset_req = false;
+            s_sid_stop_req = false;
+            s_sid_start_req = false;
             s_sid_q_tail = s_sid_q_head;
             s_sid_need_anchor = true;
             s_sid_running = false;
@@ -764,6 +791,20 @@ static void core1_sid_main(void) {
             s_sid_q_tail = s_sid_stop_mark;
             s_sid_need_anchor = true;
             s_sid_running = false;
+            continue;
+        }
+
+        /* Start requests, always after the stop above: the host sends
+         * STOP -> clear -> START, so servicing them in this order means the
+         * clear lands on a queue that is already empty and the gate that opens
+         * lasts. Applying START on Core 0 instead let it run before this stop,
+         * which then closed the gate again and stranded the clear - the chip
+         * kept the old volume and the notes rang on after quitting. */
+        if (s_sid_start_req) {
+            s_sid_start_req = false;
+            s_sid_deadline = 0;
+            s_sid_need_anchor = true;
+            s_sid_running = true;
             continue;
         }
 
@@ -824,11 +865,19 @@ static void core1_sid_main(void) {
         if (ev.dt_us) {
             s_sid_deadline += ev.dt_us;
             while (time_us_64() < s_sid_deadline) {
+                /* A stop or start must not wait out a long gap between two
+                 * events - a tune can leave tens of ms of silence and the user
+                 * pressing q expects the chip to go quiet now. Drop this event
+                 * instead of writing it early: a pending request only ever
+                 * means "close the gate", and firing one last note on the way
+                 * out is exactly what the mute is trying to avoid. */
+                if (sid_ctrl_pending()) goto next_pass;
                 tight_loop_contents();
             }
         }
         if (ev.addr != SID_EV_WAIT_ONLY)
             write_reg_sid(ev.addr, ev.data);
+    next_pass:;
     }
 }
 

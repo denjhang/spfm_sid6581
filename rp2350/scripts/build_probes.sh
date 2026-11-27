@@ -21,7 +21,7 @@ LS_LIBS="$LS_DIR/lib/libsidplayfp.a $LS_DIR/lib/libresidfp.a"
 mkdir -p build
 
 # Hardware-only probes: just the HID link.
-for t in hidbench wbench qprobe gapsprobe; do
+for t in hidbench wbench qprobe gapsprobe mutebench; do
     $CC $CFLAGS -o "build/$t.exe" "rp2350/tools/$t.c" rp2350/tools/rpfm_link.c \
         -lsetupapi -lhid
     echo "built build/$t.exe"
