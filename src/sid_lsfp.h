@@ -35,9 +35,12 @@ int sid_lsfp_available(void);
  * default), `events` is malloc'd and released with sid_song_free().
  *
  * Timestamps come from libsidplayfp's event scheduler (PHI1 clock), converted
- * with the tune's own clock, and are measured from the end of the first
- * emulated frame. Everything the driver's init routine wrote lands there
- * (t=0), which is the same convention the other two recorders use. */
+ * with the tune's own clock, and are measured from the tune's first register
+ * write (t=0). Only the silence *before* that write is dropped - the chip has
+ * not been written yet, so it cannot be sounding. The gap between the end of
+ * the init routine and the first play() call is kept, because init leaves
+ * oscillators gated and the volume set, so the reference player sounds through
+ * it. See find_play_origin() in sid_lsfp.cpp. */
 int sid_lsfp_extract(const char *path, int subsong, double seconds,
                      sid_event_t **events, size_t *count,
                      sid_song_info_t *info, char *err, size_t errlen);

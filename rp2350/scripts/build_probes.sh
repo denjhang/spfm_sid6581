@@ -50,3 +50,30 @@ $CC $CFLAGS -c -o build/realprobe.o rp2350/tools/realprobe.c
 $CXX -o build/realprobe.exe build/realprobe.o build/sid_rsid.o build/sid_lsfp.o \
     $LS_LIBS -static -lwinmm
 echo "built build/realprobe.exe"
+
+# Timeline probes: what t=0 is, and whether the board's deadline arithmetic
+# matches the recorder when the queue never runs dry.
+for t in originprobe firstev; do
+    $CC $CFLAGS -c -o "build/$t.o" "rp2350/tools/$t.c"
+    $CXX -o "build/$t.exe" "build/$t.o" build/sid_rsid.o build/sid_lsfp.o \
+        $LS_LIBS -static -lwinmm
+    echo "built build/$t.exe"
+done
+
+$CC $CFLAGS -c -o build/deadsim.o rp2350/tools/deadsim.c
+$CXX -o build/deadsim.exe build/deadsim.o build/sid_rsid.o build/sid_lsfp.o \
+    $LS_LIBS -static -lwinmm
+echo "built build/deadsim.exe"
+
+# Render OUR event list through reSIDfp, so a waveform diff against
+# build/lsfpref.exe measures timeline error and nothing else.
+$CC $CFLAGS -c -o build/replaywav.o rp2350/tools/replaywav.c
+$CXX -o build/replaywav.exe build/replaywav.o build/sid_rsid.o build/sid_lsfp.o \
+    $LS_LIBS -static -lwinmm
+echo "built build/replaywav.exe"
+
+# live stream vs a recorded .sidvgm, event by event.
+$CC $CFLAGS -c -o build/cmpfirst.o rp2350/tools/cmpfirst.c
+$CXX -o build/cmpfirst.exe build/cmpfirst.o build/sid_rsid.o build/sid_lsfp.o \
+    build/sidvgm.o $LS_LIBS -static -lwinmm
+echo "built build/cmpfirst.exe"

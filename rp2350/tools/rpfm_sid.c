@@ -56,7 +56,7 @@
 #endif
 
 #define PLAYER_NAME    "RPFM SID Player"
-#define PLAYER_VERSION "1.4"
+#define PLAYER_VERSION "1.5"
 
 /* How far ahead of the wall clock the host may run. The board's event queue is
  * 8192 entries, and the densest SID tune in this collection peaks at about
@@ -178,9 +178,22 @@ static void hw_clear_regs(void)
     rpfm_link_send(CMD_SID_WRITE, p, n, NULL);
 }
 
+/* Silence the chip *now*, even when seconds of music are still queued.
+ *
+ * A register clear on its own is just more events: it lands behind the backlog
+ * and only plays when that drains, which is exactly why 'q' kept sounding for a
+ * second while 'n' stopped instantly - the next track's sched_reset() sends
+ * CMD_SID_STOP, and that drops the queue. So mute = STOP (drop the backlog,
+ * close the gate), then queue the clear, then START so the board executes it.
+ * The clear is all dt==0, so START's "first non-zero delta anchors the clock"
+ * rule runs it immediately and leaves the chip silent with an empty queue. */
 static void hw_mute(void)
 {
+    if (opt.dry_run) return;
+    rpfm_sid_stop();
+    rpfm_sid_stream_begin();
     hw_clear_regs();
+    rpfm_sid_start();
 }
 
 /* The tune's own region decides the clock the board generates. A PAL tune on a

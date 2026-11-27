@@ -173,16 +173,34 @@ void resolve_clock(const SidTuneInfo *ti, int *pal, double *clock_hz,
     *vsync_hz  = is_pal ? 50.125 : 60.0;
 }
 
-/* The first play burst is separated from the tail of init by most of a frame.
- * Everything up to that point is state the player must have before t=0, so it
- * is stamped 0 rather than dropped. */
+/* t=0 is the FIRST register write, not the first play burst.
+ *
+ * This used to be "the first gap longer than half a frame", on the theory that
+ * the gap separates the driver's init from the first play() call and that
+ * everything before it is setup state, so it could be collapsed onto t=0.
+ *
+ * Collapsing it is a real time shift, not a relabelling: the init leaves
+ * oscillators gated, envelopes running and the volume set, so the gap is not
+ * silent in the reference player. Measured against build/lsfpref.exe (same
+ * reSIDfp, so the only difference is the timeline), collapsing the gap moves
+ * the whole tune earlier by exactly that gap:
+ *
+ *   tune                init gap    offset vs reference audio   correlation
+ *   Great Giana Sisters   17.07 ms        17.14 ms                0.992
+ *   Commando              14.32 ms        14.69 ms                0.961
+ *   Guns'n'Ghosts         52.65 ms        54.74 ms                0.946
+ *   Galencia              14.83 ms        14.97 ms                0.730
+ *
+ * With t=0 at the first write the same comparison lands at +0.07 ms and
+ * correlation rises (Giana 0.992). The audible symptom of the collapsed gap is
+ * exactly the report "the first note of the Giana RSID is slightly rushed".
+ *
+ * Only the pre-first-write silence is dropped, and that part really is silent:
+ * the chip has had no writes, so it cannot be making sound. */
 double find_play_origin(const capture_t *cap, double frame_cycles, double total)
 {
+    (void)frame_cycles;
     if (cap->n == 0) return total;
-    for (size_t i = 1; i < cap->n; i++) {
-        if (cap->cyc[i] - cap->cyc[i - 1] > frame_cycles * 0.5)
-            return cap->cyc[i];
-    }
     return cap->cyc[0];
 }
 
@@ -460,40 +478,28 @@ int sid_lsfp_stream_next(sid_lsfp_stream_t *s, const sid_event_t **ev, size_t *n
 
     const double ms_per_cycle = 1000.0 / s->clock_hz;
 
-    /* First call: run until the init burst has ended and the first play burst
-     * has been seen, then hand back everything up to that point as t=0. */
+    /* First call: advance until the tune has written something, then hand back
+     * everything from that first write on, stamped from it. Same origin rule as
+     * find_play_origin(): t=0 is the first register write, so the gap between
+     * the end of init and the first play() call stays in the timeline instead
+     * of being collapsed. */
     if (!s->started) {
-        /* The origin is the first gap of more than half a frame; the init
-         * writes are everything before it. Some inits are not quick: R-Type
-         * spends ~160 ms there, so the search has to run well past three
-         * frames or it gives up and shifts the whole tune by that stall. One
-         * second of 6502 is a few tens of milliseconds of host time, paid
-         * once at open. */
         const double search_limit = s->clock_hz * 1.0;
-        while (s->origin < 0.0) {
+        while (s->cap.n == 0) {
             if ((double)s->run > search_limit) {
-                /* No recognisable gap (a tune that writes throughout init).
-                 * Treat the start of the stream as t=0 and let the frame grid
-                 * fall where it falls; timing is still monotonic. */
-                s->origin = s->cap.n ? s->cap.cyc[0] : 0.0;
+                /* Nothing at all in the first second: treat the start of the
+                 * stream as t=0; timing is still monotonic. */
+                s->origin = 0.0;
                 break;
             }
-            double found = -1.0;
-            for (size_t i = 1; i < s->cap.n; i++) {
-                if (s->cap.cyc[i] - s->cap.cyc[i - 1] > s->frame_cycles * 0.5) {
-                    found = s->cap.cyc[i];
-                    break;
-                }
-            }
-            if (found >= 0.0) { s->origin = found; break; }
             if (stream_advance(s, 5000u) != 0) {
                 /* The tune halted during init. Return what we have, once. */
-                s->origin = 0.0;
+                s->origin = s->cap.n ? s->cap.cyc[0] : 0.0;
                 s->finished = 1;
                 break;
             }
         }
-        if (s->origin < 0.0) s->origin = 0.0;
+        if (s->origin < 0.0) s->origin = s->cap.n ? s->cap.cyc[0] : 0.0;
 
         s->out.clear();
         size_t i = 0;
