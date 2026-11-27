@@ -56,7 +56,7 @@
 #endif
 
 #define PLAYER_NAME    "RPFM SID Player"
-#define PLAYER_VERSION "1.6"
+#define PLAYER_VERSION "1.7"
 
 /* How far ahead of the wall clock the host may run. The board's event queue is
  * 8192 entries, and the densest SID tune in this collection peaks at about

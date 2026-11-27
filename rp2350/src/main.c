@@ -164,10 +164,10 @@ static inline void cs_select(uint8_t slot) {
 
 #define WS_TICK_MS      20      /* meter refresh = frame gap */
 #define LED_MAX         0x10    /* hard per-channel ceiling, all four lit at once */
-/* Writes per 20 ms tick that mean "full brightness". The bus is PHI2-clocked
- * now, so a tick can carry hundreds of writes where it used to carry a handful;
- * 24 = 1200 writes/s for one voice is a hard-driven channel, and the densest
- * tune (4500/s across all four) pins the busiest LED at full. */
+/* Writes per 20 ms tick that mean "full brightness" on the red LED. The bus is
+ * PHI2-clocked, so a tick can carry hundreds of writes where it used to carry a
+ * handful; 24 = 1200 writes/s into the filter/volume block is a hard-driven digi
+ * passage, and the densest tune (4500/s across all four) pins it at full. */
 #define LED_FULL_HITS   24
 
 /* SID register bits the LED layer needs. The firmware does not link
@@ -183,13 +183,42 @@ static uint32_t urgb_u32(uint8_t r, uint8_t g, uint8_t b) {
 
 /* Fixed hue per LED, RPFM's order: green, blue, yellow, red. */
 static uint32_t s_ws_col[4];
-/* Incremented on Core 1 (write_reg_sid), read and cleared on Core 0
- * (led_update). A counter that lands mid-clear can lose one count; for a
- * brightness meter that is invisible, and making it exact would cost a lock on
- * the hot path. Everything else in this block is Core 0 only. */
-static volatile uint16_t s_ws_hits[4];
 static uint8_t  s_ws_level[4];       /* level currently shown, 0..LED_MAX */
 static absolute_time_t s_ws_tick = {0};
+
+/* LED0-2 are volume meters, LED3 is a write-density meter.
+ *
+ *   LED0 green   voice 1   sustain $D406 high nibble, gated by $D404 bit 0
+ *   LED1 blue    voice 2   sustain $D40D high nibble, gated by $D40B bit 0
+ *   LED2 yellow  voice 3   sustain $D414 high nibble, gated by $D412 bit 0
+ *   LED3 red     $D415-$D418 write density
+ *
+ * The voices show a level and the red one shows a rate, because the two things
+ * are actually different:
+ *
+ *   A voice has no volume register. What you hear is the envelope multiplied
+ *   into the waveform and gated on and off by the control register, and the
+ *   envelope lives inside the chip where the firmware cannot read it. So the
+ *   meter uses the two numbers the tune writes: sustain (how loud it settles)
+ *   and gate (whether it sounds at all). sustain 15 with gate 0 is silent, so
+ *   showing it bright would be a lie - hence the gate factor. Counting writes
+ *   instead lit all four LEDs on a tune that rewrites every register with 00
+ *   every frame (C-2048: 25 writes per frame, first 150 ms silent), because
+ *   clearing a register is still a write.
+ *
+ *   $D418 is NOT a voice volume. Its low nibble is the master volume and every
+ *   tune pins it at 0x0F within the first frame, so metering it by level lights
+ *   the red LED on every tune forever - tried, and it says nothing. What is
+ *   interesting there is the write rate: that is the digi path, and a burst of
+ *   $D418 writes is a drum. So the red LED stays the write-density meter it
+ *   always was.
+ *
+ * Written on Core 1 by ws_sid_activity(), read on Core 0 by led_update().
+ * Separate bytes so a half-updated picture costs one dim tick, never a wrong
+ * level that sticks. */
+static volatile uint8_t  s_ws_sus[3];    /* sustain nibble, 0..15 */
+static volatile uint8_t  s_ws_gate[3];   /* 0 or 1, from the control register */
+static volatile uint16_t s_ws_digi;      /* $D415-$D418 writes this tick */
 
 /* The only place a level becomes a colour. Clamps each channel to LED_MAX, so
  * the ceiling holds no matter what the caller computed. */
@@ -206,21 +235,29 @@ static uint32_t ws_frame(uint32_t col, uint32_t level)
 }
 
 /* Called by write_reg_sid() on Core 1 for every write that reached the chip.
- * Only counts; the picture is composed on Core 0 in led_update(). */
+ *
+ * Voice registers set a level; the $D415-$D418 block counts writes. Nothing here
+ * does more than a nibble shift and a compare, so the hot path stays cheap. */
 static void ws_sid_activity(uint8_t addr, uint8_t data)
 {
-    (void)data;
-    if (addr > 0x18) return;
-
-    int led;
-    if (addr >= SID_REG_FILT_LO) {
-        led = 3;                   /* filter + volume block */
-    } else {
-        led = addr / 7;            /* 0x00-0x06 v1, 0x07-0x0D v2, 0x0E-0x14 v3 */
-        if (led > 2) led = 2;
+    /* Voice n owns $D400+n*7 .. $D406+n*7. $D404+n*7 is the control register
+     * (bit 0 = gate) and $D406+n*7 the sustain level (high nibble). */
+    if (addr <= 0x14) {
+        int v = addr / 7;
+        if (v > 2) v = 2;
+        uint8_t off = (uint8_t)(addr - v * 7);
+        if (off == 4) {
+            s_ws_gate[v] = (uint8_t)(data & 0x01);
+        } else if (off == 6) {
+            s_ws_sus[v] = (uint8_t)((data >> 4) & 0x0F);
+        }
+        return;
     }
-    uint16_t h = s_ws_hits[led];
-    if (h < 0xFFFF) s_ws_hits[led] = (uint16_t)(h + 1);
+
+    if (addr >= SID_REG_FILT_LO && addr <= 0x18) {
+        uint16_t h = s_ws_digi;
+        if (h < 0xFFFF) s_ws_digi = (uint16_t)(h + 1);
+    }
 }
 
 /* Four words, then return - byte for byte RPFM's ws2812_update(). See rule 1
@@ -244,9 +281,13 @@ static void ws2812_init(void) {
 
     for (int i = 0; i < NUM_WS_LEDS; i++) {
         s_ws_leds[i] = 0;
-        s_ws_hits[i] = 0;
         s_ws_level[i] = 0;
     }
+    for (int i = 0; i < 3; i++) {
+        s_ws_sus[i] = 0;
+        s_ws_gate[i] = 0;
+    }
+    s_ws_digi = 0;
     ws2812_update();
     s_ws_tick = make_timeout_time_ms(WS_TICK_MS);
 }
@@ -300,20 +341,38 @@ static void led_update(void)
     if (!time_reached(s_ws_tick)) return;
     s_ws_tick = make_timeout_time_ms(WS_TICK_MS);
 
-    /* Level is this tick's write count, scaled so LED_FULL_HITS writes means
-     * full. It holds for one tick and then drops: a note that is still being
-     * driven keeps its brightness because the voice keeps receiving writes,
-     * and an idle voice goes dark on the next tick. No accumulation, so there
-     * is nothing that can creep upward. */
+    /* Three voice LEDs show a level, the red one shows a rate - see the comment
+     * on s_ws_sus for why the two differ.
+     *
+     * Voices: sustain (gated). This is state, not a rate, so it is read fresh
+     * every tick and needs no counters - a level that stops changing simply
+     * stops producing WS2812 frames, because `want` stops changing.
+     *
+     * Red: writes into $D415-$D418 during the tick just ended. That block is
+     * where digi drums live, so a burst is the thing worth showing. Metering
+     * $D418's level instead was tried and is useless: every tune pins its low
+     * nibble at 0x0F in the first frame, so the red LED would sit lit forever. */
     int changed = 0;
-    for (int i = 0; i < NUM_WS_LEDS; i++) {
-        uint32_t lvl = (uint32_t)s_ws_hits[i] * LED_MAX / LED_FULL_HITS;
+
+    for (int i = 0; i < 3; i++) {
+        uint32_t lvl = 0;
+        if (s_ws_gate[i])
+            lvl = (uint32_t)s_ws_sus[i] * LED_MAX / 15u;
         if (lvl > LED_MAX) lvl = LED_MAX;
-        s_ws_hits[i] = 0;
         s_ws_level[i] = (uint8_t)lvl;
 
         uint32_t want = lvl ? ws_frame(s_ws_col[i], lvl) : 0;
         if (s_ws_leds[i] != want) { s_ws_leds[i] = want; changed = 1; }
+    }
+
+    {
+        uint32_t lvl = (uint32_t)s_ws_digi * LED_MAX / LED_FULL_HITS;
+        if (lvl > LED_MAX) lvl = LED_MAX;
+        s_ws_digi = 0;
+        s_ws_level[3] = (uint8_t)lvl;
+
+        uint32_t want = lvl ? ws_frame(s_ws_col[3], lvl) : 0;
+        if (s_ws_leds[3] != want) { s_ws_leds[3] = want; changed = 1; }
     }
     if (changed && s_ws_ready) ws2812_update();
 }
